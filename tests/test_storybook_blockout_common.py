@@ -77,6 +77,17 @@ def test_effective_link_type_reads_only_start_element():
     assert used_fallback is False
 
 
+def test_chains_preserve_measured_fractional_shot_durations():
+    items = [
+        _el(1, 1, 'start', duration_s=1.7625, link_type='independent'),
+        _el(1, 2, 'start', duration_s=2.64375, link_type='full_copy'),
+    ]
+    chains, _ = bc.compute_chains(1, items)
+    assert chains[0].shots[0].duration_s == pytest.approx(1.7625)
+    assert chains[0].shots[1].t_start == pytest.approx(1.7625)
+    assert chains[0].total_duration_s == pytest.approx(4.40625)
+
+
 def test_effective_link_type_missing_start_falls_back():
     elements = [_el(1, 1, "end", link_type="independent")]
     link_type, used_fallback = bc.effective_link_type(elements)

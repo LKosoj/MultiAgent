@@ -1352,17 +1352,17 @@ class RetryOpenAIServerModel:
                 normalized.append(msg)
         return normalized
 
-    def _normalize_response_content(self, response: Any) -> Any:
+    def _normalize_response_content(self, response: Any, tools_to_call_from: Optional[List[Any]] = None) -> Any:
         """
         Нормализует content в ответе модели к строке.
         Это предотвращает падения вида `list` has no attribute `strip`.
-        Восстанавливает tool_calls, если шлюз вшил их в текст (Calling tools: [...]).
+        Восстанавливает tool_calls из текста только при переданных инструментах.
         """
         try:
             if isinstance(response, ChatMessage):
                 normalized_content = self._coerce_content_to_text(getattr(response, "content", None))
                 tool_calls = getattr(response, "tool_calls", None)
-                if not tool_calls and normalized_content:
+                if tools_to_call_from and not tool_calls and normalized_content:
                     cleaned_content, recovered = recover_tool_calls_from_text(normalized_content)
                     if recovered:
                         logger.info(
@@ -1395,7 +1395,7 @@ class RetryOpenAIServerModel:
                 if message is not None and hasattr(message, "content"):
                     normalized_content = self._coerce_content_to_text(message.content)
                     message.content = normalized_content
-                    if not getattr(message, "tool_calls", None) and normalized_content:
+                    if tools_to_call_from and not getattr(message, "tool_calls", None) and normalized_content:
                         cleaned_content, recovered = recover_tool_calls_from_text(normalized_content)
                         if recovered:
                             logger.info(
@@ -1568,7 +1568,7 @@ class RetryOpenAIServerModel:
                     #logger.info(f"Запрос: {messages}, {kwargs}")
                     normalized_messages = self._normalize_messages_for_model(messages)
                     response = self.model(normalized_messages, **kwargs)
-                    response = self._normalize_response_content(response)
+                    response = self._normalize_response_content(response, kwargs.get("tools_to_call_from"))
                     response = self._apply_tool_call_recovery(response, kwargs)
 
                     # Проверяем, что модель вернула не None

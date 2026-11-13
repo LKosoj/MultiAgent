@@ -47,6 +47,62 @@ def test_validate_keeps_suitcase_state_through_dream_interlude():
     assert ct.validate_continuity_plan(plan, _screenplay()) is plan
 
 
+def test_wrong_scene_action_quote_reports_exact_shot_evidence_for_repair():
+    screenplay = _screenplay()
+    screenplay['screenplay'][0]['action'] = 'Герой ставит чемодан на платформу.'
+    plan = _plan()
+    evidence = screenplay['screenplay'][0]['action']
+    plan['entities'][0]['transitions'] = [{
+        'at': '1:1:end', 'from': 'on_platform', 'to': 'on_platform', 'evidence': evidence,
+    }]
+    with pytest.raises(ValueError) as exc:
+        ct.validate_continuity_plan(plan, screenplay)
+    message = str(exc.value)
+    assert evidence in message
+    assert screenplay['screenplay'][0]['storyboard'][0]['description'] in message
+    assert 'shot.description' in message and 'scene.action' in message
+
+
+def test_state_mismatch_reports_expected_and_actual_for_repair():
+    plan = _plan()
+    plan['frames']['1:1:start']['entities'][0]['state_id'] = 'floating'
+    with pytest.raises(ValueError) as exc:
+        ct.validate_continuity_plan(plan, _screenplay())
+    assert "expected='on_platform'" in str(exc.value)
+    assert "actual='floating'" in str(exc.value)
+
+
+def test_repair_receives_all_independent_state_mismatches(tmp_path, monkeypatch):
+    (tmp_path / '91_screenplay').mkdir()
+    source = {'screenplay': _screenplay(), 'characters': [], 'locations': [], 'author_materials': {}}
+    plan = _plan()
+    second = copy.deepcopy(plan['entities'][0])
+    second.update(id='lamp', name='Фонарь')
+    plan['entities'].append(second)
+    for frame in plan['frames'].values():
+        if frame['world_id'] == 'station':
+            frame['entities'].append({'id': 'lamp', 'state_id': 'on_platform', 'visible': True})
+    for binding in plan['frames']['1:1:start']['entities']:
+        binding['state_id'] = 'floating'
+    fingerprint = ct._digest([ct._PLAN_VERSION, source])
+    plan['_input_hash'] = fingerprint
+    calls = []
+
+    def repair(**kwargs):
+        payload = json.loads(kwargs['prompt'])
+        calls.append(payload)
+        assert {e['id'] for e in payload['candidate']['entities']} == {'suitcase', 'lamp'}
+        assert all(ident in payload['validation_error'] for ident in ('suitcase', 'lamp'))
+        return json.dumps({'frame_updates': {'1:1:start': {'entities': [
+            {'id': ident, 'state_id': 'on_platform'} for ident in ('suitcase', 'lamp')
+        ]}}})
+
+    monkeypatch.setattr(ct, 'call_openai_api', repair)
+    result = ct._repair_candidate(tmp_path, source, plan, fingerprint)
+    assert len(calls) == 1
+    assert ct.validate_continuity_plan(result, source['screenplay']) is result
+
+
 def test_frame_references_ignore_unrendered_prop_paths(tmp_path, monkeypatch):
     plan = _plan()
     plan['entities'][0]['reference_path'] = str(tmp_path / 'missing-prop.png')
@@ -613,3 +669,310 @@ def test_frame_binding_carries_object_shape_anchor(tmp_path):
     base = _managed_project(tmp_path, plan)
     bound = ct.bind_continuity_to_items(base, [{'scene_number': 1, 'shot_number': 1, 'shot_type': 'start'}])
     assert bound[0]['_continuity']['start']['entities'][0]['shape'] == plan['entities'][0]['shape']
+
+
+def test_identity_cleanup_keeps_declared_worn_accessories_and_sheet_layout(tmp_path, monkeypatch):
+    from custom_tools import image_tools
+    from PIL import Image
+    source = tmp_path / 'actor.png'
+    Image.new('RGB', (16, 16)).save(source)
+    plan = _plan()
+    plan['entities'][0]['states'][0]['holder'] = 'Actor'
+    plan['entities'].append({'id': 'glasses', 'name': 'Eyeglasses', 'kind': 'prop',
+                             'states': [{'holder': 'Actor', 'support': 'nose'}]})
+    plan['character_identity'] = {'Actor': {'accessories': ['glasses']}}
+    monkeypatch.setattr(ct, 'load_continuity_plan', lambda base: plan)
+    calls = []
+    def edit(**kwargs):
+        calls.append(kwargs)
+        Path(kwargs['output_path']).parent.mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (16, 16)).save(kwargs['output_path'])
+    monkeypatch.setattr(image_tools, 'edit_image_vse_tool', edit)
+    ct.identity_reference_path(tmp_path, {'name': 'Actor', 'reference_image_path': str(source)}, 's', 0)
+    removal = calls[0]['prompt'].split('REMOVE these temporary props: ')[1].split('. Remove EVERY')[0]
+    assert 'Чемодан' in removal and 'Eyeglasses' not in removal
+    assert 'large clear face close-up' in calls[0]['prompt']
+    assert 'do not repair' in calls[0]['prompt']
+
+
+def test_identity_cleanup_rejects_output_failing_reference_requirements(tmp_path, monkeypatch):
+    from custom_tools import image_tools
+    from custom_tools.storybook import artist_batch_edit
+    from PIL import Image
+    source = tmp_path / 'actor.png'
+    Image.new('RGB', (16, 16)).save(source)
+    plan = _plan()
+    plan['entities'][0]['states'][0]['holder'] = 'Actor'
+    monkeypatch.setattr(ct, 'load_continuity_plan', lambda base: plan)
+    outputs = []
+    prompts = []
+    def edit(**kwargs):
+        prompts.append(kwargs['prompt'])
+        outputs.append(Path(kwargs['output_path']))
+        outputs[-1].parent.mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (16, 16)).save(outputs[-1])
+    monkeypatch.setattr(image_tools, 'edit_image_vse_tool', edit)
+    monkeypatch.setattr(artist_batch_edit, '_reference_requirements_met', lambda *_: False)
+    with pytest.raises(RuntimeError, match='Identity cleanup failed'):
+        ct.identity_reference_path(tmp_path, {'name': 'Actor', 'reference_image_path': str(source),
+                                            'reference_requirements': ['Keep a large clear face view.']}, 's', 0)
+    assert outputs and not outputs[0].exists()
+    assert 'Keep a large clear face view.' not in prompts[0]
+    assert 'Remove EVERY instance in EVERY view' in prompts[0]
+    assert 'Keep everything else unchanged' in prompts[0]
+
+
+def test_identity_cleanup_checks_details_before_publishing(tmp_path, monkeypatch):
+    from custom_tools import image_tools
+    from custom_tools.storybook import artist_batch_edit
+    from PIL import Image
+    source = tmp_path / 'actor.png'
+    Image.new('RGB', (800, 450)).save(source)
+    plan = _plan()
+    plan['entities'][0]['states'][0]['holder'] = 'Actor'
+    monkeypatch.setattr(ct, 'load_continuity_plan', lambda base: plan)
+    outputs, details = [], []
+    def edit(**kwargs):
+        output = Path(kwargs['output_path'])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        size = (800, 450) if not outputs else (kwargs['width'], kwargs['height'])
+        Image.new('RGB', size).save(output)
+        outputs.append(output)
+    def review(path, data):
+        requirement = data['reference_requirements'][0]
+        if 'enlarged fragment' in requirement:
+            with Image.open(path) as image:
+                details.append(image.size)
+            assert 'do not require other views' in requirement
+            return False
+        return True
+    monkeypatch.setattr(image_tools, 'edit_image_vse_tool', edit)
+    monkeypatch.setattr(artist_batch_edit, '_reference_requirements_met', review)
+    with pytest.raises(RuntimeError, match='Identity cleanup failed'):
+        ct.identity_reference_path(tmp_path, {'name': 'Actor', 'reference_image_path': str(source),
+                                            'reference_requirements': ['Preserve identity.']}, 's', 0)
+    assert details and all(max(size) == 896 for size in details)
+    assert not outputs[0].exists()
+
+
+def test_identity_edit_does_not_request_preservation_of_removed_prop(tmp_path, monkeypatch):
+    from custom_tools import image_tools
+    from custom_tools.storybook import artist_batch_edit
+    from PIL import Image
+    source = tmp_path / 'actor.png'
+    Image.new('RGB', (16, 16)).save(source)
+    plan = _plan()
+    plan['entities'][0].update(name='Зубочистка', shape='a thin wooden toothpick')
+    plan['entities'][0]['states'][0]['holder'] = 'Actor'
+    monkeypatch.setattr(ct, 'load_continuity_plan', lambda base: plan)
+    calls, reviews = [], []
+    def edit(**kwargs):
+        calls.append(kwargs)
+        output = Path(kwargs['output_path'])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (16, 16)).save(output)
+    def review(path, data):
+        reviews.append(data)
+        return False
+    monkeypatch.setattr(image_tools, 'edit_image_vse_tool', edit)
+    monkeypatch.setattr(artist_batch_edit, '_reference_requirements_met', review)
+    criterion = 'Preserve the outfit and sandals; a toothpick.'
+    with pytest.raises(RuntimeError, match='Identity cleanup failed'):
+        ct.identity_reference_path(tmp_path, {'name': 'Actor', 'reference_image_path': str(source),
+                                            'reference_requirements': [criterion]}, 's', 0)
+    assert criterion not in calls[0]['prompt']
+    assert calls[0]['prompt'].isascii()
+    assert calls[0]['negative_prompt'] == 'a thin wooden toothpick'
+    assert reviews[0]['reference_requirements'][1] == criterion
+    assert 'sole permitted exception' in reviews[0]['reference_requirements'][0]
+
+
+def test_identity_cleanup_repairs_only_rejected_detail_and_rechecks_sheet(tmp_path, monkeypatch):
+    from custom_tools import image_tools
+    from custom_tools.storybook import artist_batch_edit
+    from PIL import Image, ImageDraw
+    source = tmp_path / 'actor.png'
+    image = Image.new('RGB', (800, 450), 'white')
+    image.putpixel((700, 400), (0, 0, 255))
+    image.save(source)
+    original = source.read_bytes()
+    plan = _plan()
+    plan['entities'][0]['states'][0]['holder'] = 'Actor'
+    monkeypatch.setattr(ct, 'load_continuity_plan', lambda base: plan)
+    edits, full_reviews = [], []
+    def edit(**kwargs):
+        edits.append(kwargs)
+        output = Path(kwargs['output_path'])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if len(edits) == 1:
+            result = Image.open(source).copy()
+            ImageDraw.Draw(result).rectangle((90, 90, 110, 110), fill='red')
+        else:
+            assert 'magnified fragment' in kwargs['prompt']
+            assert Path(kwargs['image_paths'][0]).is_relative_to(tmp_path / '97_shots')
+            result = Image.new('RGB', Image.open(kwargs['image_paths'][0]).size, 'white')
+        result.save(output)
+    def review(path, data):
+        if 'enlarged fragment' not in data['reference_requirements'][0]:
+            full_reviews.append(path)
+            return True
+        with Image.open(path) as result:
+            return not any(r > 200 and g < 40 and b < 40
+                           for _, (r, g, b) in result.convert('RGB').getcolors(1000000))
+    monkeypatch.setattr(image_tools, 'edit_image_vse_tool', edit)
+    monkeypatch.setattr(artist_batch_edit, '_reference_requirements_met', review)
+    output = ct.identity_reference_path(tmp_path, {'name': 'Actor', 'reference_image_path': str(source),
+                                                  'reference_requirements': ['Preserve identity.']}, 's', 0)
+    assert len(edits) == 2 and len(full_reviews) == 2
+    with Image.open(output) as result:
+        assert result.getpixel((100, 100)) == (255, 255, 255)
+        assert result.getpixel((700, 400)) == (0, 0, 255)
+    assert source.read_bytes() == original
+    assert not list((tmp_path / '97_shots').glob('identity_review_*'))
+
+
+def _moved_reference(tmp_path, monkeypatch, move=True):
+    """Серия с референсом, перенесённым в shared; возвращает base, старый и новый путь."""
+    from custom_tools.storybook import reference_catalog as catalog
+    from custom_tools.storybook.studio.capabilities import invoke
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = invoke('projects_create', {'title': 'World', 'description': 'Shared world', 'genre': 'comedy',
+                                     'target_age': 'all'})['project_id']
+    sid = invoke('series_create', {'project_id': pid, 'title': 'One', 'source_material': '',
+                                   'participant_ids': [], 'settings': {}})['series_id']
+    base = tmp_path / pid / 'series' / sid
+    old = base / '20_bible/references/locations/tower.png'
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_bytes(b'tower')
+    if not move:
+        return base, old, None
+    new = catalog.store_reference(base, old, 'location', 'tower')
+    assert not old.exists() and Path(new).is_file()
+    return base, old, Path(new)
+
+
+def test_landmark_hash_survives_moving_reference_to_shared(tmp_path, monkeypatch):
+    from custom_tools.storybook import reference_catalog as catalog
+    base, old, _ = _moved_reference(tmp_path, monkeypatch, move=False)
+    plan = _plan()
+    plan['entities'][0].update(kind='landmark', geometry='башня', reference_path=str(old))
+    (base / '20_bible/continuity_plan.json').write_text(json.dumps(plan), encoding='utf-8')
+    before = ct.unit_continuity_hash(base, ['1-1'])
+    catalog.store_reference(base, old, 'location', 'tower')
+    assert not old.exists()
+    # Путь в контексте остаётся исходным, иначе хеши и планы устареют после переноса.
+    assert ct.frame_continuity(base, 1, 1, 'start')['landmark_reference_paths'] == [str(old)]
+    assert ct.unit_continuity_hash(base, ['1-1']) == before
+
+
+def test_image_hash_survives_moving_reference_to_shared(tmp_path, monkeypatch):
+    import hashlib
+    from custom_tools.storybook import reference_catalog as catalog
+    from custom_tools.storybook.project_paths import series_scope
+    base, old, _ = _moved_reference(tmp_path, monkeypatch, move=False)
+    (base / '20_bible/continuity_plan.json').write_text(json.dumps(_plan()), encoding='utf-8')
+    item = {'project_id': base.parent.parent.name, 'scene_number': 1, 'shot_number': 1,
+            'shot_type': 'start', 'reference_image_paths': [str(old)]}
+    with series_scope(base.parent.parent.name, base.name):
+        catalog.store_reference(base, old, 'location', 'tower')
+        assert not old.exists()
+        # Файл перенесён: ключ остаётся прежним путём, содержимое берётся из shared.
+        context = ct.frame_continuity(base, 1, 1, 'start')
+        want = ct._digest([context, None, None, None, {str(old): hashlib.sha256(b'tower').hexdigest()}])
+        assert ct.image_continuity_hash(item) == want
+
+
+def test_image_hash_without_catalog_keys_on_absolute_path(tmp_path, monkeypatch):
+    import hashlib
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    base = tmp_path / 'proj'
+    ref = base / '20_bible/references/locations/x.png'
+    ref.parent.mkdir(parents=True)
+    ref.write_bytes(b'x')
+    (base / '20_bible/continuity_plan.json').write_text(json.dumps(_plan()), encoding='utf-8')
+    item = {'project_id': 'proj', 'scene_number': 1, 'shot_number': 1, 'shot_type': 'start',
+            'reference_image_paths': ['/references/locations/x.png']}
+    context = ct.frame_continuity(base, 1, 1, 'start')
+    want = ct._digest([context, None, None, None, {str(ref): hashlib.sha256(b'x').hexdigest()}])
+    assert ct.image_continuity_hash(item) == want
+
+
+def _landmark_project(tmp_path, monkeypatch):
+    from custom_tools import image_tools
+    from custom_tools.storybook import artist_batch_edit
+    root = tmp_path / 'proj'
+    base = root / 'series/s1'
+    (base / '20_bible/references/locations').mkdir(parents=True)
+    (base / '20_bible/references/locations/place.png').write_bytes(b'source')
+    entity = {'id': 'obj', 'name': 'Gate', 'kind': 'landmark', 'world_id': 'place', 'geometry': 'Two posts',
+              'locations': ['Place'], 'reference_location': 'Place'}
+    (base / '20_bible/continuity_plan.json').write_text(json.dumps({'entities': [entity]}))
+    (base / '20_bible/locations.json').write_text(json.dumps(
+        [{'name': 'Place', 'reference_image_path': '/references/locations/place.png'}]))
+    (base / 'series.json').write_text('{}')
+    (root / 'project.json').write_text('{}')
+    calls = []
+
+    def gen(**kwargs):
+        calls.append(kwargs['output_path'])
+        Path(kwargs['output_path']).write_bytes(b'valid%d' % len(calls))
+    monkeypatch.setattr(image_tools, 'edit_image_vse_tool', gen)
+    monkeypatch.setattr(artist_batch_edit, '_reference_requirements_met', lambda *a, **k: True)
+    return root, base, calls
+
+
+def test_landmark_not_regenerated_after_catalog_moves_it(tmp_path, monkeypatch):
+    root, base, calls = _landmark_project(tmp_path, monkeypatch)
+    ct.ensure_landmark_references(base, 's', 0)
+    assert len(calls) == 1
+    (root / 'project.json').write_text(json.dumps({'format': 'storybook-series-v1'}))
+    ct.ensure_landmark_references(base, 's', 0)
+    assert len(calls) == 1
+
+
+def test_landmark_plan_path_and_hashes_stay_after_catalog_moves_it(tmp_path, monkeypatch):
+    root, base, calls = _landmark_project(tmp_path, monkeypatch)
+    plan_file = base / '20_bible/continuity_plan.json'
+    plan = json.loads(plan_file.read_text())
+    plan['entities'][0]['states'] = [{'id': 's', 'description': 'd', 'space': 'p', 'support': 'g',
+                                      'holder': None, 'motion': 'stationary'}]
+    plan['frames'] = {f'1:1:{phase}': {'world_id': 'place', 'entities': [
+        {'id': 'obj', 'state_id': 's', 'visible': True}]} for phase in ('start', 'end')}
+    plan_file.write_text(json.dumps(plan))
+    ct.ensure_landmark_references(base, 's', 0)
+    old_path = json.loads(plan_file.read_text())['entities'][0]['reference_path']
+    before = (ct.frame_continuity(base, 1, 1, 'start'), ct.unit_continuity_hash(base, ['1-1']))
+    (root / 'project.json').write_text(json.dumps({'format': 'storybook-series-v1'}))
+    ct.ensure_landmark_references(base, 's', 0)
+    assert len(calls) == 1
+    assert json.loads(plan_file.read_text())['entities'][0]['reference_path'] == old_path
+    assert (ct.frame_continuity(base, 1, 1, 'start'), ct.unit_continuity_hash(base, ['1-1'])) == before
+
+
+def test_identity_not_regenerated_after_catalog_moves_it(tmp_path, monkeypatch):
+    from PIL import Image
+    from custom_tools import image_tools
+    root = tmp_path / 'proj'
+    base = root / 'series/s1'
+    source = base / '20_bible/references/characters/actor.png'
+    source.parent.mkdir(parents=True)
+    (root / '20_bible/references/characters').mkdir(parents=True)
+    Image.new('RGB', (16, 16)).save(source)
+    (base / 'series.json').write_text('{}')
+    (root / 'project.json').write_text('{}')
+    plan = _plan()
+    plan['character_identity'] = {}
+    plan['entities'][0]['states'][0]['holder'] = 'Actor'
+    monkeypatch.setattr(ct, 'load_continuity_plan', lambda b: plan)
+    calls = []
+
+    def edit(**kwargs):
+        calls.append(kwargs)
+        Image.new('RGB', (16, 16), 'gray').save(kwargs['output_path'])
+    monkeypatch.setattr(image_tools, 'edit_image_vse_tool', edit)
+    actor = {'name': 'Actor', 'reference_image_path': str(source)}
+    ct.identity_reference_path(base, actor, 'session', 0)
+    assert len(calls) == 1
+    (root / 'project.json').write_text(json.dumps({'format': 'storybook-series-v1'}))
+    ct.identity_reference_path(base, actor, 'session', 0)
+    assert len(calls) == 1

@@ -1,10 +1,12 @@
 """Visual continuity acceptance using the existing labeled-image QA renderer."""
 import contextvars
 import json
+import logging
 import math
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from fractions import Fraction
 
@@ -12,10 +14,14 @@ from agent_command import model_ultimate
 from utils import call_openai_api, parse_llm_json
 from .continuity import (_digest, _source, _PLAN_VERSION, _write, bind_continuity_to_items,
                          load_continuity_plan, unit_continuity_hash, validate_continuity_plan)
-from .project_paths import safe_storybook_project_dir
+from .project_paths import existing_reference_path, safe_storybook_project_dir
 
-_REVIEW_VERSION = 8
-_AUDIT_IMAGE_MAX_SIDE = 640
+logger = logging.getLogger(__name__)
+
+_REVIEW_VERSION = 9
+_AUTO_ACCEPT_ROUNDS = 2
+_AUDIT_IMAGE_MAX_SIDE = 1280
+_AUDIT_VIDEO_MAX_SIDE = 640
 _AUDIT_JPEG_QUALITY = 75
 _AUDIT_VIDEO_MAX_SAMPLES = 5
 
@@ -110,8 +116,10 @@ def _tasks(base, kind):
                 contexts[-1]['time_s'] = offsets[f"{item['scene_number']}-{item['shot_number']}"][phase != 'start']
         masters = {entity['reference_path'] for item in frames for context in item['_continuity'].values()
                    for entity in context.get('entities', []) if entity.get('reference_path')}
-        character_masters = _character_masters(base, frames)
-        hashes = {path: _file_hash(path) for path in set(media) | anchors | masters | set(character_masters)}
+        scenes = {item['scene_number'] for item in frames}
+        character_frames = [item for item in items if item['scene_number'] in scenes] if kind == 'images' else frames
+        character_masters = _character_masters(base, character_frames)
+        hashes = {path: _file_hash(existing_reference_path(base, path)) for path in set(media) | anchors | masters | set(character_masters)}
         events = []
         if offsets:
             events = sorted({offsets[f'{scene}-{shot}'][phase == 'end']
@@ -132,7 +140,7 @@ def _tasks(base, kind):
         tasks.append({'id': '|'.join(sorted(keys)), 'input_hash': signature, 'group': group, 'kind': kind,
                       'state_hash': unit_continuity_hash(base, sorted(keys)),
                       'frames': frames, 'media': media, 'anchors': sorted(anchors),
-                      'masters': sorted(masters), 'character_base': str(base), 'contexts': contexts,
+                      'masters': sorted(masters), 'character_base': str(base), 'character_masters': character_masters, 'contexts': contexts,
                       **({'events': events, 'planned_duration': cursor} if kind == 'videos' else {})})
     return tasks
 
@@ -170,8 +178,8 @@ def pending_image_findings(base, shot_keys):
             continue
         keys = record['id'].split('|')
         if (record['passed'] or not set(keys).intersection(shot_keys)
-                or record.get('state_hash') != unit_continuity_hash(Path(base), keys)
-                or any(not Path(p).is_file() or _file_hash(p) != digest for p, digest in record.get('media_hashes', {}).items())):
+                or any(not Path(p).is_file() or _file_hash(p) != digest for p, digest in record.get('media_hashes', {}).items())
+                or record.get('state_hash') != unit_continuity_hash(Path(base), keys)):
             continue
         for verdict in record['verdicts']:
             for finding in verdict['violations']:
@@ -190,11 +198,12 @@ def _audit(task, pictures, chunk_number):
                     for item in task['frames'] for context in item['_continuity'].values()
                     for entity in context.get('entities', []) if entity.get('reference_path')}
     master_images = [{'scene_number': 'LANDMARK', 'shot_number': master_roles.get(path, n),
-                      'shot_type': 'object construction only', 'output_path': path}
+                      'shot_type': 'object construction only',
+                      'output_path': existing_reference_path(Path(task['character_base']), path) if task.get('character_base') else path}
                      for n, path in enumerate(task['masters'], 1)]
     character_images = [{'scene_number': 'CHARACTER', 'shot_number': name,
                          'shot_type': 'character identity and appearance reference', 'output_path': path}
-                        for path, name in _character_masters(Path(task['character_base']), task['frames']).items()] if task.get('character_base') else []
+                        for path, name in (task.get('character_masters') or _character_masters(Path(task['character_base']), task['frames'])).items()] if task.get('character_base') else []
     request = {'prompt': json.dumps({'kind': task['kind'], 'expected_frames': task['contexts'], 'chunk': chunk_number,
                            'prior_findings': [dict(index=index, finding=finding)
                                               for index, finding in enumerate(task.get('prior_findings', []))],
@@ -221,6 +230,7 @@ def _audit(task, pictures, chunk_number):
         **request,
         system_prompt=(
             'Inspect actual labeled pixels against their own phase and the shared object identities. Compare character identity with the labeled CHARACTER references; the current scene determines clothing changes and framing. '
+            'CHARACTER references include the scene cast for comparison, not required on-screen presence; the current source and visible_characters determine who must appear. '
             'source_shot describes the whole source action; registered continuity defines physical START/END states. '
             'Re-evaluate every prior finding against current source_shot, registered continuity and pixels. '
             'Prior findings marked source=video are hypotheses from a generated clip, not observations of this source image; '
@@ -399,8 +409,9 @@ def _repair_media(base, tasks, kind, session_id):
                     elif isinstance(refs, str) and str(Path(refs).resolve()) in rejected_paths:
                         item[field] = []
                 frame_key = f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
-                masters = [entity_refs[ident] for ident in sorted(frame_entities.get(frame_key, set()))
-                           if entity_refs.get(ident) and Path(entity_refs[ident]).is_file()]
+                # Мастер мог быть перенесён в каталог: план ссылается на старый путь.
+                masters = [path for ident in sorted(frame_entities.get(frame_key, set())) if entity_refs.get(ident)
+                           for path in [existing_reference_path(base, entity_refs[ident])] if Path(path).is_file()]
                 refs = item.get('reference_image_paths') or item.get('references') or []
                 if isinstance(refs, str):
                     refs = [refs]
@@ -605,7 +616,8 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                 prior.extend(explicit_findings)
             else:
                 for record in previous.values():
-                    if (record.get('id') == task['id']
+                    if (record.get('review_version') == _REVIEW_VERSION
+                            and record.get('id') == task['id']
                             and record.get('state_hash') == task['state_hash']
                             and record.get('media_hashes') == media_hashes):
                         for verdict in record.get('verdicts', []):
@@ -657,7 +669,7 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                 indices = _video_sample_indices(task.get('events', []), task['planned_duration'], duration, fps, frame_count)
                 expression = '+'.join(f'eq(n\\,{index})' for index in indices)
                 subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', task['media'][0], '-vf',
-                                f'select={expression},scale={_AUDIT_IMAGE_MAX_SIDE}:-1', '-vsync', '0', str(Path(temporary) / '%03d.jpg')],
+                                f'select={expression},scale={_AUDIT_VIDEO_MAX_SIDE}:-1', '-vsync', '0', str(Path(temporary) / '%03d.jpg')],
                                capture_output=True, check=True)
                 images = sorted(Path(temporary).glob('*.jpg'))
                 if len(images) != len(indices):
@@ -688,9 +700,55 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                     record_continuity_image(item, basis='visual_review')
     check = continuity_acceptance(base, kind)
     if not check['passed'] and repair:
-        rejected = [task for task in tasks
-                    if not report['tasks'][task['input_hash']]['passed']
-                    and (not findings_by_task or task['input_hash'] in findings_by_task)]
+        if findings_by_task:
+            return _repair_round(session_id, project_id, kind, enable, base, tasks, report, findings_by_task)
+        # Аудитор может отвергать любой вариант ремонта: после _AUTO_ACCEPT_ROUNDS неудачных
+        # раундов группа принимается с сохранёнными замечаниями, чтобы не блокировать видео.
+        while True:
+            result = _repair_round(session_id, project_id, kind, enable, base, tasks, report, {})
+            unaccepted = result.get('acceptance', {}).get('unaccepted')
+            if result.get('acceptance', {}).get('passed') or not unaccepted:
+                return result
+            report = json.loads(path.read_text())
+            rounds = {task_id: count for task_id, count in report.get('failed_rounds', {}).items()
+                      if task_id in unaccepted}
+            for task_id in unaccepted:
+                rounds[task_id] = rounds.get(task_id, 0) + 1
+            report['failed_rounds'] = rounds
+            tasks = _tasks(base, kind)
+            exhausted = [task for task in tasks if rounds.get(task['id'], 0) >= _AUTO_ACCEPT_ROUNDS
+                         and task['input_hash'] in report['tasks']]
+            for task in exhausted:
+                logger.warning('Continuity %s group %s auto-accepted after %d failed repair rounds',
+                               kind, task['id'], rounds[task['id']])
+                report['tasks'][task['input_hash']].update(passed=True, auto_accepted={
+                    'failed_rounds': rounds.pop(task['id']),
+                    'at': datetime.now().isoformat(timespec='seconds')})
+            _write(path, report)
+            if kind == 'images':
+                from .continuity import record_continuity_image
+                for task in exhausted:
+                    for item in task['group']:
+                        record_continuity_image(item, basis='visual_review')
+            if len(exhausted) == len(unaccepted):
+                check = continuity_acceptance(base, kind)
+                return {'status': 'success' if check['passed'] else 'error', 'review_path': str(path),
+                        'acceptance': check, 'auto_accepted': [task['id'] for task in exhausted]}
+    return {'status': 'success' if check['passed'] else 'error', 'review_path': str(path), 'acceptance': check}
+
+
+def _repair_round(session_id, project_id, kind, enable, base, tasks, report, findings_by_task):
+    rejected = [task for task in tasks
+                if not report['tasks'][task['input_hash']]['passed']
+                and (not findings_by_task or task['input_hash'] in findings_by_task)]
+    rollback = {}
+    if kind == 'images':
+        rollback = {
+            str(Path(item['output_path']).resolve()): Path(item['output_path']).read_bytes()
+            for task in rejected for item in task['group']
+            if Path(item['output_path']).is_file()
+        }
+    try:
         if kind == 'videos':
             image_keys = {str(Path(item['output_path']).resolve()):
                           f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
@@ -708,23 +766,30 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                 rejected_ids = {task['id'] for task in rejected}
                 rejected.extend(task for task in tasks if task['id'] not in rejected_ids
                                 and current[task['id']] != task['input_hash'])
-        rollback = {}
-        if kind == 'images':
-            rollback = {
-                str(Path(item['output_path']).resolve()): Path(item['output_path']).read_bytes()
-                for task in rejected for item in task['group']
-                if Path(item['output_path']).is_file()
-            }
         _repair_media(base, rejected, kind, session_id)
-        post = _review(session_id, project_id, kind, enable, repair=False)
-        if post.get('acceptance', {}).get('passed') or not rollback:
-            return post
+    except Exception as exc:
+        if findings_by_task:
+            raise
+        # Сбой ремонта — неудачный раунд: картинки возвращаются к проверенным байтам.
+        logger.warning('Continuity %s repair round failed: %s', kind, exc)
         for path, content in rollback.items():
             Path(path).write_bytes(content)
-        # Rebuild the report against the previous bytes. This makes a failed
-        # repair a no-op for continuity state and leaves the accepted baseline.
         return _review(session_id, project_id, kind, enable, repair=False)
-    return {'status': 'success' if check['passed'] else 'error', 'review_path': str(path), 'acceptance': check}
+    post = _review(session_id, project_id, kind, enable, repair=False)
+    if post.get('acceptance', {}).get('passed') or not rollback:
+        return post
+    # Откатываются только группы, не принятые после ремонта: иначе успешный ремонт
+    # теряется и каждый запуск начинает с тех же замечаний.
+    unaccepted = post.get('acceptance', {}).get('unaccepted')
+    restore = None if unaccepted is None else {
+        str(Path(item['output_path']).resolve()) for task in rejected if task['id'] in unaccepted
+        for item in task['group']}
+    for path, content in rollback.items():
+        if restore is None or path in restore:
+            Path(path).write_bytes(content)
+    # Rebuild the report against the previous bytes. This makes a failed
+    # repair a no-op for continuity state and leaves the accepted baseline.
+    return _review(session_id, project_id, kind, enable, repair=False)
 
 
 def storybook_continuity_images_review_tool(session_id: str, project_id: str, enable: bool = True, review_findings: list = None) -> dict:

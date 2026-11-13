@@ -206,6 +206,19 @@ def test_continuity_dismissed_uncertain_dedup_summary(proj):
     assert meta["dismissed"] == 1 and meta["passed"] == 1 and meta["failed"] == 2
 
 
+
+def test_continuity_auto_accepted_keeps_findings_as_warnings(proj):
+    # Автопринятая группа не должна выглядеть чистой: замечания остаются видны.
+    rec = S.continuity_record("4-4|4-5", passed=True, version=reports._review_version()[0],
+                              violations=[S.violation("4:5:end", "пылесос на полу")])
+    rec["auto_accepted"] = {"failed_rounds": 2, "at": "2026-11-13T09:00:00"}
+    S.write_json(proj, "continuity_images", S.continuity([rec]))
+    found = fs(proj, "continuity_images")
+    violation = next(f for f in found if f.code == "continuity_violation")
+    assert violation.level == "warning" and violation.message == "пылесос на полу"
+    assert next(f for f in found if f.code == "continuity_auto_accepted").level == "warning"
+    assert entry(proj, "continuity_images").meta["passed"] == 1
+
 def test_continuity_failed_without_details_still_reported(proj):
     S.write_json(proj, "continuity_images", S.continuity([S.continuity_record("3-1|3-2")]))
     assert "continuity_failed" in codes(proj, "continuity_images")

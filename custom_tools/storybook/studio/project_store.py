@@ -262,6 +262,22 @@ def pick_cover(project_dir: Path) -> str | None:
     for candidate in _sorted_images(refs, project_dir):
         if "_backup_" not in candidate.name:
             return candidate.relative_to(project_dir).as_posix()
+    return _catalog_cover(project_dir)
+
+
+def _catalog_cover(project_dir: Path) -> str | None:
+    """Обложка серийного проекта: портрет героя из каталога референсов (shared/references)."""
+    from custom_tools.storybook.reference_catalog import bound_references
+    try:
+        records = bound_references(project_dir, ("identity", "character"))
+    except (OSError, ValueError):
+        return None
+    for record in sorted(records, key=lambda r: r["path"]):
+        if not record.get("selectable"):
+            continue
+        path = project_dir / record["path"]
+        if path.suffix.lower() in IMAGE_EXTS and _safe_file(path, project_dir):
+            return record["path"]
     return None
 
 

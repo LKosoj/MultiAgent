@@ -206,9 +206,13 @@ def test_reference_prompt_binds_final_image_and_saved_style(project, monkeypatch
     assert refs == ['hero.png', str(style_image), str(final)]
     assert json.loads(captured['prompt'])['final_image_number'] == 3
     assert json.loads(captured['prompt'])['style_image_number'] == 2
+    assert json.loads(captured['prompt'])['visual_style'] == 'SAVED INK STYLE'
     assert json.loads(captured['prompt'])['landmark_image_roles'] == [
         {'entity_id': 'arch', 'name': 'Station arch', 'image_number': 1}]
-    assert prompt == 'SAVED INK STYLE\n\nUse Image 2 for style; travel, then finish on Image 3.'
+    assert prompt == ('SAVED INK STYLE\n\nImage 1 — Station arch: landmark object construction\n'
+                      'Image 2 — visual style only: medium, palette, lighting, line and surface\n'
+                      'Image 3 — required end state of the clip\n\n'
+                      'Use Image 2 for style; travel, then finish on Image 3.')
     assert 'not the choice of style' in captured['system_prompt']
     assert 'WRONG' not in prompt
     assert 'ordinary image reference' in captured['system_prompt']
@@ -796,3 +800,147 @@ def test_fingerprint_changes_with_series_settings(tmp_path, monkeypatch):
         settings.write_text(json.dumps({'video': {'provider':'routerai', 'model':'second'}}))
         second = vp._fingerprint([item], base=base, project_id=pid)
     assert first != second
+
+
+def test_cached_episode_plan_keeps_scoped_keyframes_and_outputs(tmp_path, monkeypatch):
+    from custom_tools.storybook import project_paths
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path / 'plots/storybooks'))
+    monkeypatch.setattr(project_paths, '_series_scope', project_paths.ContextVar('plan_scope', default=('test', 'episode')))
+    base = tmp_path / 'plots/storybooks/test/series/episode'
+    (base / '97_shots').mkdir(parents=True)
+    legacy = 'plots/storybooks/test/97_shots/scene_01_shot_01/'
+    target = str(base / '97_shots/scene_01_shot_01') + '/'
+    items = [dict(scene_number=1, shot_number=1, shot_type=phase, duration_s=2,
+                  output_path=target + phase + '.png', video_path=target + 'video.mp4')
+             for phase in ('start', 'end')]
+    plan = {'source_hash':'keep', 'units':[dict(
+        shot_keys=['1-1'], duration_s=2, video_path=legacy+'video.mp4',
+        video_prompt='Static', reference_image_paths=[legacy+'start.png'],
+        start_reference_path=legacy+'start.png', end_reference_path=legacy+'end.png',
+        resolution='1080p')]}
+    path = base / '97_shots/video_plan.json'
+    path.write_text(json.dumps(plan))
+    assert len(vp.select_image_items('test', items)) == 2
+    result = vp.apply_video_plan('test', items)
+    assert result[0]['video_path'] == target+'video.mp4'
+    assert result[0]['start_reference_path'] == target+'start.png'
+    saved = json.loads(path.read_text())
+    assert saved['source_hash'] == 'keep'
+    assert saved['units'][0]['end_reference_path'] == target+'end.png'
+
+
+def test_fractional_action_timing_preserved_with_supported_provider_padding(project, monkeypatch):
+    base, items, _ = planning_setup(project, monkeypatch)
+    for item in items:
+        item['duration_s'] = 1.7968
+    monkeypatch.setattr(vp, 'choose_video_method', lambda state: {'method': 'references', 'continuity': 'new'})
+    monkeypatch.setattr(vp, '_decide', lambda *args: {'resume': 'new'})
+    vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items})
+    units = json.loads((base / '97_shots/video_plan.json').read_text())['units']
+    assert [unit['duration_s'] for unit in units] == [1.7968] * 3
+    assert [unit['video_duration_s'] for unit in units] == [2] * 3
+    assert all(item['duration_s'] == 1.7968 for item in items)
+
+
+@pytest.fixture
+def moved_reference(tmp_path, monkeypatch):
+    """Серия, где референс перенесён в shared, а данные ссылаются на старый путь."""
+    from custom_tools.storybook import reference_catalog as catalog
+    from custom_tools.storybook.project_paths import series_scope
+    from custom_tools.storybook.studio.capabilities import invoke
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = invoke('projects_create', {'title': 'World', 'description': 'Shared world', 'genre': 'comedy',
+                                     'target_age': 'all'})['project_id']
+    sid = invoke('series_create', {'project_id': pid, 'title': 'One', 'source_material': '',
+                                   'participant_ids': [], 'settings': {}})['series_id']
+    base = tmp_path / pid / 'series' / sid
+    old = base / '20_bible/references/characters/hero.png'
+    old.parent.mkdir(parents=True, exist_ok=True)
+    Image.new('RGB', (32, 24), 'red').save(old)
+    catalog.store_reference(base, old, 'character', 'hero')
+    assert not old.exists()
+    with series_scope(pid, sid):
+        yield pid, base, old
+
+
+def test_reference_request_resolves_moved_reference(moved_reference):
+    pid, base, old = moved_reference
+    item = dict(project_id=pid, duration_s=4, video_prompt='Run', reference_image_paths=[str(old)])
+    payload, _ = vp.reference_request(item, 'alibaba/wan-3.0', 42)
+    assert len(payload['input_references']) == 1
+
+
+def test_adopt_reference_test_resolves_moved_reference(moved_reference):
+    import hashlib
+    from custom_tools.storybook import reference_catalog as catalog
+    pid, base, old = moved_reference
+    moved = catalog.resolve_reference(base, old)
+    items = [dict(project_id=pid, scene_number=1, shot_number=shot, shot_type=phase, timing='00:02', video_prompt='Run',
+                  video_path=str(base / f'{shot}.mp4'), width=1920, height=1088)
+             for shot in (1, 2) for phase in ('start', 'end')]
+    (base / '97_shots').mkdir(exist_ok=True)
+    (base / '97_shots/shots.json').write_text(json.dumps({'items': items}))
+    movie = base / 'approved.mp4'
+    movie.write_bytes(b'existing-video')
+    test = base / 'trial'
+    test.mkdir()
+    (test / 'context.json').write_text(json.dumps(dict(
+        model='alibaba/wan-3.0', duration_seconds=4, resolution='480p', aspect_ratio='16:9', seed=1,
+        references=[{'path': str(old), 'sha256': hashlib.sha256(moved.read_bytes()).hexdigest()}])))
+    (test / 'prompt.json').write_text(json.dumps({'video_prompt': 'Run'}))
+    (test / 'provider_jobs.json').write_text(json.dumps({'jobs': [{
+        'status': 'downloaded', 'task_id': 'paid-test-id', 'output_path': str(movie)}]}))
+    vp.adopt_reference_test(pid, test, ['1-1', '1-2'])
+
+
+def test_fingerprint_survives_moving_reference_to_shared(tmp_path, monkeypatch):
+    import hashlib
+    from custom_tools.storybook import reference_catalog as catalog
+    from custom_tools.storybook.project_paths import series_scope
+    from custom_tools.storybook.studio.capabilities import invoke
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = invoke('projects_create', {'title':'World', 'description':'A shared world', 'genre':'fairy', 'target_age':'all'})['project_id']
+    sid = invoke('series_create', {'project_id':pid, 'title':'Series', 'source_material':'', 'participant_ids':[], 'settings':{}})['series_id']
+    base = tmp_path / pid / 'series' / sid
+    old = base / '20_bible/references/characters/hero.png'
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_bytes(b'hero')
+    item = dict(scene_number=1, shot_number=1, shot_type='start', duration_s=2,
+                characters=[{'name': 'Hero', 'reference_image_path': str(old)}])
+    with series_scope(pid, sid):
+        catalog.store_reference(base, old, 'identity', 'hero')
+        assert not old.exists()
+        seen = []
+        monkeypatch.setattr(vp, '_digest', lambda payload: seen.append(payload) or 'x')
+        vp._fingerprint([item], base=base, project_id=pid)
+    # Ключ — путь-кандидат до переноса, содержимое читается из shared: отпечаток не зависит от места файла.
+    assert seen[0]['style_source_images'] == {str(old): hashlib.sha256(b'hero').hexdigest()}
+
+
+def test_reference_prompt_lists_each_image_with_subject_and_role_on_own_line(project, monkeypatch):
+    import utils
+    base, items = project
+    final = base / 'ending.png'
+    final.write_bytes(b'final')
+    style_image = base / 'style.png'
+    style_image.write_bytes(b'style')
+    captured = {}
+
+    def generate(**kwargs):
+        captured.update(kwargs)
+        return '{"video_prompt":"Static camera. 0-2s: Hero walks."}'
+
+    monkeypatch.setattr(utils, 'call_openai_api', generate)
+    group = vp._starts(items)[1:]
+    state = {'reference_images': [dict(image=1, subject='Hero', role='character_appearance'),
+                                  dict(image=2, subject='Yard', role='location')]}
+    prompt, _ = vp.prepare_reference_prompt(base, group, state, ['hero.png', 'yard.png'],
+                                            final_image=final, style_image=style_image)
+    lines = prompt.split('\n\n')[0].splitlines()
+    assert lines == ['Image 1 — Hero: character appearance',
+                     'Image 2 — Yard: location materials and architecture',
+                     'Image 3 — visual style only: medium, palette, lighting, line and surface',
+                     'Image 4 — required end state of the clip']
+    assert prompt.endswith('Static camera. 0-2s: Hero walks.')
+    assert 'do not repeat that list' in captured['system_prompt']

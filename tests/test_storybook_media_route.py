@@ -210,3 +210,28 @@ def test_series_route_isolates_tokens_and_paths(env):
     assert client.get(url, params={'path': '../two/a.png', 't': token}).status_code == 403
     project_token = issue_media_token('demo')['token']
     assert client.get(url, params={'path': 'a.png', 't': project_token}).status_code == 401
+
+
+def test_series_route_serves_shared_references(env):
+    client, shared = env
+    project = shared.parent
+    directory = project / 'series' / 'one'
+    directory.mkdir(parents=True)
+    (directory / 'series.json').write_text('{}')
+    refs = shared / 'references' / 'characters'
+    refs.mkdir(parents=True)
+    Image.new('RGB', (50, 50), (1, 2, 3)).save(refs / 'a.png')
+    (shared / 'other.png').write_bytes(b'o')
+    (refs / 'out.png').symlink_to(project.parent.parent / 'secret.png')
+    token = issue_media_token('demo', series_id='one')['token']
+    other = issue_media_token('demo', series_id='two')['token']
+    url = '/v1/storybook/projects/demo/series/one/media'
+    turl = '/v1/storybook/projects/demo/series/one/thumb'
+    rel = 'shared/references/characters/a.png'
+    assert client.get(url, params={'path': rel, 't': token}).status_code == 200
+    assert client.get(turl, params={'path': rel, 't': token, 'size': 128}).status_code == 200
+    for bad in ('shared/references/../x.png', 'shared/other.png', 'shared/references/characters/out.png'):
+        assert client.get(url, params={'path': bad, 't': token}).status_code in (403, 404)
+        assert client.get(turl, params={'path': bad, 't': token}).status_code in (403, 404)
+    assert client.get(url, params={'path': rel, 't': other}).status_code == 401
+    assert client.get(turl, params={'path': rel, 't': other}).status_code == 401

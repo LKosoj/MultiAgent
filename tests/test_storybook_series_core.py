@@ -100,6 +100,19 @@ def test_materialize_pinned_canon_for_bible_and_style(tmp_path, monkeypatch):
     assert json.loads((root / '30_style/style_text.json').read_text())['narrative_voice'] == 'warm'
 
 
+def test_materialize_character_without_uploaded_reference_has_generation_path(tmp_path, monkeypatch):
+    from custom_tools.storybook.studio.series import materialize_snapshot
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = call('projects_create', title='World', description='A shared world', genre='comedy', target_age='18+')['project_id']
+    call('shared_resource_save', project_id=pid, kind='characters', entity_id='hero',
+         data={'name': 'Герой', 'immutable_attributes': {'face_shape': 'вытянутое лицо'}})
+    sid = call('series_create', project_id=pid, title='Pilot', source_material='', participant_ids=['hero'], settings={})['series_id']
+    materialize_snapshot(pid, sid)
+    character = json.loads((tmp_path / pid / 'series' / sid / '20_bible/characters.json').read_text())[0]
+    assert character['reference_image_path'] == '/references/characters/hero.png'
+    assert character['immutable_attributes']['face_shape'] == 'вытянутое лицо'
+
+
 def test_series_tokens_do_not_allow_other_series(tmp_path, monkeypatch):
     from custom_tools.storybook.studio.media_tokens import issue_media_token, verify_media_token
     monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
@@ -306,3 +319,21 @@ def test_public_run_plan_contains_series_id(tmp_path, monkeypatch):
     monkeypatch.setattr(run_exec, 'get_engine', lambda: FakeEngine(tmp_path))
     result = call('run_plan', project_id=pid, series_id=sid, mode='full', task='Story')
     assert result['plan']['project_id'] == pid and result['plan']['series_id'] == sid
+
+
+def test_materialize_same_character_version_preserves_pipeline_identity_cleanup(tmp_path, monkeypatch):
+    from custom_tools.storybook.studio.series import materialize_snapshot
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = call('projects_create', title='World', description='Shared world', genre='comedy', target_age='18+')['project_id']
+    call('shared_resource_save', project_id=pid, kind='characters', entity_id='hero', data={
+        'name':'Hero', 'voice':'chosen-voice', 'immutable_attributes':{'unique_features':['face','temporary prop']},
+        'variable_attributes':{'accessories':['temporary prop']}})
+    sid = call('series_create', project_id=pid, title='Pilot', source_material='', participant_ids=['hero'], settings={})['series_id']
+    materialize_snapshot(pid, sid)
+    path = tmp_path / pid / 'series' / sid / '20_bible/characters.json'
+    cleaned = json.loads(path.read_text())
+    cleaned[0]['immutable_attributes']['unique_features'] = ['face']
+    cleaned[0]['variable_attributes']['accessories'] = []
+    path.write_text(json.dumps(cleaned))
+    materialize_snapshot(pid, sid)
+    assert json.loads(path.read_text()) == cleaned

@@ -218,7 +218,7 @@ def screenplay_lines(screenplay, snapshot):
         if not candidates:
             from .video_generator_common import parse_duration_seconds_from_timing
             duration = scene.get('silence_duration')
-            if not duration and shots:
+            if shots:
                 duration = sum(parse_duration_seconds_from_timing(shot.get('timing', '5s')) for shot in shots)
             pending_silence += float(duration or 0)
             continue

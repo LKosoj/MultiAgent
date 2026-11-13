@@ -77,7 +77,8 @@ def _resolve_target(project_id: str, shot_key: str, part: str, path: str) -> dic
     else:
         absolute = resolve_in_project(project_id, path)
         key, part, kind = "", "", "illustration"
-        inside = absolute.relative_to(root).parts
+        # shared/references серии лежит выше корня серии: править его нельзя, только брать образцом
+        inside = absolute.relative_to(root).parts if absolute.is_relative_to(root) else ()
         if len(inside) < 2 or inside[0] != ILLUSTRATIONS_DIR:
             raise StudioError("invalid_argument", "Править можно иллюстрации из папки 50_images")
     _check_extension(absolute)

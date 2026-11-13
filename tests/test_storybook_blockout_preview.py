@@ -41,6 +41,13 @@ def _chains_payload(chains):
     return {"chains": chains}
 
 
+def test_preview_keeps_fractional_measured_duration():
+    payload = _chains_payload([_chain('c1', 1, [_shot(1, 1.7625)])])
+    shots = bp.shots_from_chains_payload(payload)
+    assert shots[0]['duration_s'] == pytest.approx(1.7625)
+    assert bp.shot_burnin_summary_text(1, 1, 1.7625) == 'SC 01·SH 01·1.7625s'
+
+
 def _make_video(path: Path, *, duration_s: int, fps: int = 24, w: int = 64, h: int = 36, color: str = "red") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     args = [
@@ -298,7 +305,7 @@ def test_zero_contract_string_false(tmp_path):
 
 
 def test_invalid_project_id_never_raises_degrades_to_warning():
-    result = bp.blockout_preview_tool(session_id="s", project_id="../evil")
+    result = bp.blockout_preview_tool(session_id="s", project_id="../evil", enable=True)
     assert result["status"] == "warning"
     assert result["segments_total"] == 0
 
@@ -330,7 +337,7 @@ def test_no_segments_found_returns_warning_and_creates_nothing_in_preview(tmp_pa
     _write_json(blockout_dir / "chains.json", _chains_payload([_chain("c1", 1, [_shot(1, 5)])]))
     # scene_01_shot_01 dir отсутствует -> blockout_ref.mp4 отсутствует
 
-    result = bp.blockout_preview_tool(session_id="s", project_id=project_id)
+    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, enable=True)
     assert result["status"] == "warning"
     assert result["segments_total"] == 1
     assert result["segments_included"] == 0
@@ -343,7 +350,7 @@ def test_no_segments_found_returns_warning_and_creates_nothing_in_preview(tmp_pa
 
 
 def test_chains_json_missing_returns_warning(tmp_path):
-    result = bp.blockout_preview_tool(session_id="s", project_id="nochains")
+    result = bp.blockout_preview_tool(session_id="s", project_id="nochains", enable=True)
     assert result["status"] == "warning"
     assert result["segments_total"] == 0
 
@@ -361,7 +368,7 @@ def test_report_json_not_created_when_blockout_scene_builder_never_ran(tmp_path)
     _write_json(blockout_dir / "chains.json", _chains_payload([_chain("c1", 1, [_shot(1, 5)])]))
     # report.json deliberately absent -- blockout_scene_builder never ran
 
-    result = bp.blockout_preview_tool(session_id="s", project_id=project_id)
+    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, enable=True)
 
     assert result["status"] == "warning"
     assert not (blockout_dir / "report.json").exists()
@@ -382,7 +389,7 @@ def test_report_write_preserves_foreign_section_and_no_leftover_tmp(tmp_path):
     report_path = blockout_dir / "report.json"
     _write_json(report_path, {"some_other_step": {"checks": [{"code": "X", "level": "info"}]}})
 
-    bp.blockout_preview_tool(session_id="s", project_id=project_id)
+    bp.blockout_preview_tool(session_id="s", project_id=project_id, enable=True)
 
     report = _read_json(report_path)
     assert report["some_other_step"] == {"checks": [{"code": "X", "level": "info"}]}
@@ -405,7 +412,7 @@ def test_success_status_when_all_segments_present(tmp_path, monkeypatch):
     (shot_dir / "blockout_ref.mp4").write_bytes(b"fake")
     _write_json(shot_dir / "manifest.json", {"fps": 24, "resolution": [1280, 720]})
 
-    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=False)
+    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=False, enable=True)
     assert result["status"] == "success"
     assert result["segments_included"] == 1 == result["segments_total"]
     assert result["blockout_all_path"] is not None
@@ -430,7 +437,7 @@ def test_burnin_degrades_to_no_burnin_file_when_font_unavailable(tmp_path, monke
     (shot_dir / "blockout_ref.mp4").write_bytes(b"fake")
     _write_json(shot_dir / "manifest.json", {"fps": 24, "resolution": [1280, 720]})
 
-    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=True)
+    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=True, enable=True)
 
     assert result["status"] == "success"
     assert result["blockout_all_path"] is not None
@@ -454,7 +461,7 @@ def test_partial_status_when_some_segments_missing(tmp_path, monkeypatch):
     _write_json(shot1_dir / "manifest.json", {"fps": 24, "resolution": [1280, 720]})
     # scene_01_shot_02 отсутствует целиком
 
-    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=False)
+    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=False, enable=True)
     assert result["status"] == "partial"
     assert result["segments_total"] == 2
     assert result["segments_included"] == 1
@@ -477,7 +484,7 @@ def test_burnin_false_removes_stale_burnin_file_and_rebuilds_contact_sheet(tmp_p
     (preview_dir / "blockout_all_burnin.mp4").write_bytes(b"stale")
     (preview_dir / "contact_sheet.png").write_bytes(b"stale-png")
 
-    bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=False)
+    bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=False, enable=True)
 
     assert not (preview_dir / "blockout_all_burnin.mp4").exists()
     assert (preview_dir / "contact_sheet.png").is_file()
@@ -499,7 +506,7 @@ def test_real_concat_produces_video_with_correct_total_duration(tmp_path):
         Image.new("RGB", (64, 36), color=(1, 2, 3)).save(shot_dir / "ref_start.png")
         Image.new("RGB", (64, 36), color=(4, 5, 6)).save(shot_dir / "ref_end.png")
 
-    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=False)
+    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=False, enable=True)
     assert result["status"] == "success"
     assert result["segments_included"] == 2
     assert result["total_duration_s"] == 3
@@ -529,7 +536,7 @@ def test_real_burnin_pass_creates_file_when_font_available(tmp_path):
     _make_video(shot_dir / "blockout_ref.mp4", duration_s=1, fps=24, w=64, h=36)
     _write_json(shot_dir / "manifest.json", {"fps": 24, "resolution": [64, 36]})
 
-    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=True)
+    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=True, enable=True)
     assert result["blockout_all_burnin_path"] is not None
     assert Path(result["blockout_all_burnin_path"]).is_file()
 
@@ -549,7 +556,7 @@ def test_real_mismatched_segment_gets_reencoded_to_first_segments_params(tmp_pat
     _make_video(shot2_dir / "blockout_ref.mp4", duration_s=1, fps=30, w=128, h=72)
     _write_json(shot2_dir / "manifest.json", {"fps": 30, "resolution": [128, 72]})
 
-    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=False)
+    result = bp.blockout_preview_tool(session_id="s", project_id=project_id, burnin=False, enable=True)
     assert result["status"] == "success"
 
     out_path = Path(result["blockout_all_path"])

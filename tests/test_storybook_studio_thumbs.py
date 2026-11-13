@@ -103,3 +103,17 @@ def test_parallel_same_thumb_does_not_collide(project):
     with Image.open(path) as img:
         img.verify()
     assert not [p for p in path.parent.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_series_scope_thumb_of_shared_reference(project):
+    from custom_tools.storybook.project_paths import series_scope
+    (project / "project.json").write_text('{"format": "storybook-series-v1"}')
+    sdir = project / "series" / "s1"
+    sdir.mkdir(parents=True)
+    (sdir / "series.json").write_text("{}")
+    refs = project / "shared" / "references" / "characters"
+    refs.mkdir(parents=True)
+    Image.new("RGB", (600, 400), (1, 2, 3)).save(refs / "a.png")
+    with series_scope("demo", "s1"):
+        path, placeholder = thumbs.make_thumb("demo", "shared/references/characters/a.png", 128)
+    assert not placeholder and path.is_file()

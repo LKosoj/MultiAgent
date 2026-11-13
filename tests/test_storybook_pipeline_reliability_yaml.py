@@ -48,6 +48,23 @@ def test_auto_retry_transient_declared():
     assert isinstance(eh["auto_retry_transient"], bool)
 
 
+def test_enabled_music_planner_condition_is_understood_by_engine():
+    from workflow.engine import WorkflowEngine
+    from workflow.models import WorkflowContext
+    step = next(s for s in _load_raw()['steps'] if s['id'] == 'music_planner')
+    engine = WorkflowEngine.__new__(WorkflowEngine)
+    context = WorkflowContext(workflow_id='music', session_id='music',
+                              variables={'generate_screenplay': True, 'generate_music': True})
+    assert engine._evaluate_condition(step['condition'], context)
+
+
+def test_disabled_music_planner_does_not_create_plan(tmp_path):
+    from custom_tools.storybook.music_planner import music_planner_tool
+    result = music_planner_tool(base_dir=str(tmp_path), enable=False)
+    assert result['status'] == 'skipped'
+    assert not (tmp_path / '98_audio').exists()
+
+
 def test_expensive_side_effect_steps_marked_non_retryable():
     data = _load_raw()
     steps = {s["id"]: s for s in data.get("steps", [])}

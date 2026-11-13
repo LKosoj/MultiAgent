@@ -67,6 +67,9 @@ export const editableExtension = (name: unknown): boolean => {
 // «папка/имя»: так образцы выглядели в старой панели
 export const referenceLabel = (path: string): string => {
   const parts = path.split("/").filter(Boolean);
+  // общие образцы серии лежат под именем-хешем: короткий хеш с категорией читается лучше
+  const hashed = parts.length >= 2 ? /^([0-9a-f]{64})\.[a-z0-9]+$/i.exec(parts[parts.length - 1]) : null;
+  if (hashed) return `${parts[parts.length - 2]} · ${hashed[1].slice(0, 8)}`;
   return parts.length >= 2 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : (parts[0] ?? path);
 };
 

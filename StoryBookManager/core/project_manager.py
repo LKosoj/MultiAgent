@@ -90,6 +90,7 @@ class Project:
             media_dirs = {
                 "images": "50_images",
                 "references": "20_bible/references",
+                "shared_references": "shared/references",
                 "shots": "97_shots"
             }
             

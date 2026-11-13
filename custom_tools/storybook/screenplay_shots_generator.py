@@ -79,6 +79,135 @@ _PROMPT_LANGUAGE_NAMES = {
 }
 
 
+def _map_camera_plan_to_shot_size(plan: str) -> str:
+    p = (plan or "").lower()
+    if (
+        ("extreme" in p and ("close" in p or "up" in p))
+        or "сверхкруп" in p
+        or "macro" in p
+        or "макро" in p
+    ):
+        return "Extreme close-up"
+    if ("medium" in p and "close" in p) or "среднекруп" in p:
+        return "Medium close-up"
+    if "круп" in p or "close" in p:
+        return "Close-up"
+    if "сред" in p or "medium" in p:
+        return "Medium shot"
+    if "общ" in p or "wide" in p:
+        return "Wide shot"
+    return ""
+
+_CHANGED_CAST_REFERENCE_ROLE = (
+    "The previous-shot frame is a reference for environment and recurring objects only. "
+    "Take each current character's face, body, clothing and accessories from its own named character reference "
+    "and current authored appearance state, never from a differently named actor in the previous frame."
+)
+_DISJOINT_CAST_REFERENCE_ROLE = (
+    "Create the current shot with each actor's face, body, clothing and accessories from its own named character reference "
+    "and current authored appearance state. The previous shot has different actors: do not preserve or dress its actors. "
+    "Use the location/background references for the environment and the current shot description for framing."
+)
+
+
+def _changed_cast_prompt(item: Dict[str, Any], role=_CHANGED_CAST_REFERENCE_ROLE) -> str:
+    prompt = str(item.get("english_prompt") or "")
+    old_role = item.get("reference_roles_instruction")
+    if old_role and old_role != role:
+        prompt = prompt.replace(old_role, "").strip()
+    if role not in prompt:
+        prompt = f"{prompt}\n\n{role}".strip()
+    return prompt
+
+
+def _frame_cast(item, phase):
+    spec = item.get("_shot_frame_spec") or item.get("shot_frame_spec") or {}
+    state = spec.get(f"{phase}_state_spec") or {}
+    names = state.get("visible_characters", spec.get("visible_characters", item.get("characters")))
+    if names is None:
+        return None
+    return {str(name.get("name") if isinstance(name, dict) else name).strip().casefold() for name in names}
+
+
+def _full_copy_mismatch(previous_end: Dict[str, Any], start: Dict[str, Any]) -> str:
+    previous_cast, next_cast = _frame_cast(previous_end, "end"), _frame_cast(start, "start")
+    if previous_cast is not None and next_cast is not None and previous_cast != next_cast:
+        return "visible_characters_changed"
+    previous_size = _map_camera_plan_to_shot_size(previous_end.get("final_shot_size") or previous_end.get("camera_plan") or "")
+    next_size = _map_camera_plan_to_shot_size(start.get("camera_plan") or "")
+    if previous_size and next_size and previous_size != next_size:
+        return "shot_size_changed"
+    return ""
+
+
+def _normalize_full_copy_links(items: List[Dict[str, Any]], shot_keys=None) -> List[Dict[str, Any]]:
+    ends = {os.path.abspath(item["output_path"]): item for item in items
+            if item.get("shot_type") == "end" and item.get("output_path")}
+    changed = []
+    for item in items:
+        if item.get("shot_type") != "start":
+            continue
+        if shot_keys is not None and f"{item.get('scene_number')}-{item.get('shot_number')}" not in shot_keys:
+            continue
+        refs = item.get("reference_image_paths") or []
+        if isinstance(refs, str):
+            refs = [refs]
+        source_path = item.get("source_end_path") or next((ref for ref in refs if os.path.abspath(ref) in ends), None)
+        previous = ends.get(os.path.abspath(source_path)) if source_path else None
+        reason = _full_copy_mismatch(previous, item) if previous else ""
+        old_cast = _frame_cast(previous, "end") if previous else None
+        new_cast = _frame_cast(item, "start")
+        disjoint = bool(old_cast and new_cast and old_cast.isdisjoint(new_cast))
+        role = _DISJOINT_CAST_REFERENCE_ROLE if disjoint else _CHANGED_CAST_REFERENCE_ROLE
+        role_changed = reason == "visible_characters_changed" and (
+            item.get("reference_roles_instruction") != role
+            or item.get("english_prompt") != _changed_cast_prompt(item, role)
+            or (disjoint and source_path in refs))
+        if not reason or (not item.get("copy_from_previous_end") and not role_changed):
+            continue
+        if role_changed:
+            item["english_prompt"] = _changed_cast_prompt(item, role)
+            item["reference_roles_instruction"] = role
+        remaining = [ref for ref in refs if os.path.abspath(ref) != os.path.abspath(source_path)]
+        item.update(copy_from_previous_end=False, link_type="independent" if disjoint else "reference", should_link_as_next_start=False,
+                    source_end_path=None if disjoint else source_path, should_use_prev_end_as_reference=not disjoint,
+                    reference_image_paths=remaining if disjoint else [source_path, *remaining],
+                    link_reasoning=f"Previous-frame link corrected automatically: {reason}")
+        if disjoint:
+            for field in ("image_path", "base_image_path"):
+                if item.get(field) and os.path.abspath(item[field]) == os.path.abspath(source_path):
+                    item[field] = None
+        logger.warning("Previous-frame link corrected automatically for %s-%s: %s", item.get("scene_number"), item.get("shot_number"), reason)
+        changed.append(item)
+    return changed
+
+
+def _scope_cached_shot_paths(project_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep cached episode shot outputs and their continuity links in the episode."""
+    from .project_paths import current_series_scope, storybook_projects_root
+    scope = current_series_scope()
+    if not scope or scope[0] != project_id:
+        return data
+    target = str(safe_storybook_project_dir(project_id) / "97_shots") + "/"
+    prefixes = (
+        str(storybook_projects_root() / project_id / "97_shots") + "/",
+        f"plots/storybooks/{project_id}/97_shots/",
+    )
+
+    def scoped(value):
+        if isinstance(value, str):
+            for prefix in prefixes:
+                value = value.replace(prefix, target)
+            return value
+        if isinstance(value, list):
+            return [scoped(item) for item in value]
+        if isinstance(value, dict):
+            return {key: scoped(item) for key, item in value.items()}
+        return value
+
+    return scoped(data)
+
+
 def _get_prompt_language_label(language: str) -> str:
     return _PROMPT_LANGUAGE_LABELS.get(language, f"языке с кодом {language}")
 
@@ -270,9 +399,10 @@ def screenplay_shots_generator_tool(
     scene_numbers: Optional[List[int]] = None,
     shot_keys: Optional[List[str]] = None,
     force: bool = False,
-    generate_blockout: bool = True,
+    generate_blockout: bool = False,
     allowed_durations: Optional[List[int]] = None,
     screenplay_time: Optional[int] = None,
+    frame_resolution: str = "",
 ) -> Dict[str, Any]:
     """
     Генерирует shots.json для создания изображений кадров на основе режиссерского сценария.
@@ -287,13 +417,14 @@ def screenplay_shots_generator_tool(
         scene_numbers: Опционально явный список номеров сцен для генерации (например: [2, 3]).
         shot_keys: Только указанные ключи scene-shot; остальные шоты сохраняются.
         force: Если True — игнорирует существующий shots.json и перегенерирует заново (полезно при частичной генерации).
-        generate_blockout: Если True (по умолчанию) — отсутствие/пустота набора supported_durations
-            видеомодели останавливает генерацию блокирующей ошибкой B15. Если False — генерация
+        generate_blockout: Если True — отсутствие/пустота набора supported_durations
+            видеомодели останавливает генерацию блокирующей ошибкой B15. Если False (по умолчанию) — генерация
             продолжается без нормализации длительности (P14), существующие duration_s не трогаются.
         allowed_durations: Ограничение набора длительностей модели значениями проекта
             (blockout_allowed_durations). Пустой/не заданный — берётся весь набор модели.
         screenplay_time: Целевая длительность сценария в секундах — только для справочной строки
             предупреждения P17 (не влияет на нормализацию и ничего не блокирует).
+        frame_resolution: Размер кадров WxH; пустая строка сохраняет 1920x1088.
 
     Returns:
         Словарь в формате items.json для совместимости с artist_agent_batch_edit_tool.
@@ -305,6 +436,10 @@ def screenplay_shots_generator_tool(
         logger.info("🎬 Генерация кадров отключена (enable=False)")
         # Возвращаем пустую структуру в формате items.json
         return {"items": [], "consistency_rules": []}
+
+    frame_width, frame_height = map(int, (frame_resolution or "1920x1088").lower().split("x"))
+    if frame_width <= 0 or frame_height <= 0:
+        raise ValueError("Размер кадров должен быть положительным: WxH")
     
     # Пути к файлам (M-23: единый резолвер, как в audio_subtitle/montage)
     base_dir = str(safe_storybook_project_dir(project_id))
@@ -428,6 +563,10 @@ def screenplay_shots_generator_tool(
             logger.warning("⚠️ Не удалось прочитать существующий shots.json: %s", e)
             on_disk_meta = {}
 
+    scoped_meta = _scope_cached_shot_paths(project_id, on_disk_meta)
+    if scoped_meta != on_disk_meta:
+        on_disk_meta = _merge_write_shots(shots_path, shots_data=scoped_meta, partial=True)
+
     # seed: on-disk (resume) → brief.json → random (L-12: стабильный seed при resume)
     seed = random.randint(1, 1000000)  # Значение по умолчанию
     brief_path = f"{base_dir}/00_brief.json"
@@ -456,6 +595,7 @@ def screenplay_shots_generator_tool(
         seed=seed,
         language=language,
         generate_end_shots=generate_end_shots,
+        frame_resolution=frame_resolution,
     )
 
     # --- Э0.3, блоки 2/3/4: возможности видеомодели + effective_durations ---
@@ -967,6 +1107,10 @@ def screenplay_shots_generator_tool(
                 previous_end_llm_result = None
                 previous_end_shot_item = None
 
+            for shot_item in (start_shot_item, end_shot_item):
+                if shot_item is not None:
+                    shot_item.update(width=frame_width, height=frame_height)
+
             if "face_visibility_relative" in shot:
                 for shot_item in (start_shot_item, end_shot_item):
                     if shot_item is not None:
@@ -1163,6 +1307,7 @@ def _compute_inputs_hash(
     language: str,
     generate_end_shots: bool,
     image_style_catalog: Optional[Dict[str, Any]] = None,
+    frame_resolution: str = "",
 ) -> str:
     """sha256 по стабильным входам всего фильма (M-26).
 
@@ -1180,6 +1325,8 @@ def _compute_inputs_hash(
         "language": language,
         "generate_end_shots": bool(generate_end_shots),
     }
+    if frame_resolution:
+        payload["frame_resolution"] = frame_resolution
     if image_style_catalog:
         default_style = image_style_catalog.get("default_style_id")
         location_bindings = image_style_catalog.get("location_bindings") or {}
@@ -1628,6 +1775,7 @@ def _merge_write_shots(
                     shots_data = _merge_shots_payload(on_disk, shots_data)
 
                 items = shots_data.get("items") or []
+                changed_links = _normalize_full_copy_links(items, shot_keys)
                 duration_items = items if shot_keys is None else [
                     i for i in items if f"{i['scene_number']}-{i['shot_number']}" in shot_keys]
                 if manual_overrides:
@@ -1670,6 +1818,9 @@ def _merge_write_shots(
                     with open(tmp, "w", encoding="utf-8") as wf:
                         json.dump(shots_data, wf, ensure_ascii=False, indent=2)
                     os.replace(tmp, shots_path)
+                    for item in changed_links:
+                        if item.get("output_path"):
+                            Path(item["output_path"]).with_suffix(".continuity.json").unlink(missing_ok=True)
                 except Exception:
                     try:
                         os.remove(tmp)
@@ -3356,23 +3507,6 @@ def _convert_end_to_start_shot_item(
     except Exception:
         linked_location_canon_name = ""
 
-    def _map_camera_plan_to_shot_size(plan: str) -> str:
-        p = (plan or "").lower()
-        if (
-            ("extreme" in p and ("close" in p or "up" in p))
-            or "сверхкруп" in p
-            or "macro" in p
-            or "макро" in p
-        ):
-            return "Extreme close-up"
-        if "круп" in p or "close" in p:
-            return "Close-up"
-        if "сред" in p or "medium" in p:
-            return "Medium shot"
-        if "общ" in p or "wide" in p:
-            return "Wide shot"
-        return ""
-    
     # Подготавливаем референсы для LLM (включая continuity reference)
     enhanced_characters_data = list(characters_data)
     enhanced_locations_data = list(locations_data)
@@ -3640,6 +3774,10 @@ def _convert_end_to_start_shot_item(
     else:
         size_compatible = bool(planned_start_size) and planned_start_size.lower() == str(end_final_size).strip().lower()
 
+    copy_mismatch = _full_copy_mismatch(previous_end_shot_item, new_shot_item)
+    if copy_mismatch:
+        strict_link = False
+
     if strict_link and size_compatible:
         # Полное копирование допустимо
         logger.info(f"🔗 Применяется полное копирование: strict_link={strict_link}, size_compatible={size_compatible}")
@@ -3674,4 +3812,5 @@ def _convert_end_to_start_shot_item(
             "link_reasoning": reasoning
         })
     
+    _normalize_full_copy_links([previous_end_shot_item, new_shot_item])
     return new_shot_item

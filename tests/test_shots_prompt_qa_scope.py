@@ -254,3 +254,37 @@ def test_previous_end_is_offered_and_shown_to_visual_audit(tmp_path, monkeypatch
     assert items[1]['reference_image_paths'] == []
     previous.unlink()
     assert sq._previous_end_paths(items) == {}
+
+
+@pytest.mark.parametrize('shared_old', [False, True])
+def test_canonical_location_review_finds_moved_reference(tmp_path, monkeypatch, shared_old):
+    from PIL import Image
+    from custom_tools.storybook import reference_catalog as catalog
+    from custom_tools.storybook.project_paths import series_scope
+    from custom_tools.storybook.studio.capabilities import invoke
+    pid = invoke('projects_create', dict(title='World', description='Shared world of a show', genre='comedy',
+                                         target_age='all'))['project_id']
+    sid = invoke('series_create', dict(project_id=pid, title='One', source_material='', participant_ids=[],
+                                       settings={}))['series_id']
+    base = tmp_path / pid / 'series' / sid
+    _write_screenplay(tmp_path, f'{pid}/series/{sid}', [_scene(1)])
+    old = (base.parent.parent if shared_old else base) / '20_bible/references/locations/yard.png'
+    old.parent.mkdir(parents=True, exist_ok=True)
+    Image.new('RGB', (16, 16)).save(old)
+    new = catalog.store_reference(base, old, 'location', 'yard', description='Yard')
+    assert not old.exists()
+    shot = base / 'shot.png'
+    Image.new('RGB', (16, 16)).save(shot)
+    item = _item(1, 1, 'start')
+    item['output_path'] = str(shot)
+    item['locations'] = [{'name': 'Yard', 'reference_image_path': '/references/locations/yard.png'}]
+    (base / '97_shots').mkdir(exist_ok=True)
+    (base / '97_shots/shots.json').write_text(json.dumps({'items': [item]}))
+    rendered = []
+    monkeypatch.setattr(sq, '_scene_render_review_image', lambda frames: rendered.append(frames) or 'image')
+    monkeypatch.setattr(sq, '_extract_shot_frame_spec_llm', lambda **kwargs: {})
+    monkeypatch.setattr(sq, 'call_openai_api', lambda **kwargs: '{"violations": [], "repairs": []}')
+    with series_scope(pid, sid):
+        sq.shots_prompt_qa_tool('s', pid, shots_data={'items': [item]}, shot_keys=['1-1'], force=True, dry_run=True)
+    assert any(frame.get('shot_type') == 'CANONICAL_LOCATION_1' and frame['output_path'] == new
+               for group in rendered for frame in group)

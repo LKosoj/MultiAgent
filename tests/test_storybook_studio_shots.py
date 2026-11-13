@@ -755,3 +755,91 @@ def test_conflict_in_artifact_save_makes_no_records(project):
     res = call("artifact_save", key="shots", base_digest="sha256:wrong", content=content)
     assert res["error"]["code"] == "conflict"
     assert not (project / ".studio/shot_inputs.json").exists()
+
+
+# --- референсы серии в shared/references ------------------------------------------------
+
+def _move_ref(root, old_rel, name="hero"):
+    """Референс переехал в shared/references; старый путь остался алиасом в каталоге."""
+    from custom_tools.storybook import reference_catalog as catalog
+    old = root.parents[1] / old_rel
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_bytes(b"ref-" + name.encode())
+    new = Path(catalog.store_reference(root, old, "identity", name))
+    assert not old.exists() and new.is_file()
+    return new
+
+
+def test_moved_reference_view_exists_and_fresh_after_move(project):
+    old = project / "20_bible/references/characters/hero.png"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"ref-hero")
+    doc = read_items(project)
+    doc["items"][0]["reference_image_paths"] = ["/references/characters/hero.png"]
+    write_items(project, doc)
+    adopt()  # база до переноса
+    from custom_tools.storybook import reference_catalog as catalog
+    new = Path(catalog.store_reference(project, old, "identity", "hero"))
+    shots()._CACHE.clear()
+    card = call("shot_get", shot_key="1-1")["shot"]
+    assert card["stale_parts"] == [] and card["parts"]["start"]["freshness"] == "fresh"
+
+
+def test_moved_reference_content_change_still_stales(project):
+    old = project.parents[1] / "20_bible/references/characters/hero.png"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"ref-hero")
+    doc = read_items(project)
+    doc["items"][0]["reference_image_paths"] = ["/references/characters/hero.png"]
+    write_items(project, doc)
+    from custom_tools.storybook import reference_catalog as catalog
+    new = Path(catalog.store_reference(project, old, "identity", "hero"))
+    adopt()
+    new.write_bytes(b"changed bytes!")
+    card = call("shot_get", shot_key="1-1")["shot"]
+    assert card["stale_reasons"]["start"] == ["references_changed"]
+
+
+def test_ref_view_resolves_moved_and_shared_paths(project):
+    new = _move_ref(project, "20_bible/references/characters/a.png", "a")
+    doc = read_items(project)
+    doc["items"][0]["reference_image_paths"] = ["/references/characters/a.png", f"shared/references/characters/{new.name}",
+                                                "/references/characters/missing.png"]
+    write_items(project, doc)
+    s = shots()
+    s._CACHE.clear()
+    ctx = s._Ctx(PID)
+    view = s._ref_view(ctx, {"refs": doc["items"][0]["reference_image_paths"]})
+    want = f"shared/references/characters/{new.name}"
+    assert [v["path"] for v in view[:2]] == [want, want]
+    assert [v["exists"] for v in view] == [True, True, False]
+    # ключ отпечатка: у shared-пути sha (не зависит от папки категории), у старого алиаса путь из шота
+    entries = ctx._ref_entries({"refs": [want, "/references/characters/a.png"], "bg": None}, None)
+    assert entries[0] == ["sha:" + new.stem, entries[0][1]] and entries[0][1] and entries[1][0] == "20_bible/references/characters/a.png"
+    assert entries[1][1] == entries[0][1]
+
+
+def test_unbound_project_root_reference_does_not_exist(project):
+    """Файл лежит в корне проекта, но не привязан к серии: генератор на нём упадёт, значит exists=false."""
+    from custom_tools.storybook import reference_catalog as catalog
+    bound = project.parents[1] / "20_bible/references/characters/b.png"
+    bound.parent.mkdir(parents=True)
+    bound.write_bytes(b"bound")
+    catalog.store_reference(project, bound, "identity", "b")
+    other = project.parents[1] / "20_bible/references/characters/other.png"
+    other.write_bytes(b"other")
+    s = shots()
+    s._CACHE.clear()
+    ctx = s._Ctx(PID)
+    view = s._ref_view(ctx, {"refs": ["/references/characters/other.png", "/references/characters/b.png"]})
+    assert [v["exists"] for v in view] == [False, True]
+
+
+def test_ref_view_resolves_series_scoped_alias(project):
+    """Единственный алиас записи лежит под _series/<sid>: шот со ссылкой /references/... всё равно находит файл."""
+    new = _move_ref(project, f"20_bible/references/_series/{project.name}/characters/x.png", "x")
+    s = shots()
+    s._CACHE.clear()
+    view = s._ref_view(s._Ctx(PID), {"refs": ["/references/characters/x.png"]})
+    assert [v["exists"] for v in view] == [True]
+    assert view[0]["path"] == f"shared/references/characters/{new.name}"

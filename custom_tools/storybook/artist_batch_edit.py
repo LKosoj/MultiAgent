@@ -2,9 +2,11 @@ import os
 import contextvars
 import re
 import json
+import hashlib
 import logging
 import glob
 import shutil
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
@@ -15,7 +17,7 @@ from custom_tools.storybook.entity_generator_utils import build_canon_image_prom
 from custom_tools.storybook.screenplay_shots_generator_utils.shared_utils import (
     black_screen_storyboard_shot,
 )
-from custom_tools.storybook.project_paths import safe_storybook_project_dir
+from custom_tools.storybook.project_paths import safe_storybook_project_dir, reference_project_dir, current_series_scope, existing_reference_path
 
 # Локальные импорты
 from agent_factory import AgentFactory
@@ -847,6 +849,20 @@ def _apply_blockout_reference_to_item(item: Dict[str, Any], blockout_ref_image: 
     )
 
 
+def _entity_reference_names(item, field):
+    names = {}
+    for entity in item.get(field) or []:
+        if not isinstance(entity, dict) or not entity.get("reference_image_path"):
+            continue
+        path = str(entity["reference_image_path"])
+        names[os.path.abspath(path)] = entity.get("name", "")
+        if item.get("project_id"):
+            from .background_references import _reference_path
+            resolved = _reference_path(safe_storybook_project_dir(item["project_id"]), path)
+            names[os.path.abspath(resolved)] = entity.get("name", "")
+    return names
+
+
 def _background_reference_binding(
     item: Dict[str, Any], reference_paths: List[str], language: str = "en",
     location_paths: Optional[set] = None,
@@ -856,6 +872,8 @@ def _background_reference_binding(
     if not isinstance(binding, dict):
         return reference_paths, ""
     sheet = str(binding.get("sheet_path") or "").strip()
+    if sheet and item.get("project_id"):
+        sheet = existing_reference_path(safe_storybook_project_dir(item["project_id"]), sheet)
     if not sheet or not os.path.exists(sheet):
         raise FileNotFoundError(f"Фоновой лист-карточка не найден: {sheet}")
     try:
@@ -870,11 +888,8 @@ def _background_reference_binding(
     location_index = next((index for index, path in enumerate(reference_paths) if path in location_paths), None)
     continuity = [path for path in kept if "/97_shots/" in path
                   or (item.get("_continuity_edit_findings") and os.path.abspath(path) == os.path.abspath(item.get("output_path") or ""))]
-    character_basenames = {
-        os.path.basename(str(character.get("reference_image_path") or ""))
-        for character in item.get("characters") or [] if isinstance(character, dict)
-    }
-    characters = [path for path in kept if os.path.basename(path) in character_basenames
+    character_paths = _entity_reference_names(item, "characters")
+    characters = [path for path in kept if os.path.abspath(path) in character_paths
                   or ("characters" not in item and "/characters/" in path)]
     other = [path for path in kept if path not in continuity and path not in characters]
     max_count = 4 if (os.getenv("IMG2IMG_MODEL") or os.getenv("VSEGPT_IMG2IMG_MODEL") or "").strip() == "llmgateway/gpt-image-2" else 10
@@ -908,15 +923,15 @@ def _replace_stale_background_reference_roles(prompt: str, paths: List[str], ite
             role_end = len(prompt)
         core = (prompt[:role_start] + prompt[role_end:]).strip()
     roles = []
-    character_names = {
-        os.path.basename(str(character.get("reference_image_path") or "")): str(character.get("name") or "character")
-        for character in (item.get("characters") or []) if isinstance(character, dict)
-    }
+    character_names = _entity_reference_names(item, "characters")
     for index, path in enumerate(paths, 1):
         if os.path.abspath(path) == os.path.abspath(sheet_path):
             label = "background-card sheet"
-        elif os.path.basename(path) in character_names:
-            label = f"character — {character_names[os.path.basename(path)]}"
+        elif os.path.abspath(path) in character_names:
+            name = character_names[os.path.abspath(path)]
+            from .screenplay_shots_generator_utils.technical import _character_placement
+            placement = _character_placement(name, item.get("_shot_frame_spec"), item.get("shot_type", "start"))
+            label = f"character — {name}" + (f"; положение и видимость: {placement}" if placement else "")
         elif "/97_shots/" in path:
             label = "continuity reference"
         elif "/characters/" in path:
@@ -1137,6 +1152,36 @@ def _build_image_generation_prompts(
     return english_prompt, negative_prompt
 
 
+def _reuse_legacy_series_shot_image(item: Dict[str, Any]) -> bool:
+    """Reuse a matching shot saved at the project root before episode path repair."""
+    from pathlib import Path
+    from .project_paths import current_series_scope, storybook_projects_root
+    from .continuity import image_continuity_hash
+    scope = current_series_scope()
+    project_id = item.get("project_id")
+    if not scope or scope[0] != project_id or not item.get("output_path"):
+        return False
+    target = Path(item["output_path"])
+    if target.exists():
+        return False
+    try:
+        relative = target.resolve().relative_to(safe_storybook_project_dir(project_id) / "97_shots")
+    except ValueError:
+        return False
+    source = storybook_projects_root() / project_id / "97_shots" / relative
+    sidecar = source.with_suffix(".continuity.json")
+    if not source.is_file() or not sidecar.is_file():
+        return False
+    fingerprint = image_continuity_hash(item)
+    if fingerprint is None or json.loads(sidecar.read_text()).get("input_hash") != fingerprint:
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    shutil.copy2(sidecar, target.with_suffix(".continuity.json"))
+    logger.info("Reused existing episode shot without generation: %s", target)
+    return True
+
+
 def _handle_linked_shot(item: Dict[str, Any]) -> bool:
     """
     Обрабатывает кадр, связанный с предыдущим end кадром.
@@ -1241,7 +1286,6 @@ def _build_edit_instruction(
     
     # Получаем project_id для формирования правильных путей к референсам
     project_id = item.get("project_id", "")
-    reference_base = str(safe_storybook_project_dir(project_id) / "20_bible" / "references") if project_id else "plots/references"
     
     reference_paths = item.get("reference_image_paths") or item.get("references") or []
     
@@ -1267,11 +1311,13 @@ def _build_edit_instruction(
     for ref_path in reference_paths:
         if ref_path.startswith("/references/"):
             # Убираем ведущий слеш и заменяем "/references/" на reference_base
-            corrected_path = os.path.join(reference_base, ref_path[12:])  # 12 = len("/references/")
+            from .background_references import _reference_path
+            corrected_path = str(_reference_path(safe_storybook_project_dir(project_id), ref_path)) if project_id else os.path.join("plots/references", ref_path[12:])
             corrected_reference_paths.append(corrected_path)
         elif ref_path.startswith("references/"):
             # Убираем "references/" и заменяем на reference_base
-            corrected_path = os.path.join(reference_base, ref_path[11:])  # 11 = len("references/")
+            from .background_references import _reference_path
+            corrected_path = str(_reference_path(safe_storybook_project_dir(project_id), ref_path)) if project_id else os.path.join("plots/references", ref_path[11:])
             corrected_reference_paths.append(corrected_path)
         elif ref_path.startswith("plots/storybooks/") and "/97_shots/" in ref_path:
             # Legacy relative shot path: anchor it to the configured project
@@ -1281,8 +1327,10 @@ def _build_edit_instruction(
                 str(safe_storybook_project_dir(project_id) / relative_shot_path)
             )
         else:
-            # Оставляем путь как есть, если он уже корректный
-            corrected_reference_paths.append(ref_path)
+            # Файл мог быть перенесён в общий каталог: берём разрешённый путь
+            corrected_reference_paths.append(
+                existing_reference_path(safe_storybook_project_dir(project_id), ref_path) if project_id else ref_path
+            )
     
     # Преобразуем в абсолютные пути
     abs_reference_paths = []
@@ -1301,19 +1349,14 @@ def _build_edit_instruction(
             raise FileNotFoundError(f"Continuity edit base not found: {base}")
         reference_paths = [base] + [path for path in reference_paths if os.path.abspath(path) != base]
 
-    location_basenames = {
-        os.path.basename(str(location.get("reference_image_path") or ""))
-        for location in (item.get("locations") or [])
-        if isinstance(location, dict) and location.get("reference_image_path")
-    }
-    location_paths = {
-        path for path in reference_paths
-        if os.path.basename(path) in location_basenames
-    }
+    location_references = _entity_reference_names(item, "locations")
+    location_paths = {path for path in reference_paths if os.path.abspath(path) in location_references}
     background_note = ""
     if isinstance(item.get("background_reference"), dict):
         if edit_findings:
             sheet = str(item["background_reference"].get("sheet_path") or "")
+            if sheet and project_id:
+                sheet = existing_reference_path(safe_storybook_project_dir(project_id), sheet)
             reference_paths = [path for path in reference_paths
                                if path not in location_paths and "/locations/" not in path
                                and (not sheet or os.path.abspath(path) != os.path.abspath(sheet))]
@@ -1580,7 +1623,14 @@ def _find_entity_by_reference_path(items_data: List[Dict[str, Any]], ref_path: s
 
 def _collect_project_references(project_id: str, entity_type: str, max_count: int = 10) -> List[str]:
     """Собирает до max_count существующих референсных файлов из проектных каталогов с приоритетом."""
-    references_dir = str(safe_storybook_project_dir(project_id) / "20_bible" / "references")
+    from .reference_catalog import _enabled, bootstrap_series_references, bound_reference_paths
+    base = safe_storybook_project_dir(project_id)
+    if _enabled(base):
+        bootstrap_series_references(base)
+        primary = bound_reference_paths(base, [entity_type])
+        secondary = bound_reference_paths(base, ["location" if entity_type == "character" else "character"])
+        return list(dict.fromkeys(primary + secondary))[:max_count]
+    references_dir = str(reference_project_dir(base) / "20_bible" / "references")
     
     # Определяем приоритетный каталог
     primary_dir = f"{references_dir}/{entity_type}s/"  # characters/ или locations/
@@ -1909,12 +1959,17 @@ def _create_canon_reference(
                 if not parts:
                     return None
                 project_id_local = parts[0]
+                scope = current_series_scope()
+                if scope and scope[0] == project_id_local:
+                    return str(safe_storybook_project_dir(project_id_local))
                 return f"{prefix}{marker}{project_id_local}"
             except Exception:
                 return None
 
         base_dir = _infer_base_dir_from_output(output_path)
         if base_dir:
+            from .style_keeper import project_reference_style_prompt
+            project_style = project_reference_style_prompt(base_dir)
             style_images_path = f"{base_dir}/30_style/style_images.json"
             try:
                 if os.path.exists(style_images_path):
@@ -1925,7 +1980,9 @@ def _create_canon_reference(
             except Exception:
                 style_images = {}
 
-            if isinstance(style_images, dict) and style_images:
+            if project_style is not None:
+                prompt += f"\n\nIMAGE STYLE:\n{project_style}"
+            elif isinstance(style_images, dict) and style_images:
                 from .style_keeper import ensure_image_style_catalog
                 catalog = ensure_image_style_catalog(base_dir, style_images)
                 style = catalog["styles"][catalog["default_style_id"]]
@@ -1991,6 +2048,8 @@ def _create_canon_reference(
             
             # Проверяем результат
             if os.path.exists(output_path):
+                from .reference_catalog import register_canon_reference
+                register_canon_reference(output_path, entity_type, entity_data)
                 logger.info(f"✅ Канонический референс создан: {output_path}")
                 return True
             else:
@@ -2034,12 +2093,13 @@ def _preprocess_canon_references(
         return []
     
     canon_tasks = []
-    project_dir = os.path.abspath(str(safe_storybook_project_dir(project_id))) + os.sep
+    project_dir = os.path.abspath(str(reference_project_dir(safe_storybook_project_dir(project_id)))) + os.sep
     
     # Анализируем каждый повторный референс
     for ref_path in repeated_refs.keys():
-        if os.path.isfile(ref_path) and os.path.abspath(ref_path).startswith(project_dir):
-            logger.info(f"📁 Готовый проектный референс сохранён: {ref_path}")
+        resolved_ref = existing_reference_path(safe_storybook_project_dir(project_id), ref_path)
+        if os.path.isfile(resolved_ref) and (resolved_ref != ref_path or os.path.abspath(ref_path).startswith(project_dir)):
+            logger.info(f"📁 Готовый проектный референс сохранён: {resolved_ref}")
             continue
         # Проверяем, находится ли уже в проектном каталоге И существует ли физически
         if f"/20_bible/references/" in ref_path:
@@ -2065,8 +2125,8 @@ def _preprocess_canon_references(
             canon_path = os.path.abspath(ref_path)
         else:
             # Если файл внешний, строим путь в проектном каталоге
-            canon_path = str(safe_storybook_project_dir(project_id) / "20_bible") + str(entity_data.get("reference_image_path", ""))
-            canon_path = os.path.abspath(canon_path)
+            from .background_references import _reference_path
+            canon_path = str(_reference_path(safe_storybook_project_dir(project_id), entity_data.get("reference_image_path", "")).resolve())
         
         # Проверяем, существует ли уже канон
         if os.path.exists(canon_path):
@@ -2410,6 +2470,10 @@ def artist_agent_batch_edit_tool(
     # Получаем project_id для чтения seed из brief.json
     temp_items_data = items_obj.get("items", []) if isinstance(items_obj, dict) else items_obj
     project_id_for_seed = temp_items_data[0].get("project_id") if temp_items_data else None
+    if project_id_for_seed:
+        from .screenplay_shots_generator import _scope_cached_shot_paths, _normalize_full_copy_links
+        items_obj = _scope_cached_shot_paths(project_id_for_seed, items_obj)
+        _normalize_full_copy_links(items_obj.get("items", []) if isinstance(items_obj, dict) else items_obj)
     
     # Читаем seed из brief.json или items_obj
     seed = random.randint(1, 1000000)  # Значение по умолчанию
@@ -2613,6 +2677,8 @@ def artist_agent_batch_edit_tool(
                 # П12 (раздел 20.2/Р4): оба исхода отката должны быть видны в возвращаемой записи —
                 # и переход к обычной генерации, и возврат уже лежащего на диске файла ниже.
                 link_copy_failed_this_run = item.get("link_copy_failed", False)
+
+            _reuse_legacy_series_shot_image(item)
 
             # Проверяем, существует ли уже финальное изображение
             output_path = item.get("output_path", "")
@@ -2960,19 +3026,7 @@ def _generate_image_from_scratch(
     
     # Собираем промпт на основе данных о персонаже
     name = protagonist_data.get("name") or "Hero"
-    imm = protagonist_data.get("immutable_attributes", {})
-    var = protagonist_data.get("variable_attributes", {})
-    prompt = (
-        f"Full-body portrait of {name} as main protagonist, neutral pose, neutral background, "
-        f"face_shape: {imm.get('face_shape','')}, eye_color: {imm.get('eye_color','')}, "
-        f"skin_tone: {imm.get('skin_tone','')}, body_proportions: {imm.get('body_proportions','')}, "
-        f"unique_features: {', '.join(imm.get('unique_features', []))}. "
-        f"base_clothing: {var.get('base_clothing','')}, base_hairstyle: {var.get('base_hairstyle','')}, "
-        f"accessories: {', '.join(var.get('accessories', []))}. "
-    )
-    for field in ("historical_period", "environment_context"):
-        if protagonist_data.get(field):
-            prompt += f"{field}: {protagonist_data[field]}. "
+    prompt = build_canon_image_prompt("character", protagonist_data, [])
 
     # Добавляем информацию о стиле из файлов
     style_images_path = f"{base_dir}/30_style/style_images.json"
@@ -3014,6 +3068,10 @@ def _generate_image_from_scratch(
     if style_images.get("texture"): style_chunks.append(f"Texture: {style_images['texture']}.")
     if style_images.get("detail_density"): style_chunks.append(f"Detail level: {style_images['detail_density']}.")
     if style_images.get("model"): style_chunks.append(f"Prefer model: {style_images['model']}.")
+    from .style_keeper import project_reference_style_prompt
+    project_style = project_reference_style_prompt(base_dir)
+    if project_style is not None:
+        style_chunks = [project_style]
     if style_chunks:
         prompt = f"{prompt} {' '.join(style_chunks)}"
     
@@ -3036,8 +3094,8 @@ def _generate_image_from_scratch(
   - number: 1
   - negative_prompt: "усиленный_негативный_промпт"
   - seed: {seed}
-  - width: 1920
-  - height: 1088
+  - width: 1536
+  - height: 1024
 В ответе верни только финальный путь к файлу.
 """
     try:
@@ -3051,14 +3109,73 @@ def _generate_image_from_scratch(
         output = agent.run(task.strip(), stream=False)
         gen_path = _parse_output_path(str(output), session_id)
         if gen_path and os.path.exists(gen_path):
+            if not _reference_requirements_met(gen_path, protagonist_data):
+                os.remove(gen_path)
+                return False
             if os.path.abspath(gen_path) != os.path.abspath(output_path):
                 _ensure_parent_dir(output_path)
                 shutil.move(gen_path, output_path)
+            from .reference_catalog import register_canon_reference
+            register_canon_reference(output_path, "character", protagonist_data)
             return True
-        return os.path.exists(output_path)
+        if os.path.exists(output_path) and _reference_requirements_met(output_path, protagonist_data):
+            from .reference_catalog import register_canon_reference
+            register_canon_reference(output_path, "character", protagonist_data)
+            return True
+        return False
     except Exception as e:
         logger.error(f"Ошибка генерации изображения с нуля для {name}: {e}")
         return False
+
+
+def _reference_requirements_met(image_path: str, entity_data: Dict[str, Any], source_image_path: Optional[str] = None) -> bool:
+    requirements = entity_data.get("reference_requirements")
+    if not requirements:
+        return True
+    import base64
+    from agent_command import model_vision
+    from utils import call_openai_api, parse_llm_json
+
+    prompt = json.dumps({"name": entity_data.get("name"), "requirements": requirements}, ensure_ascii=False)
+    image_url = "data:image/png;base64," + base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+    comparison_instruction = ""
+    if source_image_path:
+        prompt = [
+            {"type": "text", "text": "APPROVED SOURCE: comparison baseline, not the candidate."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(Path(source_image_path).read_bytes()).decode("ascii")}},
+            {"type": "text", "text": "CANDIDATE: evaluate this image against the requirements and approved source. " + prompt},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+        image_url = None
+        comparison_instruction = (
+            "The first labeled image is an approved source, the second is the candidate. Evaluate only the candidate. "
+            "For inherited traits, preserve the source's actual appearance; do not demand more pronounced features "
+            "than the approved source. Verify the declared change, identity, artistic technique and view layout by "
+            "direct comparison. Only explicitly declared changes may differ from the source. "
+        )
+    system_prompt = (
+            comparison_instruction +
+            "Check the actual reference image against every supplied visual requirement in all views. "
+            "Fail only for an explicit requirement, not an invented preference. "
+            "Respect the supplied visual style and do not add constraints absent from the supplied list. "
+            "When a requirement specifies consistency "
+            "between views, compare those views against each other instead of evaluating them independently. "
+            "Return JSON {\"image_available\": true/false, \"passed\": true/false, \"violations\": [specific visible failures]}. "
+            "image_available is false ONLY when the actual image was not received or cannot be opened, "
+            "not when a feature is absent or hidden in the visible image. "
+            "If a required feature cannot be checked, fail and explain why."
+    )
+    for attempt in range(2):
+        result = parse_llm_json(call_openai_api(
+            prompt=prompt, image_url=image_url, system_prompt=system_prompt,
+            model=model_vision, response_format={"type": "json_object"}, max_tokens=4096, temperature=0.1,
+        ))
+        logger.warning("Reference requirements review for %s: %s", entity_data.get("name"), result)
+        if result.get('image_available') is False:
+            if attempt == 0:
+                continue
+            raise RuntimeError('Reference image unavailable to requirements reviewer')
+        return result.get("passed") is True and not result.get("violations")
 
 
 def _generate_canon_reference_from_scratch(
@@ -3080,6 +3197,22 @@ def _generate_canon_reference_from_scratch(
         if not prompt.strip():
             return False
 
+        project_base = next((parent.parent for parent in Path(output_path).resolve().parents
+                             if parent.name == "20_bible"), None)
+        if project_base is not None:
+            from .style_keeper import project_reference_style_prompt
+            project_style = project_reference_style_prompt(project_base)
+            scope = current_series_scope()
+            style_base = safe_storybook_project_dir(project_base.name) if scope and scope[0] == project_base.name else project_base
+            style_path = style_base / "30_style/style_images.json"
+            if project_style is not None:
+                prompt += "\n\nIMAGE STYLE:\n" + project_style
+            elif style_path.is_file():
+                from .style_keeper import ensure_image_style_catalog
+                style_data = json.loads(style_path.read_text(encoding="utf-8"))
+                catalog = ensure_image_style_catalog(style_path.parent.parent, style_data)
+                prompt += "\n\nIMAGE STYLE:\n" + catalog["styles"][catalog["default_style_id"]]["prompt"]
+
         if entity_type == "location":
             negative_prompt = "people, person, character, human, man, woman, child, figure, watermark, text, logo"
         elif entity_type == "character":
@@ -3100,6 +3233,7 @@ def _generate_canon_reference_from_scratch(
 СТРОГО СЛЕДУЙ ИНСТРУКЦИЯМ НИЖЕ:
 1) Используй инструмент generate_image_tool.
 2) Используй информацию для создания промпта для изображения. Переведи её на английский (проверь, что все слова переведены): "{english_prompt}"
+   Передай полный переведённый промпт без сокращения и повторного сочинения. Сохрани формат листа, состав ракурсов, крупность лица, нейтральный фон, приоритет референса внешности над сюжетным контекстом и все ограничения. Не усиливай признаки при переводе или переформулировке.
 3) Обязательно укажи negative_prompt (английский, не пустой).
 4) Параметры вызова generate_image_tool должны быть ПЕРЕДАНЫ ЯВНО как именованные аргументы:
    - prompt: "prompt_on_english"
@@ -3107,8 +3241,8 @@ def _generate_canon_reference_from_scratch(
    - number: 1
    - seed: {seed}
    - negative_prompt: "{negative_prompt}"
-   - width: 1920
-   - height: 1088
+   - width: 1536
+   - height: 1024
 
 КРИТИЧЕСКИ ВАЖНО:
 - Язык описания изображения (prompt) — ТОЛЬКО английский.
@@ -3131,11 +3265,23 @@ def _generate_canon_reference_from_scratch(
         output = agent.run(task.strip(), stream=False)
         gen_path = _parse_output_path(str(output), session_id)
         if gen_path and os.path.exists(gen_path):
+            with Image.open(gen_path) as reference:
+                if reference.size != (1536, 1024):
+                    logger.error("Reference size mismatch: requested 1536x1024, received %sx%s", *reference.size)
+                    os.remove(gen_path)
+                    return False
+            if not _reference_requirements_met(gen_path, entity_data):
+                os.remove(gen_path)
+                return False
             if os.path.abspath(gen_path) != os.path.abspath(output_path):
                 _ensure_parent_dir(output_path)
                 shutil.move(gen_path, output_path)
-            return os.path.exists(output_path)
-        if os.path.exists(output_path):
+            from .reference_catalog import register_canon_reference
+            register_canon_reference(output_path, entity_type, entity_data)
+            return True
+        if os.path.exists(output_path) and _reference_requirements_met(output_path, entity_data):
+            from .reference_catalog import register_canon_reference
+            register_canon_reference(output_path, entity_type, entity_data)
             return True
         return False
     except Exception as e:
@@ -3155,8 +3301,6 @@ def _ensure_references_exist(
 ):
     """Проверяет наличие всех изображений в image_paths содержащих 20_bible/references/ и генерирует недостающие."""
     
-    base_dir = str(safe_storybook_project_dir(project_id) / "20_bible")
-
     # Загружаем bible-данные, чтобы при генерации недостающих канонов
     # использовать ПОЛНОЕ описание персонажа/локации (а не фиктивные заглушки).
     # Иначе теряется признак "человек" / entity_nature и появляются антро-животные/роботы.
@@ -3175,6 +3319,8 @@ def _ensure_references_exist(
         marker = "/20_bible/references/"
         if marker in p:
             tail = p.split(marker, 1)[1].lstrip("/")
+            if tail.startswith('_series/'):
+                tail = tail.split('/', 2)[2]
             return "/references/" + tail
         # если уже /references/...
         if p.startswith("/references/"):
@@ -3187,9 +3333,11 @@ def _ensure_references_exist(
         if not ref_path:
             return ""
         if ref_path.startswith('/references/'):
-            return os.path.abspath(os.path.join(base_dir, ref_path.lstrip('/')))
+            from .background_references import _reference_path
+            return str(_reference_path(safe_storybook_project_dir(project_id), ref_path).resolve())
         if ref_path.startswith('references/'):
-            return os.path.abspath(os.path.join(base_dir, ref_path))
+            from .background_references import _reference_path
+            return str(_reference_path(safe_storybook_project_dir(project_id), ref_path).resolve())
         return os.path.abspath(ref_path)
 
     # 1. Сбор всех отсутствующих файлов из image_paths и reference_image_paths, которые содержат 20_bible/references/
@@ -3217,7 +3365,7 @@ def _ensure_references_exist(
             
             # Проверяем, относится ли путь к 20_bible/references/
             if "20_bible/references/" in resolved:
-                if not os.path.exists(resolved):
+                if not os.path.exists(existing_reference_path(safe_storybook_project_dir(project_id), resolved)):
                     missing_canonical_files.add(resolved)
                     logger.info(f"🔍 Найден отсутствующий канонический файл: {resolved} (исходный: {path})")
     
@@ -3267,10 +3415,22 @@ def _ensure_references_exist(
         logger.info("Отсутствующих канонических файлов не найдено после обработки.")
         return
 
-    # 2. Проверка существования файлов (base_dir и resolve_path уже определены выше)
+    # 2. Проверка существования файлов
 
     # Все файлы уже отфильтрованы как отсутствующие
+    from .reference_catalog import add_alias, reuse_reference
+    base = safe_storybook_project_dir(project_id)
+    for target, (kind, entity) in all_entities.items():
+        description = json.dumps(entity, ensure_ascii=False, sort_keys=True)
+        key = "canon:" + hashlib.sha256(description.encode()).hexdigest()
+        cached = reuse_reference(base, kind, key, description=description,
+                                 metadata={"entity": entity.get("name")})
+        if cached:
+            add_alias(base, cached, target)
+            missing_canonical_files.discard(target)
     missing_paths = list(missing_canonical_files)
+    if not missing_paths:
+        return
     entities_by_full_path = {}
     for file_path, (entity_type, entity_data) in all_entities.items():
         entities_by_full_path[file_path] = (entity_type, entity_data)
@@ -3279,8 +3439,13 @@ def _ensure_references_exist(
     
     # Собираем все существующие референсы проекта для использования в генерации
     existing_paths = []
-    project_refs_dir = str(safe_storybook_project_dir(project_id) / "20_bible" / "references")
-    if os.path.exists(project_refs_dir):
+    project_refs_dir = str(reference_project_dir(safe_storybook_project_dir(project_id)) / "20_bible" / "references")
+    from .reference_catalog import _enabled, bootstrap_series_references, bound_reference_paths
+    base = safe_storybook_project_dir(project_id)
+    if _enabled(base):
+        bootstrap_series_references(base)
+        existing_paths = bound_reference_paths(base, ["character", "location"])
+    elif os.path.exists(project_refs_dir):
         for root, dirs, files in os.walk(project_refs_dir):
             for file in files:
                 if file.lower().endswith(('.png', '.jpg', '.jpeg')):
@@ -3297,7 +3462,7 @@ def _ensure_references_exist(
             logger.info("Протагонист отсутствует и нет других референсов. Генерируем с нуля...")
             if _generate_image_from_scratch(session_id, project_id, protagonist, protagonist_ref_path, pipeline_type, seed=seed):
                 logger.info(f"Изображение протагониста успешно создано: {protagonist_ref_path}")
-                existing_paths.append(protagonist_ref_path)
+                existing_paths.append(existing_reference_path(base, protagonist_ref_path))
                 missing_paths.remove(protagonist_ref_path)
             else:
                 logger.error("Не удалось сгенерировать изображение протагониста. Продолжаем с остальными.")
@@ -3328,7 +3493,7 @@ def _ensure_references_exist(
                 seed=seed,
             ):
                 logger.info(f"Канонический референс создан без опорных изображений: {path_to_create}")
-                existing_paths.append(path_to_create)
+                existing_paths.append(existing_reference_path(base, path_to_create))
             else:
                 logger.error(f"Не удалось создать референс без опорных изображений: {path_to_create}")
                 pending_paths.append(path_to_create)
@@ -3348,6 +3513,17 @@ def _ensure_references_exist(
 
         entity_type, entity_data = entity_info
         logger.info(f"Генерируем '{entity_data.get('name')}' используя {len(existing_paths)} существующих референсов...")
+
+        if entity_type == "character":
+            if _generate_canon_reference_from_scratch(
+                session_id=session_id, entity_type=entity_type, entity_data=entity_data,
+                output_path=path_to_create, consistency_rules=consistency_rules,
+                pipeline_type=pipeline_type, seed=seed,
+            ):
+                existing_paths.append(existing_reference_path(base, path_to_create))
+            else:
+                logger.error(f"Не удалось создать референс: {path_to_create}")
+            continue
         
         # Применяем умный отбор для соблюдения лимита
         selected_refs = _smart_select_references_for_generation(
@@ -3367,6 +3543,6 @@ def _ensure_references_exist(
             seed=seed
         ):
             logger.info(f"Референс успешно создан: {path_to_create}")
-            existing_paths.append(path_to_create)
+            existing_paths.append(existing_reference_path(base, path_to_create))
         else:
             logger.error(f"Не удалось создать референс: {path_to_create}")

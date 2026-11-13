@@ -225,3 +225,44 @@ def test_pagination_and_paths(project):
 def test_registry():
     cap = capabilities.registry()["media_inventory"]
     assert cap.access == "read" and "media_inventory" in cap.supersedes
+
+
+def _bind(root, records):
+    (root.parent.parent / "shared").mkdir(exist_ok=True)
+    (root.parent.parent / "shared/reference_catalog.json").write_text(json.dumps(
+        {"version": 1, "initialized_series": [], "references": {
+            r["id"]: {"keys": [], "aliases": [], "parents": [], "selectable": True, **r} for r in records}}),
+        encoding="utf-8")
+
+
+def test_catalog_references_visible_only_in_bound_series(project):
+    project("../../shared/references/characters/aa.png")
+    project("../../shared/references/landmarks/bb.png")
+    _bind(project.root, [
+        {"id": "aa", "path": "shared/references/characters/aa.png", "kinds": ["identity"], "series_ids": ["main"]},
+        {"id": "bb", "path": "shared/references/landmarks/bb.png", "kinds": ["landmark"], "series_ids": ["main"]}])
+    found = scan(project)
+    assert (found["shared/references/characters/aa.png"].category,
+            found["shared/references/landmarks/bb.png"].category) == ("character", "landmark")
+    assert found["shared/references/characters/aa.png"].type == "reference"
+    other = project.root.parent / "other"
+    other.mkdir()
+    assert not [p for p in media.scan_media(other) if p.path.startswith("shared/")]
+    _bind(project.root, [
+        {"id": "aa", "path": "shared/references/characters/aa.png", "kinds": ["identity"], "series_ids": ["two"]}])
+    assert not [p for p in scan(project) if p.startswith("shared/")]
+
+
+def test_catalog_references_categories_and_prefix_filter(project):
+    project("../../shared/references/backgrounds/bg.png")
+    project("../../shared/references/styles/st.png")
+    project("../../shared/characters/actor/a.png")
+    base = {"series_ids": ["main"]}
+    _bind(project.root, [
+        {"id": "bg", "path": "shared/references/backgrounds/bg.png", "kinds": ["background"], **base},
+        {"id": "st", "path": "shared/references/styles/st.png", "kinds": ["style"], **base},
+        {"id": "ac", "path": "shared/characters/actor/a.png", "kinds": ["identity"], **base}])
+    found = scan(project)
+    assert found["shared/references/backgrounds/bg.png"].category == "background"
+    assert found["shared/references/styles/st.png"].category == "location"
+    assert "shared/characters/actor/a.png" not in found

@@ -17,14 +17,15 @@ inputs:
   generate_end_shots: true
   language: ru
   screenplay_time: 120
-  generate_blockout: true
+  frame_resolution: ''     # размер видеокадров WxH; '' = 1920x1088
+  generate_blockout: false
   blockout_fps: 24
   blockout_resolution: '1280x720'
   blockout_allowed_durations: []
   blockout_jobs: 0                    # 0 = cpu_count - 1
   blockout_scope: all
   blockout_preview_burnin: true
-  blockout_use_as_image_reference: true
+  blockout_use_as_image_reference: false
   blockout_use_as_video_reference: false
   force_update_prompts: false
   skip_prompt_enhancement: true  # Если true, видео-промпт только переводится без "улучшений" LLM
@@ -257,6 +258,7 @@ steps:
     allowed_durations: '{blockout_allowed_durations}'
     screenplay_time: '{screenplay_time}'
     #enable: false
+    frame_resolution: '{frame_resolution}'
   depends_on:
   - storybook_continuity_plan
   - storybook_speech
@@ -563,9 +565,10 @@ steps:
     session_id: '{session_id}'
     project_id: '{project_id}'
     language: '{language}'
+    enable: '{generate_music}'
   depends_on:
   - storybook_audio_subtitle
-  condition: '{generate_screenplay} and {generate_music}'
+  condition: '{generate_screenplay}'
 - id: storybook_music_generator
   step_type: tool
   task: Generate or reuse background music and register it in audio manifest

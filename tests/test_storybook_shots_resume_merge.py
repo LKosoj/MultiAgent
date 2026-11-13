@@ -185,6 +185,26 @@ def _scene_set(saved):
     return {it["scene_number"] for it in saved["items"]}
 
 
+def test_frame_resolution_changes_all_frames_and_invalidates_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
+    base = _setup_project(tmp_path, "portrait", [(1, [1])])
+    recorder = []
+    _install_fakes(monkeypatch, generate_end_shots=True, recorder=recorder)
+    shots_generator.screenplay_shots_generator_tool("s", "portrait", language="ru")
+    original = _load(base)
+    assert {(item["width"], item["height"]) for item in original["items"]} == {(1920, 1088)}
+    recorder.clear()
+
+    shots_generator.screenplay_shots_generator_tool(
+        "s", "portrait", language="ru", frame_resolution="1080x1920"
+    )
+    portrait = _load(base)
+    assert recorder == [1]
+    assert portrait["inputs_hash"] != original["inputs_hash"]
+    assert {item["shot_type"] for item in portrait["items"]} == {"start", "end"}
+    assert {(item["width"], item["height"]) for item in portrait["items"]} == {(1080, 1920)}
+
+
 # --------------------------------------------------------------------------------
 def test_resume_regenerates_only_missing_scenes(tmp_path, monkeypatch):
     root = tmp_path / "projects"

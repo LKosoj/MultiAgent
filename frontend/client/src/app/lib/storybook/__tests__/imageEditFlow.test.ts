@@ -88,6 +88,10 @@ describe("образцы", () => {
     expect(referenceLabel("a/b/c.png")).toBe("b/c.png");
     expect(referenceLabel("c.png")).toBe("c.png");
   });
+  it("имя из 64 hex заменяется на «категория · 8 символов»", () => {
+    const hex = "0123abcd".repeat(8);
+    expect(referenceLabel(`shared/references/characters/${hex}.png`)).toBe("characters · 0123abcd");
+  });
   it("не больше трёх, повторный выбор снимает", () => {
     expect(toggleReference(["a", "b", "c"], "d")).toEqual(["a", "b", "c"]);
     expect(toggleReference(["a", "b"], "a")).toEqual(["b"]);

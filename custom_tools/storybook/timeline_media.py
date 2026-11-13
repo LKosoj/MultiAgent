@@ -99,7 +99,8 @@ def _audio_segments(base, items, total):
             source_start = 0
 
     mapping = plan.get("scene_mapping") or {}
-    planned_music = bool(mapping and music)
+    # Пропущенная генерация музыки не удаляет старый план сцен: треков по нему нет.
+    planned_music = bool(mapping and music and music.get("status") != "skipped")
     music_controls = {
         str((audio_dir / track["path"]).resolve()): track
         for track in manifest.get("audio_tracks") or []
@@ -222,7 +223,8 @@ def decorate_timeline(root, path, project_id, items):
     script = Path(path).parent / "fix_timeline_paths.sh"
     script.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(Path(__file__).with_name("fix_timeline_paths.sh"), script)
-    script.chmod(0o755)
+    if script.stat().st_mode & 0o111 != 0o111:  # права чужого файла менять нельзя, а исполняемому не нужно
+        script.chmod(0o755)
 
 
 def _media_path(asset):

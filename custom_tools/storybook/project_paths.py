@@ -83,6 +83,24 @@ def safe_storybook_project_dir(project_id: str, *, must_exist: bool = False) -> 
     return candidate
 
 
+def reference_project_dir(base: Path) -> Path:
+    """Common reference images belong to the project, including series runs."""
+    base = Path(base)
+    return base.parent.parent if base.parent.name == "series" else base
+
+
+def existing_reference_path(base: Path, value: str) -> str:
+    """Путь к референсу: как есть, если файл есть, иначе через каталог (файл мог быть перенесён)."""
+    if not value or os.path.exists(value):
+        return value
+    from .background_references import _reference_path
+    try:
+        resolved = _reference_path(Path(base), value)
+    except ValueError:
+        return value
+    return str(resolved) if resolved.exists() else value
+
+
 def _require_current_lock(handle) -> None:
     from custom_tools.storybook.studio.errors import StudioError
     held = os.fstat(handle.fileno())

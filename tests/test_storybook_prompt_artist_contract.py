@@ -99,6 +99,43 @@ def test_pp01_direct_edit_receives_built_negative_prompt(monkeypatch, tmp_path):
     assert call["height"] == 222
 
 
+def test_cached_batch_does_not_copy_previous_actor_into_changed_cast(monkeypatch, tmp_path):
+    monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
+    (tmp_path / "project").mkdir()
+    previous = tmp_path / "baklan-end.png"
+    previous.write_bytes(b"Baklan pixels")
+    target = tmp_path / "chibis-start.png"
+    reference = tmp_path / "chibis-reference.png"
+    reference.write_bytes(b"Chibis reference")
+    captured = []
+
+    def fake_edit(**kwargs):
+        captured.append(kwargs)
+        Path(kwargs["output_path"]).write_bytes(b"New Chibis pixels")
+        return "ok"
+
+    monkeypatch.setattr(artist, "edit_image_vse_tool", fake_edit)
+    monkeypatch.setattr(artist, "_preprocess_canon_references", lambda **_: [])
+    monkeypatch.setattr(artist, "log_smolagents_panel", lambda **_: None)
+    common = {"project_id": "project", "scene_number": 2, "camera_plan": "Close-up",
+              "video_prompt": "Listening", "width": 1080, "height": 1920}
+    old_role = "image 1: same world layout and identity"
+    artist.artist_agent_batch_edit_tool("cached-cast-test", {"items": [
+        dict(common, shot_number=3, shot_type="end", output_path=str(previous),
+             characters=[{"name": "Баклан"}]),
+        dict(common, shot_number=4, shot_type="start", output_path=str(target),
+             source_end_path=str(previous), copy_from_previous_end=True,
+             characters=[{"name": "Чибис"}], reference_image_paths=[str(reference)],
+             english_prompt="Show Chibis. " + old_role, reference_roles_instruction=old_role),
+    ]}, max_concurrency=1, language="en")
+    assert target.read_bytes() == b"New Chibis pixels"
+    assert len(captured) == 1
+    assert "own named character reference" in captured[0]["prompt"]
+    assert old_role not in captured[0]["prompt"]
+    assert str(previous) not in captured[0]["image_paths"]
+    assert str(reference) in captured[0]["image_paths"]
+
+
 def test_pp02_identity_is_retained_once_in_english_and_sent_to_translation(monkeypatch):
     item = _character_item("/tmp/mira-reference.png")
     translations = []
@@ -276,9 +313,10 @@ def test_protagonist_reference_prompt_receives_era_and_environment(tmp_path, mon
     factory = _RecordingFactory()
     monkeypatch.setattr(artist, 'AgentFactory', lambda: factory)
     artist._generate_image_from_scratch('s', 'p', {
-        'name': 'Мальчик', 'historical_period': '1920-е годы',
+        'name': 'Мальчик', 'age': '21', 'historical_period': '1920-е годы',
         'environment_context': 'Москва, заснеженный двор без автомобилей',
     }, str(tmp_path / 'hero.png'), 'workflow')
     task = factory.calls[0]['task']
+    assert 'age: 21' in task.lower()
     assert '1920-е годы' in task
     assert 'заснеженный двор без автомобилей' in task

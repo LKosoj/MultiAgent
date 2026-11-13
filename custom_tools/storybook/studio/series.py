@@ -105,7 +105,9 @@ def series_create(project_id: str, title: str, source_material: str, participant
     path = root / "series" / sid
     data = {"series_id": sid, "title": title.strip(), "source_material": source_material,
             "participant_ids": participant_ids, "settings": copy.deepcopy(settings), "snapshot": snapshot}
+    from ..reference_catalog import initialize_series_references, unbind_series
     try:
+        data["snapshot"] = initialize_series_references(root, sid, source_material, participant_ids, snapshot)
         for folder in project_store.PROJECT_STRUCTURE:
             (path / folder).mkdir(parents=True, exist_ok=True)
         project_store.write_json_atomic(path / "series.json", data)
@@ -113,6 +115,7 @@ def series_create(project_id: str, title: str, source_material: str, participant
             "language": project.get("language", "ru"), **project.get("defaults", {}), **settings,
             "main_characters": [], "main_locations": [], "storybook_prompt": source_material})
     except BaseException:
+        unbind_series(root, sid)
         shutil.rmtree(path, ignore_errors=True)
         raise
     return success(project_id=project_id, series_id=sid, series=data)
@@ -193,6 +196,8 @@ def series_delete(project_id: str, series_id: str, confirm: bool) -> dict:
         deleting = path.parent.parent / project_store._tmp_name("delete_series", series_id)
         path.rename(deleting)
         shutil.rmtree(deleting)
+        from ..reference_catalog import unbind_series
+        unbind_series(path.parent.parent, series_id)
     except BlockingIOError as exc:
         raise StudioError("locked", "Сохраняются настройки серии. Дождитесь завершения") from exc
     finally:
@@ -245,6 +250,8 @@ def shared_resource_save(project_id: str, kind: str, entity_id: str, data: dict,
     project = _read(root / "project.json")
     project.setdefault("resources", {}).setdefault(kind, {})[entity_id] = version_id
     project_store.write_json_atomic(root / "project.json", project)
+    from ..reference_catalog import _shared_reference
+    _shared_reference(root, kind, entity_id, version_id)
     return success(project_id=project_id, kind=kind, entity_id=entity_id, version_id=version_id)
 
 
@@ -289,6 +296,8 @@ def series_resource_update_apply(project_id: str, series_id: str, kind: str, ent
     data["input_revision"] = data.get("input_revision", 0) + 1
     data["stale_results"] = list(dict.fromkeys(data.get("stale_results", []) + affected))
     project_store.write_json_atomic(path / "series.json", data)
+    from ..reference_catalog import sync_snapshot_references
+    sync_snapshot_references(path)
     return success(project_id=project_id, series_id=series_id, previous_version_id=current,
                    version_id=version_id, affected_results=affected)
 
@@ -297,15 +306,23 @@ def materialize_snapshot(project_id: str, series_id: str) -> None:
     """Подготовить входы существующих инструментов из закреплённых версий."""
     path = series_dir(project_id, series_id)
     resources = resolve_snapshot(project_id, series_id)
+    from ..reference_catalog import bootstrap_series_references, sync_snapshot_references
+    sync_snapshot_references(path)
+    bootstrap_series_references(path)
     for kind in ("characters", "locations"):
         target = path / "20_bible" / f"{kind}.json"
         previous = project_store._read_json(target)
         local = [item for item in previous if isinstance(item, dict) and not item.get("_shared_id")] if isinstance(previous, list) else []
         shared = []
+        existing = {item.get("_shared_id"): item for item in previous if isinstance(item, dict)} if isinstance(previous, list) else {}
         for entity_id, item in resources.get(kind, {}).items():
-            value = copy.deepcopy(item["data"])
+            current = existing.get(entity_id)
+            unchanged_character = kind == "characters" and current and current.get("_shared_version_id") == item["version_id"]
+            value = copy.deepcopy(current if unchanged_character else item["data"])
             value["_shared_id"] = entity_id
             value["_shared_version_id"] = item["version_id"]
+            if not value.get("reference_image_path"):
+                value["reference_image_path"] = f"/references/{kind}/{entity_id}.png"
             if kind == "locations":
                 value["_passport_version"] = 3
             shared.append(value)

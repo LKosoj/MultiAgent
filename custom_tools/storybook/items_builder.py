@@ -112,6 +112,10 @@ def items_for_artist_tool(session_id: str, project_id: str, language: str) -> st
     base = str(safe_storybook_project_dir(project_id))
     prompts_dir = f"{base}/40_prompts"
     items_path = f"{base}/50_items/items.json"
+    frame_resolution = ""
+    if os.path.exists(f"{base}/00_brief.json"):
+        with open(f"{base}/00_brief.json", encoding="utf-8") as f:
+            frame_resolution = json.load(f).get("frame_resolution", "")
     
     # Загружаем данные из 20_bible
     characters, locations, consistency_rules = load_bible_data(project_id)
@@ -135,6 +139,8 @@ def items_for_artist_tool(session_id: str, project_id: str, language: str) -> st
         size_width, _, size_height = str(technical.get("size", "")).partition("x")
         width = technical.get("width") or (int(size_width) if size_width.isdecimal() else 1920)
         height = technical.get("height") or (int(size_height) if size_height.isdecimal() else 1088)
+        if frame_resolution:
+            width, height = map(int, frame_resolution.lower().split("x"))
         
         # Собираем все референс-пути
         references = pp.get("references", {}) or {}

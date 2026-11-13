@@ -11,12 +11,12 @@ from custom_tools.storybook import continuity_review as review
 _REAL_REPAIR_MEDIA = review._repair_media
 
 
-def _project(tmp_path, monkeypatch):
+def _project(tmp_path, monkeypatch, sid=None):
     monkeypatch.setattr(review, '_repair_media', lambda *args: None)
     monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
-    base = tmp_path / 'project'
+    base = tmp_path / 'project' / 'series' / sid if sid else tmp_path / 'project'
     for directory in ('20_bible', '20_bible/references', '91_screenplay', '97_shots', 'inputs'):
-        (base / directory).mkdir(parents=True)
+        (base / directory).mkdir(parents=True, exist_ok=True)
     screenplay = {'screenplay': [{'scene_number': 1, 'storyboard': [
         {'shot_number': 1, 'description': 'Чемодан стоит у вокзальной арки.'}
     ]}]}
@@ -150,7 +150,7 @@ def test_failed_or_uncertain_audit_is_not_accepted(tmp_path, monkeypatch):
     base, _ = _project(tmp_path, monkeypatch)
     monkeypatch.setattr(review, '_audit', lambda *args: {
         'passed': False, 'violations': [], 'uncertain': ['unclear object state']})
-    result = review.storybook_continuity_images_review_tool('session', 'project')
+    result = review._review('session', 'project', 'images', True, repair=False)
     assert result['status'] == 'error'
     assert review.continuity_acceptance(base, 'images')['status'] == 'review_required'
 
@@ -248,18 +248,6 @@ def test_reference_locations_reject_unknown_and_missing_landmark_reference():
     source['locations'][0].pop('reference_image_path')
     with pytest.raises(ValueError, match='canonical reference'):
         ct._validate_reference_locations(missing, source)
-
-
-def test_failed_review_repairs_once_and_stays_unaccepted(tmp_path, monkeypatch):
-    base, _ = _project(tmp_path, monkeypatch)
-    monkeypatch.setattr(review, '_audit', lambda *args: {'passed': False,
-        'violations': [{'frame_key': '1:1:start'}], 'uncertain': []})
-    repairs = []
-    monkeypatch.setattr(review, '_repair_media', lambda *args: repairs.append(args))
-    result = review.storybook_continuity_images_review_tool('session', 'project')
-    assert result['status'] == 'error'
-    assert len(repairs) == 1
-    assert review.continuity_acceptance(base, 'images')['status'] == 'review_required'
 
 
 def test_pending_image_findings_filters_current_failed_media_and_state(tmp_path, monkeypatch):
@@ -542,8 +530,7 @@ def test_video_repair_checks_used_source_frames_first(tmp_path, monkeypatch, sou
         assert order == ['images', 'videos']
         assert regenerated == (['1-1|1-2', '2-1'] if changed_dependency else ['1-1|1-2'])
     else:
-        with pytest.raises(RuntimeError, match='video generation was not started'):
-            real_review('s', 'project', 'videos', True)
+        assert real_review('s', 'project', 'videos', True)['status'] == 'error'
         assert order == ['images'] and not regenerated
     assert {finding['frame_key'] for finding in forwarded} == {'1:1:start', '1:2:end'}
     assert all(finding['source'] == 'video' and finding['video_frame_key'] == observation['frame_key']
@@ -642,7 +629,7 @@ def test_prior_findings_rechecked_with_explicit_dismissal_and_cache(tmp_path, mo
     finding = {'frame_key': '1:1:end', 'entity_id': 'suitcase', 'observed': 'crop', 'required': 'whole body'}
     media_hashes = {p: review._file_hash(p) for p in task['media']}
     old = {'id': task['id'], 'state_hash': task['state_hash'], 'media_hashes': media_hashes,
-           'review_version': 5, 'verdicts': [{'violations': [finding, finding]}]}
+           'review_version': review._REVIEW_VERSION, 'verdicts': [{'violations': [finding, finding]}]}
     stale_state = dict(old, state_hash='other', verdicts=[{'violations': [{'frame_key': 'stale-state'}]}])
     stale_media = dict(old, media_hashes={}, verdicts=[{'violations': [{'frame_key': 'stale-media'}]}])
     report_path = base / '97_shots/continuity_images_review.json'
@@ -707,6 +694,7 @@ def test_failed_image_cache_refreshes_and_rewrites_prior_finding(tmp_path, monke
     old = {'frame_key': '1:1:end', 'entity_id': 'suitcase', 'observed': 'misplaced', 'required': 'correct arrangement'}
     new = dict(old, required='Move the object right of the landmark; preserve the landmark.')
     record = {'id': task['id'], 'passed': False, 'state_hash': task['state_hash'],
+              'review_version': review._REVIEW_VERSION,
               'media_hashes': {p: review._file_hash(p) for p in task['media']},
               'verdicts': [{'violations': [old], 'uncertain': []}]}
     path = base / '97_shots/continuity_images_review.json'
@@ -853,17 +841,75 @@ def test_direct_edit_adds_only_target_entity_master_without_writing_shots(tmp_pa
     assert shots_path.read_bytes() == before
 
 
-def test_failed_artist_stops_before_postrepair_audit(tmp_path, monkeypatch):
-    base, _ = _project(tmp_path, monkeypatch)
+def test_direct_edit_uses_master_moved_to_shared_references(tmp_path, monkeypatch):
+    from custom_tools.storybook import reference_catalog as catalog
+    from custom_tools.storybook.studio.capabilities import invoke
+    _, items, calls = _repair_scope_fixture(tmp_path / 'plain', monkeypatch)
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = invoke('projects_create', {'title': 'World', 'description': 'Shared world', 'genre': 'comedy',
+                                     'target_age': 'all'})['project_id']
+    sid = invoke('series_create', {'project_id': pid, 'title': 'One', 'source_material': '',
+                                   'participant_ids': [], 'settings': {}})['series_id']
+    base = tmp_path / pid / 'series' / sid
+    old = base / '20_bible/references/locations/master.png'
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_bytes(b'master')
+    new = catalog.store_reference(base, old, 'location', 'master')
+    assert not old.exists()
+    (base / '20_bible/continuity_plan.json').write_text(json.dumps({'entities': [
+        {'id': 'target', 'reference_path': str(old)}]}))
+    target = items[0]
+    (base / '97_shots').mkdir(exist_ok=True)
+    finding = {'frame_key': '1:1:start', 'entity_id': 'target', 'observed': 'wrong', 'required': 'correct'}
+    (base / '97_shots/continuity_images_review.json').write_text(json.dumps({'tasks': {'hash': {
+        'verdicts': [{'passed': True, 'violations': [], 'uncertain': []},
+                     {'passed': False, 'violations': [finding], 'uncertain': []}]}}}))
+    (base / '97_shots/shots.json').write_text(json.dumps({'items': items}))
+    _REAL_REPAIR_MEDIA(base, [{'id': '1-1', 'input_hash': 'hash', 'group': [target]}], 'images', 's')
+    assert calls['artist'][0]['items']['items'][0]['reference_image_paths'] == [new]
+
+
+def test_review_tasks_and_audit_read_landmark_master_moved_to_shared(tmp_path, monkeypatch):
+    from custom_tools.storybook import reference_catalog as catalog
+    from custom_tools.storybook.project_paths import series_scope
+    from custom_tools.storybook.studio.capabilities import invoke
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = invoke('projects_create', {'title': 'project', 'description': 'Shared world', 'genre': 'comedy',
+                                     'target_age': 'all'})['project_id']
+    sid = invoke('series_create', {'project_id': pid, 'title': 'One', 'source_material': '',
+                                   'participant_ids': [], 'settings': {}})['series_id']
+    base, _ = _project(tmp_path, monkeypatch, sid)
+    old = base / '20_bible/references/locations/tower.png'
+    old.parent.mkdir(parents=True, exist_ok=True)
+    Image.new('RGB', (16, 16), 'white').save(old)
+    plan = json.loads((base / '20_bible/continuity_plan.json').read_text())
+    plan['entities'][0].update(kind='landmark', geometry='башня', reference_path=str(old))
+    (base / '20_bible/continuity_plan.json').write_text(json.dumps(plan))
+    with series_scope(pid, sid):
+        before = review._tasks(base, 'images')[0]['input_hash']
+        catalog.store_reference(base, old, 'location', 'tower')
+        assert not old.exists()
+        task = review._tasks(base, 'images')[0]
+        assert task['masters'] == [str(old)] and task['input_hash'] == before
+        requests = []
+        monkeypatch.setattr(review, 'call_openai_api', lambda **kw: requests.append(kw) or '{}')
+        monkeypatch.setattr(review, 'parse_llm_json', lambda _: {'passed': True, 'violations': [], 'uncertain': []})
+        review._audit(task, [], 1)
+    assert any('LANDMARK' in part.get('text', '') for part in requests[0]['prompt'])
+
+
+def test_failed_artist_round_is_rolled_back_before_audit(tmp_path, monkeypatch):
+    base, items = _project(tmp_path, monkeypatch)
+    original = [Path(item['output_path']).read_bytes() for item in items]
     calls = []
     monkeypatch.setattr(review, '_audit', lambda *args: calls.append(args) or {
         'passed': False, 'violations': [{'frame_key': '1:1:end', 'observed': 'wrong', 'required': 'correct'}], 'uncertain': []})
     monkeypatch.setattr('custom_tools.storybook.artist_batch_edit.artist_agent_batch_edit_tool',
                         lambda **kwargs: json.dumps([{'ok': False, 'error': 'render failed'}]))
     monkeypatch.setattr(review, '_repair_media', _REAL_REPAIR_MEDIA)
-    with pytest.raises(RuntimeError, match='Continuity image repair failed'):
-        review.storybook_continuity_images_review_tool('s', 'project')
-    assert len(calls) == 1
+    assert review.storybook_continuity_images_review_tool('s', 'project')['status'] == 'success'
+    assert len(calls) == 3
+    assert [Path(item['output_path']).read_bytes() for item in items] == original
 
 
 
@@ -949,3 +995,187 @@ def test_continuity_tasks_keep_project_id_inside_series_scope(tmp_path, monkeypa
     with series_scope(pid, sid):
         assert review._tasks(base, 'images')
     assert called == [pid]
+
+
+def test_image_audit_preserves_readable_small_props_without_changing_source(tmp_path, monkeypatch):
+    import base64
+    import io
+    base, _ = _project(tmp_path, monkeypatch)
+    task = review._tasks(base, 'images')[0]
+    frame = base / 'portrait.png'
+    Image.new('RGB', (1080,1920), 'gray').save(frame)
+    before = frame.read_bytes()
+    calls = []
+    monkeypatch.setattr(review, 'call_openai_api', lambda **kwargs: calls.append(kwargs) or json.dumps({
+        'passed':True, 'violations':[], 'uncertain':[]}))
+    review._audit(task,[dict(scene_number=2,shot_number=1,shot_type='end',output_path=str(frame))],0)
+    image_block = [b for b in calls[0]['prompt'] if b['type']=='image_url'][-1]
+    with Image.open(io.BytesIO(base64.b64decode(image_block['image_url']['url'].split(',',1)[1]))) as sent:
+        assert sent.size == (720,1280)
+    assert frame.read_bytes() == before
+
+
+def test_new_review_version_does_not_reuse_old_visual_findings(tmp_path, monkeypatch):
+    base, _ = _project(tmp_path, monkeypatch)
+    task = review._tasks(base,'images')[0]
+    old = {'id':task['id'], 'review_version':review._REVIEW_VERSION-1, 'passed':False,
+           'state_hash':task['state_hash'],'media_hashes':{p:review._file_hash(p) for p in task['media']},
+           'verdicts':[{'violations':[{'frame_key':'1:1:start','entity_id':'old','observed':'old hint','required':'old edit'}], 'uncertain':[]}]}
+    (base/'97_shots/continuity_images_review.json').write_text(json.dumps({'tasks':{'old':old}}))
+    seen=[]
+    def audit(current,*_):
+        seen.extend(current.get('prior_findings',[]))
+        return {'passed':True,'violations':[],'uncertain':[]}
+    monkeypatch.setattr(review,'_audit',audit)
+    review._review('test','project','images',True,repair=False)
+    assert seen == []
+
+
+def test_pair_audit_receives_other_cast_reference_and_tracks_its_bytes(tmp_path, monkeypatch):
+    import copy
+    base, pair = _project(tmp_path, monkeypatch)
+    refs = {}
+    for name,color in [('First','red'),('Second','blue')]:
+        path=base/f'20_bible/references/{name}.png'
+        Image.new('RGB',(16,16),color).save(path);refs[name]=str(path)
+    screenplay=json.loads((base/'91_screenplay/screenplay.json').read_text())
+    screenplay['screenplay'][0]['storyboard']*=4
+    for number,shot in enumerate(screenplay['screenplay'][0]['storyboard'],1):
+        screenplay['screenplay'][0]['storyboard'][number-1]=dict(shot,shot_number=number)
+    (base/'91_screenplay/screenplay.json').write_text(json.dumps(screenplay))
+    plan=json.loads((base/'20_bible/continuity_plan.json').read_text())
+    template=copy.deepcopy(plan['frames']);plan['frames']={f'1:{number}:{phase}':copy.deepcopy(template[f'1:1:{phase}']) for number in range(1,5) for phase in ['start','end']}
+    plan['input_hash']=ct._digest([ct._PLAN_VERSION,ct._source(base)])
+    (base/'20_bible/continuity_plan.json').write_text(json.dumps(plan))
+    items=[]
+    for number in range(1,5):
+        for original in pair:
+            item=copy.deepcopy(original);item['shot_number']=number
+            name='First' if number==1 else 'Second'
+            item['characters']=[{'name':name,'reference_image_path':refs[name]}]
+            items.append(item)
+    (base/'97_shots/shots.json').write_text(json.dumps({'items':items}))
+    task=next(t for t in review._tasks(base,'images') if t['id']=='1-4')
+    requests=[]
+    monkeypatch.setattr(review,'call_openai_api',lambda **kwargs:requests.append(kwargs) or json.dumps({'passed':True,'violations':[],'uncertain':[]}))
+    review._audit(task,task['group'],0)
+    labels=[block.get('text','') for block in requests[0]['prompt']]
+    assert sum(label.startswith('CHARACTER.First ') for label in labels)==1
+    assert sum(label.startswith('CHARACTER.Second ') for label in labels)==1
+    Image.new('RGB',(16,16),'green').save(refs['First'])
+    changed=next(t for t in review._tasks(base,'images') if t['id']=='1-4')
+    assert changed['input_hash'] != task['input_hash']
+
+
+def test_deleted_review_images_are_ignored_before_reading_old_reference_hashes(tmp_path, monkeypatch):
+    base = tmp_path / 'project'
+    path = base / '97_shots/continuity_images_review.json'
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'tasks': {'old': {
+        'review_version': review._REVIEW_VERSION, 'id': '1-1', 'passed': False,
+        'state_hash': 'old', 'media_hashes': {str(base / 'deleted.png'): 'old'}, 'verdicts': []}}}))
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Deleted image review must not read its old references')
+    monkeypatch.setattr(review, 'unit_continuity_hash', forbidden)
+    assert review.pending_image_findings(base, {'1-1'}) == []
+
+
+def test_failed_repair_rolls_back_only_groups_still_rejected(tmp_path, monkeypatch):
+    # Откат всех групп терял успешный ремонт: каждый запуск начинал с тех же проблем.
+    base = tmp_path / 'project'
+    (base / '97_shots').mkdir(parents=True)
+    groups = {}
+    for group in ('fixed', 'broken'):
+        path = base / f'97_shots/{group}.png'
+        path.write_bytes(b'bad')
+        groups[group] = {'scene_number': 1, 'shot_number': len(groups) + 1, 'shot_type': 'start',
+                         'output_path': str(path), '_continuity': {'start': {}}}
+
+    def tasks(base, kind):
+        return [{'id': name, 'input_hash': name + Path(item['output_path']).read_text(), 'group': [item],
+                 'state_hash': 'state', 'media': [item['output_path']], 'contexts': []}
+                for name, item in groups.items()]
+
+    def repair(base, rejected, kind, session_id):
+        for task in rejected:
+            Path(task['group'][0]['output_path']).write_bytes(b'good' if task['id'] == 'fixed' else b'worse')
+
+    monkeypatch.setattr(review, 'safe_storybook_project_dir', lambda project: base)
+    monkeypatch.setattr(review, '_tasks', tasks)
+    monkeypatch.setattr(review, '_audit', lambda task, pictures, number: {
+        'passed': Path(pictures[0]['output_path']).read_bytes() == b'good', 'violations': [], 'uncertain': []})
+    monkeypatch.setattr(review, '_repair_media', repair)
+    monkeypatch.setattr(ct, 'record_continuity_image', lambda item, basis: None)
+    result = review.storybook_continuity_images_review_tool('session', 'project')
+    assert result['auto_accepted'] == ['broken']
+    assert (base / '97_shots/fixed.png').read_bytes() == b'good'
+    assert (base / '97_shots/broken.png').read_bytes() == b'bad'
+
+
+def test_group_failing_two_repair_rounds_is_auto_accepted_with_findings(tmp_path, monkeypatch):
+    # Аудитор, которого ремонт не убеждает, не должен навсегда блокировать видео.
+    base, _ = _project(tmp_path, monkeypatch)
+    finding = {'frame_key': '1:1:start', 'observed': 'wrong', 'required': 'correct'}
+    monkeypatch.setattr(review, '_audit', lambda *args: {'passed': False, 'violations': [finding], 'uncertain': []})
+    repairs = []
+    monkeypatch.setattr(review, '_repair_media', lambda *args: repairs.append(args))
+    result = review.storybook_continuity_images_review_tool('session', 'project')
+    assert result['status'] == 'success'
+    assert len(repairs) == 2
+    assert review.continuity_acceptance(base, 'images')['passed']
+    report = json.loads((base / '97_shots/continuity_images_review.json').read_text())
+    record = next(iter(report['tasks'].values()))
+    assert record['auto_accepted']['failed_rounds'] == 2
+    assert record['verdicts'][0]['violations'] == [finding]
+
+
+def test_failed_round_counter_survives_restart(tmp_path, monkeypatch):
+    base, _ = _project(tmp_path, monkeypatch)
+    monkeypatch.setattr(review, '_audit', lambda *args: {'passed': False, 'violations': [], 'uncertain': ['x']})
+    repairs = []
+    monkeypatch.setattr(review, '_repair_media', lambda *args: repairs.append(args))
+    path = base / '97_shots/continuity_images_review.json'
+    review._review('session', 'project', 'images', True, repair=False)
+    report = json.loads(path.read_text())
+    report['failed_rounds'] = {'1-1': 1}
+    path.write_text(json.dumps(report))
+    assert review.storybook_continuity_images_review_tool('session', 'project')['status'] == 'success'
+    assert len(repairs) == 1
+
+
+def test_repair_exception_is_failed_round_with_rollback(tmp_path, monkeypatch):
+    base, items = _project(tmp_path, monkeypatch)
+    original = Path(items[0]['output_path']).read_bytes()
+    monkeypatch.setattr(review, '_audit', lambda *args: {'passed': False,
+        'violations': [{'frame_key': '1:1:start', 'observed': 'wrong', 'required': 'correct'}], 'uncertain': []})
+
+    def repair(*args):
+        Path(items[0]['output_path']).write_bytes(b'broken')
+        raise RuntimeError('Background plan review: rejected')
+
+    monkeypatch.setattr(review, '_repair_media', repair)
+    result = review.storybook_continuity_images_review_tool('session', 'project')
+    assert result['status'] == 'success'
+    assert Path(items[0]['output_path']).read_bytes() == original
+
+
+def test_video_group_failing_two_repair_rounds_is_auto_accepted(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+        pytest.skip('ffmpeg unavailable')
+    base = tmp_path / 'project'
+    (base / '97_shots').mkdir(parents=True)
+    clip = base / '97_shots/test.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=red:s=32x32:r=5:d=1',
+                    '-c:v', 'mpeg4', str(clip)], check=True)
+    task = {'id': '1-1', 'input_hash': 'video', 'state_hash': 'state', 'media': [str(clip)], 'anchors': [],
+            'planned_duration': 1, 'contexts': [{'time_s': 0}], 'group': [{'scene_number': 1, 'shot_number': 1}]}
+    monkeypatch.setattr(review, 'safe_storybook_project_dir', lambda _: base)
+    monkeypatch.setattr(review, '_tasks', lambda _, kind: [task] if kind == 'videos' else [])
+    monkeypatch.setattr(review, '_audit', lambda *args: {'passed': False, 'violations': [], 'uncertain': ['x']})
+    repairs = []
+    monkeypatch.setattr(review, '_repair_media', lambda *args: repairs.append(args))
+    assert review.storybook_continuity_videos_review_tool('s', 'project')['status'] == 'success'
+    assert len(repairs) == 2
+    assert review.continuity_acceptance(base, 'videos')['passed']

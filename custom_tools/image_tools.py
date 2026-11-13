@@ -407,7 +407,7 @@ def _guess_image_mime(path: str) -> str:
 def _b64_from_images_api_item(item: Dict[str, Any]) -> Optional[str]:
     """Достаёт base64 из элемента data[] ответа POST .../images/generations или .../images/edits.
 
-    Некоторые шлюзы возвращают b64_json, другие — url вида data:image/...;base64,...
+    Некоторые шлюзы возвращают b64_json, другие — data URL или ссылку на готовый файл
     при том же request с response_format=b64_json.
     """
     if not isinstance(item, dict):
@@ -418,12 +418,20 @@ def _b64_from_images_api_item(item: Dict[str, Any]) -> Optional[str]:
     url_val = item.get("url")
     if isinstance(url_val, str) and "base64," in url_val:
         return url_val.split("base64,", 1)[1]
+    if isinstance(url_val, str) and url_val.startswith(("https://", "http://")):
+        response = requests.get(url_val, timeout=120)
+        response.raise_for_status()
+        return base64.b64encode(response.content).decode("ascii")
     return None
 
 
 def _adapt_gpt_image_request(payload: Dict[str, Any]) -> None:
     if payload.get("model", "").rsplit("/", 1)[-1] != "gpt-image-2":
         return
+    size = payload.get("size", "")
+    if "x" in size:
+        width, height = map(int, size.split("x"))
+        payload["size"] = f"{((width + 15) // 16) * 16}x{((height + 15) // 16) * 16}"
     payload.pop("response_format", None)
     negative = payload.pop("negative_prompt", "")
     if negative:
@@ -524,6 +532,21 @@ def generate_image_tool(
             close()
 
 
+def _moved_reference_path(path: str) -> str:
+    """Референс мог быть перенесён в общий каталог проекта: ищем его там по каталогу."""
+    if os.path.exists(path):
+        return path
+    from custom_tools.storybook.project_paths import existing_reference_path
+    for parent in Path(path).parents:
+        if (parent / "shared/reference_catalog.json").is_file():
+            # вне серии допускается любой выбираемый референс проекта; ошибка каталога не ломает вызов
+            try:
+                return existing_reference_path(parent, path)
+            except Exception:
+                return path
+    return path
+
+
 def edit_image_tool(prompt: str, image_path: str, session_id: str, number: int, negative_prompt: str = "", width: int = 1920, height: int = 1080, true_cfg_scale: float = 4.0, num_inference_steps: int = 50, seed: int = None, output_path: str = None) -> str:
     """Редактирует изображение по заданному prompt.
     
@@ -547,6 +570,15 @@ def edit_image_tool(prompt: str, image_path: str, session_id: str, number: int, 
     
     # Пробуем MCP сервер для редактирования файлов
     try:
+        from custom_tools.storybook.project_paths import current_series_scope, safe_storybook_project_dir
+        scope = current_series_scope()
+        if scope:
+            from custom_tools.storybook.reference_catalog import bootstrap_series_references, resolve_reference
+            base = safe_storybook_project_dir(scope[0])
+            bootstrap_series_references(base)
+            image_path = str(resolve_reference(base, image_path))
+        else:
+            image_path = _moved_reference_path(image_path)
         if output_path:
             # Если указан выходной путь, используем edit_image_file
             return _edit_file_via_direct_mcp_with_output(prompt, image_path, output_path, negative_prompt, width, height, true_cfg_scale, num_inference_steps, seed)
@@ -924,6 +956,15 @@ def edit_image_vse_tool(prompt: str, image_paths: List[str], session_id: str, ou
     """
     
     try:
+        from custom_tools.storybook.project_paths import current_series_scope, safe_storybook_project_dir
+        scope = current_series_scope()
+        if scope:
+            from custom_tools.storybook.reference_catalog import bootstrap_series_references, resolve_reference
+            base = safe_storybook_project_dir(scope[0])
+            bootstrap_series_references(base)
+            image_paths = [str(resolve_reference(base, path)) for path in image_paths]
+        else:
+            image_paths = [_moved_reference_path(path) for path in image_paths]
         url_gen = _images_generations_url()
         url_edits = _images_edits_url()
         if not url_gen or not url_edits:

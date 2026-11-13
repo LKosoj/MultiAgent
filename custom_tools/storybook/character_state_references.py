@@ -5,12 +5,16 @@ import json
 import os
 from pathlib import Path
 from typing import Optional
+from PIL import Image
 
 from agent_command import model_code
 from custom_tools.image_tools import edit_image_vse_tool
-from custom_tools.storybook.background_references import _frame_key, _reference_path
-from custom_tools.storybook.project_paths import safe_storybook_project_dir
-from utils import call_openai_api, parse_llm_json
+from custom_tools.storybook.background_references import _frame_key, _reference_candidate, _reference_path
+from custom_tools.storybook.project_paths import existing_reference_path, safe_storybook_project_dir, reference_project_dir
+from custom_tools.storybook.reference_catalog import (
+    reuse_reference, store_reference, reject_reference, reference_review_current, accept_reference_review,
+)
+from utils import call_openai_api, parse_llm_json, translate_prompts_in_items
 
 _CHARACTER_REFERENCE_PLAN_VERSION = 2
 
@@ -63,6 +67,23 @@ def _validate_plan(plan, frames, expected, known):
         raise ValueError(f"Character reference plan coverage is incomplete: {missing}")
 
 
+def _single_frame_states_as_text(plan):
+    """Keep images for states seen in several frames; describe one-frame states over the parent image."""
+    image_characters, text_states = [], {}
+    for character in plan["characters"]:
+        replaced, states = {}, []
+        for state in character.get("states") or []:
+            parent, inherited = replaced.get(state["parent_id"], (state["parent_id"], ""))
+            changes = f"{inherited}; {state['changes']}" if inherited else state["changes"]
+            if len(state["frame_keys"]) == 1:
+                replaced[state["id"]] = (parent, changes)
+                text_states[(character["name"], state["id"])] = dict(state, parent_id=parent)
+            else:
+                states.append(dict(state, parent_id=parent, changes=changes))
+        image_characters.append(dict(character, states=states))
+    return {"characters": image_characters}, text_states
+
+
 def storybook_character_state_references_tool(session_id: str, project_id: str, shots_data: Optional[dict] = None, language: str = "ru", enable: bool = True) -> dict:
     """Plan and generate stable appearance variants, then attach them to frames.
 
@@ -82,16 +103,22 @@ def storybook_character_state_references_tool(session_id: str, project_id: str, 
     elif isinstance(shots_data, str):
         shots_data = json.loads(shots_data)
     items = shots_data.get("items") or []
-    from .continuity import ensure_landmark_references, identity_reference_path
+    from .continuity import ensure_landmark_references, identity_reference_path, load_continuity_plan
     ensure_landmark_references(base, session_id, shots_data.get("seed"))
+    continuity = load_continuity_plan(base) or {}
     screenplay = json.loads((base / "91_screenplay" / "screenplay.json").read_text(encoding="utf-8"))
     for scene in screenplay["screenplay"]:
         scene.get("scene_continuity_facts", {}).pop("continuity", None)
         if not scene.get("scene_continuity_facts"):
             scene.pop("scene_continuity_facts", None)
     characters = json.loads((base / "20_bible" / "characters.json").read_text(encoding="utf-8"))
+    # В хеш плана идёт путь-кандидат (до переноса в общий каталог): перенос портрета не должен менять план.
+    candidates = {}
     for character in characters:
+        original = character.get("reference_image_path")
         character["reference_image_path"] = identity_reference_path(base, character, session_id, shots_data.get("seed"))
+        same = original and character["reference_image_path"] == str(_reference_path(base, original))
+        candidates[character["name"]] = str(_reference_candidate(base, original)[0]) if same else character["reference_image_path"]
     canonical = {entry["name"]: entry for entry in characters}
     frames, expected = {}, set()
     for item in items:
@@ -106,7 +133,8 @@ def storybook_character_state_references_tool(session_id: str, project_id: str, 
     base_hashes = {name: hashlib.sha256(_reference_path(base, entry.get("reference_image_path")).read_bytes()).hexdigest()
                    if _reference_path(base, entry.get("reference_image_path")).is_file() else None
                    for name, entry in canonical.items()}
-    payload = {"screenplay": screenplay, "frames": frames, "characters": characters, "language": language}
+    payload = {"screenplay": screenplay, "frames": frames, "language": language,
+               "characters": [dict(entry, reference_image_path=candidates[entry["name"]]) for entry in characters]}
     input_hash = hashlib.sha256(json.dumps([_CHARACTER_REFERENCE_PLAN_VERSION, payload, base_hashes], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     manifest_path = base / "97_shots" / "character_reference_states.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
@@ -159,6 +187,7 @@ def storybook_character_state_references_tool(session_id: str, project_id: str, 
     else:
         plan = {"characters": manifest.get("characters") or []}
         _validate_plan(plan, frames, expected, set(canonical))
+    plan, text_states = _single_frame_states_as_text(plan)
     ordinal = {name: number for number, name in enumerate(canonical, 1)}
     state_lookup = {}
     for character in plan["characters"]:
@@ -170,29 +199,83 @@ def storybook_character_state_references_tool(session_id: str, project_id: str, 
             key = (name, state["id"])
             record = manifest.setdefault("states", {}).get(f"{name}:{state['id']}", {})
             parent = state_lookup[(name, state["parent_id"])]
-            prompt = ("Создай нейтральный референс персонажа. Сохрани личность, неизменные черты, пропорции и стиль исходного референса. "
-                      "Сохрани состав ракурсов и компоновку исходного листа, не превращай его в один портрет. "
-                      "Свободные руки, без сцены и временного реквизита. Устойчивое изменение и итоговый вид: " + state["changes"] + "\n" + state["appearance"])
+            with Image.open(parent["reference_image_path"]) as parent_image:
+                reference_size = list(parent_image.size)
+            prompt = ("Edit only the declared persistent appearance change on the supplied character sheet. "
+                      "Preserve identity, proportions, artistic technique, the source canvas aspect ratio, the exact original number of views and their layout. "
+                      "Do not add panels, views, sketches, diagrams or material swatches. Do not turn the sheet into one portrait. "
+                      "For a position or orientation change, move or rotate the existing item while preserving its shape, "
+                      "construction and material; do not redesign it or invent new parts. Preserve the same physical side "
+                      "of the entity across all views; opposite viewpoints must not mirror the declared change. "
+                      "Do not introduce scene staging or temporary props. Required change and resulting appearance: "
+                      + state["changes"] + "\n" + state["appearance"])
+            prompt = translate_prompts_in_items({"english_prompt": prompt}, "en")["english_prompt"]
             parent_hash = hashlib.sha256(Path(parent["reference_image_path"]).read_bytes()).hexdigest()
+            state_key = hashlib.sha256(json.dumps(
+                [prompt, parent_hash, reference_size, shots_data.get("seed"),
+                 os.getenv("IMG2IMG_MODEL") or os.getenv("VSEGPT_IMG2IMG_MODEL")],
+                ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+            cached = reuse_reference(base, "appearance", state_key, description=prompt,
+                                     metadata={"entity": name, "appearance": state["appearance"], "source_hashes": [parent_hash], "reference_size": reference_size})
             reusable = (record.get("parent_id") == state["parent_id"]
                         and record.get("changes") == state["changes"] and record.get("appearance") == state["appearance"]
-                        and record.get("reference_image_paths") == [parent["reference_image_path"]]
+                        and record.get("prompt") == prompt
+                        and record.get("reference_size") == reference_size
+                        and [existing_reference_path(base, path) for path in record.get("reference_image_paths") or []]
+                        == [parent["reference_image_path"]]
                         and record.get("parent_hash", parent_hash) == parent_hash)
             regenerate = bool(record) and not reusable
             if not reusable:
                 record = {}
-            output = Path(record.get("reference_image_path") or (base / "20_bible" / "scene_character_references" / input_hash[:12] / "characters" / f"character_{ordinal[name]:02d}_state_{number:02d}.png"))
-            if regenerate or not output.is_file():
+            generated_path = reference_project_dir(base) / "20_bible" / "scene_character_references" / input_hash[:12] / "characters" / f"character_{ordinal[name]:02d}_state_{number:02d}.png"
+            # При регенерации не перезаписываем файл записи каталога: его имя равно sha содержимого.
+            # Старый путь записи мог быть перенесён в каталог.
+            recorded = record.get("reference_image_path")
+            output = Path(cached or (not regenerate and recorded and existing_reference_path(base, recorded)) or generated_path)
+            if not cached and (regenerate or not output.is_file()):
                 output.parent.mkdir(parents=True, exist_ok=True)
                 previous_mtime = output.stat().st_mtime_ns if output.is_file() else None
                 edit_image_vse_tool(prompt=prompt, image_paths=[parent["reference_image_path"]], session_id=session_id,
-                                    output_path=str(output), width=frames[state["frame_keys"][0]]["width"], height=frames[state["frame_keys"][0]]["height"],
+                                    output_path=str(output), width=reference_size[0], height=reference_size[1],
                                     negative_prompt="водяные знаки, логотипы, надписи", seed=shots_data.get("seed"))
                 if not output.is_file() or output.stat().st_mtime_ns == previous_mtime:
                     raise RuntimeError(f"Character reference was not generated: {output}")
+            pending_review = None
+            if canonical[name].get("reference_requirements"):
+                from .artist_batch_edit import _reference_requirements_met
+                excluded = set(continuity.get("character_identity", {}).get(name, {}).get("excluded_entity_ids", []))
+                props = [entity["name"] for entity in continuity.get("entities", []) if entity["id"] in excluded]
+                review = dict(canonical[name], reference_requirements=[
+                    "The following declared appearance change is required in every view: " + state["changes"],
+                    "The source is already approved. Preserve its identity, proportions, unmodified features and "
+                    "visual style. Only differences explicitly caused by the declared change are allowed. "
+                    "Preserve the source canvas aspect ratio, original view count and composition. "
+                    "Do not add panels, views, sketches, diagrams or material swatches. Every view must use the "
+                    "same artistic technique as the main portrait.",
+                ])
+                if props:
+                    review["reference_requirements"].append(
+                        "These temporary props must remain absent from the candidate in every view: " + ", ".join(props))
+                review_payload = {"name": name, "requirements": review["reference_requirements"], "source_image_hash": parent_hash}
+                current_review = reference_review_current(base, output, review_payload)
+                if not current_review and not _reference_requirements_met(str(output), review, parent["reference_image_path"]):
+                    reject_reference(base, output, "Appearance reference failed canonical/state requirements")
+                    generated_path.unlink(missing_ok=True)
+                    manifest["states"].pop(f"{name}:{state['id']}", None)
+                    _write_json(manifest_path, manifest)
+                    raise RuntimeError(f"Character appearance reference failed requirements: {name}:{state['id']}")
+                if not current_review:
+                    pending_review = review_payload
+            if not cached:
+                output = Path(store_reference(base, output, "appearance", state_key,
+                                              description=prompt,
+                                              metadata={"entity": name, "appearance": state["appearance"], "source_hashes": [parent_hash], "reference_size": reference_size},
+                                              sources=[parent["reference_image_path"]]))
+            if pending_review is not None:
+                accept_reference_review(base, output, pending_review)
             record = {"state_id": state["id"], "parent_id": state["parent_id"], "reference_image_path": str(output),
                       "appearance": state["appearance"], "changes": state["changes"], "frame_keys": state["frame_keys"], "prompt": prompt,
-                      "reference_image_paths": [parent["reference_image_path"]], "parent_hash": parent_hash}
+                      "reference_image_paths": [parent["reference_image_path"]], "parent_hash": parent_hash, "reference_size": reference_size}
             manifest["states"][f"{name}:{state['id']}"] = record
             state_lookup[key] = record
     _write_json(manifest_path, manifest)
@@ -202,6 +285,10 @@ def storybook_character_state_references_tool(session_id: str, project_id: str, 
             record = manifest["states"][f"{name}:{state['id']}"]
             for key in state["frame_keys"]:
                 state_lookup[(name, key)] = record
+    for (name, _), state in text_states.items():
+        record = dict(state_lookup[(name, state["parent_id"])], state_id=state["id"], appearance=state["appearance"])
+        for key in state["frame_keys"]:
+            state_lookup[(name, key)] = record
     with open(str(shots_path) + ".lock", "a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         latest = json.loads(shots_path.read_text(encoding="utf-8"))
@@ -219,7 +306,13 @@ def storybook_character_state_references_tool(session_id: str, project_id: str, 
                 record = state_lookup[(name, key)]
                 metadata[name] = {"state_id": record["state_id"], "reference_image_path": record["reference_image_path"], "appearance": record.get("appearance", "")}
                 old = entry.get("reference_image_path")
-                old_paths = {old, str(_reference_path(base, old))}
+                # This is a retired input being replaced, not a reference to use.
+                # Resolving it through the catalog would reject its old binding.
+                old_paths = {old}
+                if old:
+                    old_path = Path(old)
+                    old_paths.add(str((old_path if old_path.is_absolute() else base / old_path).resolve()))
+                    old_paths.add(existing_reference_path(base, old))
                 refs = [record["reference_image_path"] if path in old_paths else path for path in refs]
                 entry["reference_image_path"] = record["reference_image_path"]
                 if record["state_id"] == "base":

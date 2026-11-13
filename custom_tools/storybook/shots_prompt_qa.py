@@ -8,6 +8,7 @@ import os
 import re
 import fcntl
 import threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,7 +27,7 @@ from custom_tools.storybook.screenplay_shots_generator_utils.shared_utils import
 from custom_tools.storybook.screenplay_shots_generator_utils.technical import (
     _build_reference_roles_instruction,
 )
-from custom_tools.storybook.project_paths import safe_storybook_project_dir
+from custom_tools.storybook.project_paths import existing_reference_path, safe_storybook_project_dir
 from custom_tools.storybook.video_prompt_rules import VIDEO_PROMPT_RULES, video_prompt_violations
 from custom_tools.storybook.domain_glossary_config import (
     resolve_active_domain_profile,
@@ -1124,19 +1125,30 @@ def _refresh_item_reference_roles(
     ):
         return
 
-    item["characters"] = [
-        character_index_by_name[character.strip().lower()] if isinstance(character, str) else character
-        for character in item.get("characters") or []
-    ]
-    item["locations"] = [
-        location_index_by_name[location.strip().lower()] if isinstance(location, str) else location
-        for location in item.get("locations") or []
-    ]
+    replacements = {}
+    for field, index in (("characters", character_index_by_name or {}), ("locations", location_index_by_name or {})):
+        refreshed = []
+        for entry in item.get(field) or []:
+            name = entry if isinstance(entry, str) else entry.get("name", "")
+            current = index.get(name.strip().lower())
+            if current and not (isinstance(entry, dict) and entry.get("type") == "continuity"):
+                old_path = entry.get("reference_image_path") if isinstance(entry, dict) else None
+                stale = (isinstance(entry, str) or not old_path or not os.path.isfile(old_path)
+                         or entry.get("_shared_version_id") != current.get("_shared_version_id"))
+                if stale:
+                    if old_path and current.get("reference_image_path"):
+                        replacements[old_path] = current["reference_image_path"]
+                    entry = current
+            refreshed.append(entry)
+        item[field] = refreshed
+    item["reference_image_paths"] = [replacements.get(path, path) for path in item.get("reference_image_paths") or []]
     new_roles = _build_reference_roles_instruction(
         item.get("reference_image_paths") or [],
         item.get("characters") or [],
         item.get("locations") or [],
         location_index_by_name,
+        frame_spec=item.get("_shot_frame_spec"),
+        shot_type=item.get("shot_type", "start"),
     )
     prompt = str(item.get("english_prompt") or "")
     _core, old_roles = _split_saved_image_style(prompt)
@@ -1588,7 +1600,8 @@ def shots_prompt_qa_tool(
         model_obj = model_hard
 
     base = str(safe_storybook_project_dir(project_id))
-    image_style_catalog = _read_json(f"{base}/30_style/image_styles.json") or {}
+    from .style_keeper import ensure_image_style_catalog
+    image_style_catalog = ensure_image_style_catalog(base, _read_json(f"{base}/30_style/style_images.json") or {})
     from .style_keeper import resolve_image_style_id
     project_brief = _read_json(f"{base}/00_brief.json") or {}
     project_language = str(project_brief.get("language") or "").lower()
@@ -1844,6 +1857,7 @@ If shot_frame_spec exists for a shot, validate against it only when it agrees wi
 
 ### Step 3: Per-shot validation against storyboard
 For each shot, check:
+0. The frame's saved image_styles is authoritative for rendering technique, including over older stylistic wording in the storyboard. Remove or replace conflicting legacy rendering instructions embedded in the image prompt core; appending the current style does not cancel such contradictions. Preserve story objects, physical lighting sources, staging and material facts. Do not copy the style catalog into the core: code appends it after repairs.
 1. Location/time matches scene (no wrong room/hall).
 2. Spatial/zone consistency (physical placement of subjects/props per screenplay).
    Validate occlusion depth against the camera and physical boundary sides: a boundary component cannot occlude an actor positioned between that boundary and the camera. A divider separating figures on screen does not imply it covers either figure. Repair a derived occlusion that contradicts source placement in both the phase spec and image prompt; make the correct side visually readable through the actor's support and silhouette.
@@ -2305,8 +2319,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                     if not isinstance(location, dict):
                         continue
                     reference_path = str(location.get("reference_image_path") or "")
-                    if reference_path.lstrip("/").startswith("references/"):
-                        reference_path = os.path.join(base, "20_bible", reference_path.lstrip("/"))
+                    reference_path = existing_reference_path(Path(base), reference_path)
                     if reference_path in seen_location_paths or not os.path.isfile(reference_path):
                         continue
                     seen_location_paths.add(reference_path)
@@ -2324,7 +2337,8 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                               for path in context.get('landmark_reference_paths', [])}
             if landmark_paths:
                 review_items += [dict(scene_number=scene_number, shot_number=shot_number,
-                    shot_type='SHARED_LANDMARK_GEOMETRY', output_path=path) for path in sorted(landmark_paths)]
+                    shot_type='SHARED_LANDMARK_GEOMETRY', output_path=existing_reference_path(Path(base), path))
+                    for path in sorted(landmark_paths)]
                 pair_render_review_image = _scene_render_review_image(review_items)
             if not pair_render_review_image:
                 continue
@@ -2672,6 +2686,8 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
             report["global_repairs_rejected"] = 0
             logger.info("🧪 shots_prompt_qa_tool: global screenplay pass done (no repairs)")
 
+    # Repairs can replace item dictionaries; compile the final instances.
+    items_in_scope = [item for item in items if _item_in_requested_scope(item)]
     # QA rewrites scene content; refresh reference roles after any reference repairs.
     for item in items_in_scope:
         _refresh_item_reference_roles(item, location_index_by_name, character_index_by_name)

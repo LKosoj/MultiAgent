@@ -32,3 +32,4 @@ parameters:
     type: bool
     description: "If true, builds the blockout scene spec; if false, returns the zero contract without touching 93_blockout/"
     required: false
+    default: false

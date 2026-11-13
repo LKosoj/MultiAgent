@@ -84,7 +84,7 @@ def test_parse_shots_filter_happy_path():
 
 def test_b17_scene_spec_missing_raises(tmp_path):
     with pytest.raises(RuntimeError, match="B17"):
-        renderer.blockout_renderer_tool(session_id="s", project_id="nope")
+        renderer.blockout_renderer_tool(session_id="s", project_id="nope", enable=True)
     report = _read(tmp_path / "nope" / "93_blockout" / "report.json")
     assert report["blockout_renderer"]["checks"][0]["code"] == "B17"
 
@@ -96,7 +96,7 @@ def test_b12_blender_unavailable_raises_and_records_report(tmp_path, monkeypatch
     monkeypatch.setattr(bc, "check_blender_available", lambda *a, **k: (False, None, "not found"))
     _write(tmp_path / "b12" / "93_blockout" / "scene_spec.json", {"version": 1, "fps": 24, "world": {}, "chains": []})
     with pytest.raises(RuntimeError, match="B12"):
-        renderer.blockout_renderer_tool(session_id="s", project_id="b12")
+        renderer.blockout_renderer_tool(session_id="s", project_id="b12", enable=True)
     report = _read(tmp_path / "b12" / "93_blockout" / "report.json")
     assert report["blockout_renderer"]["checks"][0]["code"] == "B12"
 
@@ -107,7 +107,7 @@ def test_b12_blender_unavailable_raises_and_records_report(tmp_path, monkeypatch
 def test_b02_second_form_fps_mismatch_raises(tmp_path):
     _write(tmp_path / "fpsmismatch" / "93_blockout" / "scene_spec.json", {"version": 1, "fps": 24, "world": {}, "chains": []})
     with pytest.raises(RuntimeError, match="B02"):
-        renderer.blockout_renderer_tool(session_id="s", project_id="fpsmismatch", fps=30)
+        renderer.blockout_renderer_tool(session_id="s", project_id="fpsmismatch", fps=30, enable=True)
     report = _read(tmp_path / "fpsmismatch" / "93_blockout" / "report.json")
     assert report["blockout_renderer"]["checks"][0]["code"] == "B02"
 
@@ -127,7 +127,7 @@ def test_b01_third_form_duration_mismatch_raises(tmp_path):
         {"items": [{"scene_number": 1, "shot_number": 1, "shot_type": "start", "duration_s": 7, "width": 1280, "height": 720}]},
     )
     with pytest.raises(RuntimeError, match="B01"):
-        renderer.blockout_renderer_tool(session_id="s", project_id="durmismatch", fps=24)
+        renderer.blockout_renderer_tool(session_id="s", project_id="durmismatch", fps=24, enable=True)
     report = _read(tmp_path / "durmismatch" / "93_blockout" / "report.json")
     assert report["blockout_renderer"]["checks"][0]["code"] == "B01"
 
@@ -167,6 +167,7 @@ def test_b01_checked_only_within_scope_not_whole_project(tmp_path, monkeypatch):
     # the stubbed B12 instead, proving B01 didn't short-circuit first).
     result = renderer.blockout_renderer_tool(
         session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="chain_sc01_ch01",
+        enable=True,
     )
     assert result["status"] == "partial"
 
@@ -174,6 +175,7 @@ def test_b01_checked_only_within_scope_not_whole_project(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="B01"):
         renderer.blockout_renderer_tool(
             session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="chain_sc02_ch01",
+            enable=True,
         )
 
 
@@ -263,7 +265,7 @@ def test_full_run_emits_chain_size_mismatch_p13_warning(tmp_path, monkeypatch):
     _write(base / "97_shots" / "video_model_caps.json", {})
     monkeypatch.setattr(renderer.blockout_common, "run_blender_script", lambda *a, **k: {"ok": False, "error": "stub"})
 
-    renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720")
+    renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", enable=True)
 
     report = _read(base / "93_blockout" / "report.json")
     p13_reasons = [c.get("reason") for c in report["blockout_renderer"]["checks"] if c.get("code") == "P13"]
@@ -746,7 +748,7 @@ def test_full_run_success_writes_manifest_shots_and_report(tmp_path, monkeypatch
 
     monkeypatch.setattr(renderer.blockout_common, "run_blender_script", _fake_run_blender_script)
 
-    result = renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all")
+    result = renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all", enable=True)
 
     assert result == {
         "status": "success", "shots_rendered": 1, "frames_total": 2, "junction_checks": [],
@@ -811,7 +813,7 @@ def test_full_run_chain_launch_failure_is_partial_not_raised(tmp_path, monkeypat
         lambda *a, **k: {"ok": False, "error": "blender crashed"},
     )
 
-    result = renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720")
+    result = renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", enable=True)
     assert result["status"] == "partial"
     assert result["shots_rendered"] == 0
 
@@ -866,7 +868,7 @@ def test_world_is_read_per_chain_not_from_scene_spec_root(tmp_path, monkeypatch)
 
     monkeypatch.setattr(renderer.blockout_common, "run_blender_script", _fake_run_blender_script)
 
-    renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all")
+    renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all", enable=True)
 
     assert seen_worlds["scene_01_shot_01"] == {"ground": {"size_m": 10}, "sun": {}}
     assert seen_worlds["scene_02_shot_01"] == {"ground": {"size_m": 20}, "sun": {}}
@@ -906,7 +908,7 @@ def test_report_stale_checks_cleared_for_rerendered_chain_only(tmp_path, monkeyp
 
     # First run over the whole project: sc01_ch01 fails B16 (partial, not
     # raised), sc02_ch01 fails the stubbed B12.
-    result1 = renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all")
+    result1 = renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all", enable=True)
     assert result1["status"] == "partial"
     report1 = _read(base / "93_blockout" / "report.json")
     codes1 = {(c.get("code"), c.get("chain_id")) for c in report1["blockout_renderer"]["checks"]}
@@ -918,6 +920,7 @@ def test_report_stale_checks_cleared_for_rerendered_chain_only(tmp_path, monkeyp
     _write(scene_spec_path, {"version": 1, "fps": 1, "chains": [broken_chain, other_chain]})
     result2 = renderer.blockout_renderer_tool(
         session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="chain_sc01_ch01",
+        enable=True,
     )
     assert result2["status"] == "partial"  # now fails later, at the stubbed B12
 
@@ -972,7 +975,7 @@ def test_b05_mismatched_frame_sizes_on_disk_raises_and_records_report(tmp_path, 
     monkeypatch.setattr(renderer.blockout_common, "run_blender_script", _fake_run_blender_script)
 
     with pytest.raises(RuntimeError, match="B05"):
-        renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720")
+        renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", enable=True)
 
     report = _read(base / "93_blockout" / "report.json")
     codes = [c.get("code") for c in report["blockout_renderer"]["checks"]]
@@ -1052,6 +1055,7 @@ def test_shots_json_patches_survive_a_later_chain_b03_failure(tmp_path, monkeypa
     with pytest.raises(RuntimeError, match="B03"):
         renderer.blockout_renderer_tool(
             session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all",
+            enable=True,
         )
 
     shots_data = _read(base / "97_shots" / "shots.json")
@@ -1122,7 +1126,7 @@ def test_full_run_populates_assets_used_in_manifest(tmp_path, monkeypatch):
 
     monkeypatch.setattr(renderer.blockout_common, "run_blender_script", _fake_run_blender_script)
 
-    renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720")
+    renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", enable=True)
 
     manifest = _read(shot_dir / "manifest.json")
     assert manifest["assets_used"] == [{"asset_id": "humanoid_adult", "asset_version": 2}]
@@ -1188,7 +1192,7 @@ def test_full_run_three_shot_chain_junction_checks_exact_and_soft(tmp_path, monk
 
     monkeypatch.setattr(renderer.blockout_common, "run_blender_script", _fake_run_blender_script)
 
-    result = renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all")
+    result = renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all", enable=True)
 
     assert result["status"] == "success"
     assert result["shots_rendered"] == 3
@@ -1281,7 +1285,7 @@ def test_junction_check_sets_blockout_junction_failed_and_clears_on_rerun(tmp_pa
 
     monkeypatch.setattr(renderer.blockout_common, "run_blender_script", _fake_run_blender_script_fail)
 
-    result1 = renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all")
+    result1 = renderer.blockout_renderer_tool(session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="all", enable=True)
     assert result1["status"] == "partial"
     assert result1["junction_checks"] == [{
         "chain_id": "sc01_ch01", "scene_number": 1, "shot_number": 2, "prev_shot_number": 1,
@@ -1310,6 +1314,7 @@ def test_junction_check_sets_blockout_junction_failed_and_clears_on_rerun(tmp_pa
     monkeypatch.setattr(renderer.blockout_common, "run_blender_script", _fake_run_blender_script_pass)
     result2 = renderer.blockout_renderer_tool(
         session_id="s", project_id=project_id, fps=1, resolution="1280x720", scope="chain_sc01_ch01",
+        enable=True,
     )
     assert result2["status"] == "success"
     assert result2["junction_checks"] == [{

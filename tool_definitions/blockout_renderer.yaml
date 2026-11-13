@@ -32,3 +32,4 @@ parameters:
     type: bool
     description: "If true, renders the blockout scene; if false, returns the zero contract without touching 93_blockout/"
     required: false
+    default: false

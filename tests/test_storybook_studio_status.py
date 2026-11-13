@@ -218,7 +218,7 @@ def test_flag_in_run_settings_skips_blockout(project, no_hooks):
 
 
 def test_flag_priority_settings_db_brief_default(project, no_hooks, tmp_path):
-    assert call()["flags"]["generate_blockout"] == {"value": True, "source": "default"}
+    assert call()["flags"]["generate_blockout"] == {"value": False, "source": "default"}
     status._reset_cache_for_tests()
     touch(project, "00_brief.json", json.dumps({"generate_blockout": False, "title": "T"}).encode())
     assert call()["flags"]["generate_blockout"] == {"value": False, "source": "brief"}
@@ -242,6 +242,7 @@ def test_dotted_condition_is_unresolved(project, no_hooks):
 # ---------------------------------------------------------------------------
 
 def test_bypassed_chain(project, no_hooks):
+    touch(project, "00_brief.json", json.dumps({"generate_blockout": True}).encode())
     write_run_file(project, "artist_batch_shots")
     rows = steps_of(call())
     for sid in ("blockout_scene_builder", "blockout_renderer", "blockout_preview"):
@@ -250,6 +251,7 @@ def test_bypassed_chain(project, no_hooks):
 
 
 def test_not_bypassed_without_done_descendants(project, no_hooks):
+    touch(project, "00_brief.json", json.dumps({"generate_blockout": True}).encode())
     rows = steps_of(call())
     assert rows["blockout_renderer"]["state"] == "not_run"
 

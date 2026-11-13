@@ -3,6 +3,7 @@
 """
 
 from typing import Dict, Any, Optional, List
+from ..project_paths import current_series_scope, safe_storybook_project_dir
 import json
 import re
 import os
@@ -968,11 +969,21 @@ def _resolve_location_reference_path(
     return ""
 
 
+def _character_placement(name, frame_spec, shot_type):
+    spec = frame_spec or {}
+    state = spec.get(f"{shot_type}_state_spec") or spec
+    poses = state.get("character_pose_signatures") or {}
+    return next((str(pose).strip() for actor, pose in poses.items()
+                 if str(actor).strip().casefold() == str(name).strip().casefold()), "")
+
+
 def _build_reference_roles_instruction(
     reference_paths: List[str],
     shot_characters: List[Dict[str, Any]],
     shot_locations: List[Dict[str, Any]],
     location_index_by_name: Optional[Dict[str, Dict[str, Any]]] = None,
+    frame_spec: Optional[Dict[str, Any]] = None,
+    shot_type: str = "start",
 ) -> str:
     if not reference_paths:
         return ""
@@ -1044,10 +1055,11 @@ def _build_reference_roles_instruction(
                     label = f"image {idx} as location — {name} (layout+lighting+palette; if multiple views are shown, select the view matching this shot, not their combined arrangement)"
         elif ref in char_path_to_name and char_path_to_name[ref]:
             name = char_path_to_name[ref]
-            # Персонажный референс: приоритет идентичности над всем остальным
+            placement = _character_placement(name, frame_spec, shot_type)
             label = (
                 f"image {idx} as character — {name} "
-                f"(идентичность: лицо, глаза, пропорции; стиль проекта)"
+                f"(внешность только видимых частей; стиль проекта)"
+                + (f"; положение и видимость: {placement}" if placement else "")
             )
         elif "/97_shots/" in ref and ref.endswith(".png"):
             # Fallback: сгенерированный кадр как continuity reference - ИСТОЧНИК ФОНА
@@ -1253,8 +1265,10 @@ def _create_shot_item(
     )
     
     # Формируем путь сохранения с новым именем файла
-    output_path = f"plots/storybooks/{project_id}/97_shots/scene_{scene_number:02d}_shot_{shot_number:02d}/img_final_{shot_type}_{scene_number:02d}_{shot_number:02d}.png"
-    video_path = f"plots/storybooks/{project_id}/97_shots/scene_{scene_number:02d}_shot_{shot_number:02d}/video_final_{scene_number:02d}_{shot_number:02d}.mp4"
+    scope = current_series_scope()
+    project_dir = str(safe_storybook_project_dir(project_id)) if scope and scope[0] == project_id else f"plots/storybooks/{project_id}"
+    output_path = f"{project_dir}/97_shots/scene_{scene_number:02d}_shot_{shot_number:02d}/img_final_{shot_type}_{scene_number:02d}_{shot_number:02d}.png"
+    video_path = f"{project_dir}/97_shots/scene_{scene_number:02d}_shot_{shot_number:02d}/video_final_{scene_number:02d}_{shot_number:02d}.mp4"
 
     # Получаем данные персонажей из LLM результата (нормализованное сопоставление по имени)
     # LLM иногда возвращает некорректный тип (например, float вместо списка) — нормализуем.
@@ -1564,7 +1578,7 @@ LOCATION_TIME: "{location_time}"
         # END всегда должен сохранять локацию START того же шота.
         # Если локальный резолвер не нашёл локацию, поднимаем её из START item в shots.json.
         try:
-            shots_path = f"plots/storybooks/{project_id}/97_shots/shots.json"
+            shots_path = f"{project_dir}/97_shots/shots.json"
             if os.path.exists(shots_path):
                 with open(shots_path, "r", encoding="utf-8") as f:
                     payload = json.load(f)
@@ -1628,7 +1642,7 @@ LOCATION_TIME: "{location_time}"
     
     # Для end кадров добавляем соответствующий start кадр ПЕРВЫМ в референсы
     if shot_type == "end":
-        start_image_path = f"plots/storybooks/{project_id}/97_shots/scene_{scene_number:02d}_shot_{shot_number:02d}/img_final_start_{scene_number:02d}_{shot_number:02d}.png"
+        start_image_path = f"{project_dir}/97_shots/scene_{scene_number:02d}_shot_{shot_number:02d}/img_final_start_{scene_number:02d}_{shot_number:02d}.png"
         reference_paths.append(start_image_path)
     
     # Для start кадров проверяем, есть ли continuity reference в LLM результате
@@ -1827,6 +1841,8 @@ LOCATION_TIME: "{location_time}"
         shot_characters,
         shot_locations,
         location_index_by_name,
+        frame_spec=frame_spec,
+        shot_type=shot_type,
     )
 
     if _is_bs and shot_type == "end":
@@ -2306,7 +2322,7 @@ def _sanitize_start_via_llm(
         "- КАЧЕСТВО И ДЕТАЛИЗАЦИЯ: добавь команды улучшения качества если отсутствуют: 'with enhanced clarity', 'preserve details', 'remove artifacts'.\n"
         "- КРУПНЫЕ ПЛАНЫ ЧАСТЕЙ ТЕЛА: если spatial_composition описывает крупный план рук/ног с частичным присутствием лица/тела — НЕ удаляй упоминания лица/тела из english_prompt, это необходимо для сохранения идентичности персонажа.\n"
         "- **ЭКРАНЫ/ИНТЕРФЕЙСЫ**: при планшете/экране используй 'no brand logos, no long text' вместо 'no text' (разреши UI элементы)\n"
-        "- **УНИФИКАЦИЯ УСТРОЙСТВ**: всегда 'tablet' для деловых сцен, 'smartphone' только для звонков\n"
+        "- **СОХРАНЕНИЕ ПРЕДМЕТОВ**: типы и свойства предметов бери из исходного описания; не подменяй их по жанру или характеру сцены.\n"
         "- **НОРМАЛИЗАЦИЯ ТИПОВ**: булевы поля как true/false (не строки), character_orientation из enum, point_of_view как objective/subjective/pov_[имя]\n"
         "- Минимальность правок: если входной JSON УЖЕ соответствует этим правилам — верни его БЕЗ ИЗМЕНЕНИЙ. Вноси ТОЛЬКО необходимые точечные правки (преимущественно в english_prompt и negative_prompt). Не меняй characters/location/пространственные поля без явного противоречия.\n"
         "Ответ возвращай СТРОГО как JSON с теми же полями."

@@ -53,6 +53,16 @@ def test_scene_music_uses_saved_level_and_enabled_controls(tmp_path, monkeypatch
     assert timeline_media._audio_segments(tmp_path, items, 4) == []
 
 
+
+def test_disabled_music_ignores_stale_scene_plan(tmp_path):
+    # Выключенная музыка оставляет старый план сцен: монтаж не должен требовать его треки.
+    audio = tmp_path / '98_audio'
+    audio.mkdir()
+    (audio / 'music_plan.json').write_text(json.dumps({'scene_mapping': {'1': 'neutral'}}))
+    (audio / 'music_manifest.json').write_text(json.dumps({'status': 'skipped', 'audio_tracks': []}))
+    items = [{'scene_number': 1, 'shot_number': 1, 'duration_s': 2}]
+    assert timeline_media._audio_segments(tmp_path, items, 2) == []
+
 @pytest.mark.skipif(not shutil.which('ffmpeg'), reason='local ffmpeg required')
 def test_sound_event_level_and_position_reach_xml_and_mp4(tmp_path, monkeypatch):
     from PIL import Image
