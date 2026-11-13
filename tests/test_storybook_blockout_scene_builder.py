@@ -112,7 +112,7 @@ def test_b02_fractional_fps_raises_before_any_file_read(tmp_path):
     # directory legitimately exists afterwards — but no OTHER project file
     # (shots.json etc.) is ever read: B02 aborts before those reads happen.
     with pytest.raises(ValueError, match="blockout_fps must be an integer"):
-        sb.blockout_scene_builder_tool(session_id="s", project_id="nope", fps=23.5)
+        sb.blockout_scene_builder_tool(session_id="s", project_id="nope", fps=23.5, enable=True)
 
     report_path = tmp_path / "nope" / "93_blockout" / "report.json"
     assert report_path.is_file()
@@ -124,7 +124,7 @@ def test_b02_fractional_fps_raises_before_any_file_read(tmp_path):
 def test_b02_accepts_integer_float_and_numeric_string(tmp_path):
     _setup_project(tmp_path, "b02ok", items=[_shot(1, 1)])
     for fps in (24, 24.0, "24"):
-        result = sb.blockout_scene_builder_tool(session_id="s", project_id="b02ok", fps=fps)
+        result = sb.blockout_scene_builder_tool(session_id="s", project_id="b02ok", fps=fps, enable=True)
         assert result["status"] in ("success", "warning")
 
 
@@ -135,7 +135,7 @@ def test_b12_blender_unavailable_raises_and_records_report(tmp_path, monkeypatch
     monkeypatch.setattr(bc, "check_blender_available", lambda *a, **k: (False, None, "not found"))
     base = _setup_project(tmp_path, "b12", items=[_shot(1, 1)])
     with pytest.raises(RuntimeError, match="B12"):
-        sb.blockout_scene_builder_tool(session_id="s", project_id="b12")
+        sb.blockout_scene_builder_tool(session_id="s", project_id="b12", enable=True)
     report = _read(base / "93_blockout" / "report.json")
     checks = report["blockout_scene_builder"]["checks"]
     assert checks[0]["code"] == "B12"
@@ -148,7 +148,7 @@ def test_b12_blender_unavailable_raises_and_records_report(tmp_path, monkeypatch
 def test_b15_empty_supported_durations_raises(tmp_path):
     base = _setup_project(tmp_path, "b15", items=[_shot(1, 1)], supported_durations=[])
     with pytest.raises(RuntimeError, match="B15"):
-        sb.blockout_scene_builder_tool(session_id="s", project_id="b15")
+        sb.blockout_scene_builder_tool(session_id="s", project_id="b15", enable=True)
     report = _read(base / "93_blockout" / "report.json")
     assert report["blockout_scene_builder"]["checks"][0]["code"] == "B15"
 
@@ -166,7 +166,7 @@ def test_b01a_duplicate_shot_number_across_chains_raises(tmp_path):
     ]
     base = _setup_project(tmp_path, "b01a", items=items)
     with pytest.raises(ValueError, match="B01a"):
-        sb.blockout_scene_builder_tool(session_id="s", project_id="b01a")
+        sb.blockout_scene_builder_tool(session_id="s", project_id="b01a", enable=True)
     report = _read(base / "93_blockout" / "report.json")
     checks = report["blockout_scene_builder"]["checks"]
     assert checks[0]["code"] == "B01a"
@@ -179,7 +179,7 @@ def test_b01a_duplicate_shot_number_across_chains_raises(tmp_path):
 def test_b01_duration_not_in_effective_set_raises(tmp_path):
     base = _setup_project(tmp_path, "b01a", items=[_shot(1, 1, duration_s=6)], supported_durations=[5, 7, 10])
     with pytest.raises(RuntimeError, match="B01"):
-        sb.blockout_scene_builder_tool(session_id="s", project_id="b01a")
+        sb.blockout_scene_builder_tool(session_id="s", project_id="b01a", enable=True)
     report = _read(base / "93_blockout" / "report.json")
     entry = report["blockout_scene_builder"]["checks"][0]
     assert entry["code"] == "B01"
@@ -191,12 +191,103 @@ def test_b01_duration_missing_raises(tmp_path):
     del el["duration_s"]
     _setup_project(tmp_path, "b01b", items=[el])
     with pytest.raises(RuntimeError, match="B01"):
-        sb.blockout_scene_builder_tool(session_id="s", project_id="b01b")
+        sb.blockout_scene_builder_tool(session_id="s", project_id="b01b", enable=True)
+
+
+def test_b01_preserves_measured_duration_below_provider_minimum(tmp_path):
+    base = _setup_project(tmp_path, 'measured', items=[
+        _shot(1, 1, duration_s=1.7625, start_s=0.0, end_s=1.7625),
+    ], supported_durations=[2, 3, 4])
+    result = sb.blockout_scene_builder_tool(session_id='s', project_id='measured', enable=True)
+    assert result['status'] in {'success', 'warning'}
+    chains = _read(base / '93_blockout/chains.json')['chains']
+    assert chains[0]['shots'][0]['duration_s'] == pytest.approx(1.7625)
+
+
+@pytest.mark.parametrize('duration,end', [(0, 0), (-1, -1), (float('nan'), 1), (1.7625, 2)])
+def test_b01_rejects_invalid_measured_duration(tmp_path, duration, end):
+    _setup_project(tmp_path, 'measured', items=[
+        _shot(1, 1, duration_s=duration, start_s=0.0, end_s=end),
+    ], supported_durations=[2, 3, 4])
+    with pytest.raises(RuntimeError, match='B01'):
+        sb.blockout_scene_builder_tool(session_id='s', project_id='measured', enable=True)
+
+
+def test_chain_tracks_allow_exact_measured_terminal_between_video_frames():
+    objects, camera = sb._static_fallback_tracks(1.7625, ['actor'])
+    for subject in [camera, *objects]:
+        for keys in subject['tracks'].values():
+            keys.append(dict(keys[0], t=1.7625))
+    assert sb._validate_chain_tracks(objects, camera, 1.7625, 24) is None
+
+
+@pytest.mark.parametrize('camera_location', [[0.05, -0.076, 1.024], [0.05, -4, 5]])
+def test_ensemble_camera_fits_required_bodies_without_changing_angle(camera_location):
+    target = [0.05, 1.2, 0.95]
+    tracks = {'location': [{'t': 0, 'v': camera_location}],
+              'look_at': [{'t': 0, 'v': target}], 'lens_mm': [{'t': 0, 'v': 35}]}
+    bounds = [(x, y, z) for x in (-0.6655, 0.807) for y in (0.943, 1.457) for z in (1.1, 2.3)]
+    sb._apply_camera_boundary_overrides(tracks, [(0, sb.parse_camera_plan('MEDIUM SHOT'), 1.55, None)],
+                                        64, {'enabled': False}, frame_bounds={0: bounds})
+    look = bc.evaluate_track_vec3(tracks['look_at'], 0)
+    location = bc.evaluate_track_vec3(tracks['location'], 0)
+    expected_direction = [camera_location[n] - target[n] for n in range(3)]
+    direction = [location[n] - look[n] for n in range(3)]
+    distance = math.sqrt(sum(v*v for v in direction))
+    norm = math.sqrt(sum(v*v for v in expected_direction))
+    assert [v / distance for v in direction] == pytest.approx([v / norm for v in expected_direction])
+    assert look == pytest.approx([0.07075, 1.2, 1.7])
+    right = [-direction[1], direction[0], 0]
+    length = math.hypot(*right[:2]); right = [v / length for v in right]
+    for point in bounds:
+        offset = [point[n] - look[n] for n in range(3)]
+        depth = distance - sum(offset[n]*direction[n]/distance for n in range(3))
+        assert abs(sum(offset[n]*right[n] for n in range(3))) * 50 / depth <= 18 * 0.55 + 1e-6
+
+
+def test_measured_final_camera_override_reaches_last_rendered_frame(tmp_path, monkeypatch):
+    duration = 1.7625
+    base = _setup_project(tmp_path, 'terminal_camera', items=[
+        _shot(1, 1, duration_s=duration, start_s=0, end_s=duration),
+    ], supported_durations=[2, 3, 4])
+    def layout(payload):
+        return {'objects': [], 'camera': {'tracks': {
+            'location': [{'t': t, 'v': [0, -3, 1.5]} for t in (0, duration)],
+            'look_at': [{'t': t, 'v': [0, 0, 1.5]} for t in (0, duration)],
+            'lens_mm': [{'t': t, 'v': 35} for t in (0, duration)],
+        }}}
+    monkeypatch.setattr(sb, 'llm_parse_chain_spatial', layout)
+    sb.blockout_scene_builder_tool(session_id='s', project_id='terminal_camera', fps=8, enable=True)
+    tracks = _read(base / '93_blockout/scene_spec.json')['chains'][0]['camera']['tracks']
+    assert bc.evaluate_track_scalar(tracks['lens_mm'], round(duration * 8) / 8) == pytest.approx(50)
+
+
+def test_scene_uses_character_and_location_cards_from_generated_shots(tmp_path, monkeypatch):
+    constraints = {'scene_mode': 'ensemble', 'visible_characters': ['Hero', 'Sidekick'],
+                   'must_not_show': ['vacuum']}
+    calls = []
+    monkeypatch.setattr(sb, 'llm_parse_chain_spatial', lambda payload: calls.append(payload))
+    base = _setup_project(tmp_path, 'cards',
+        characters=[{'name': 'Hero'}, {'name': 'Sidekick'}],
+        locations=[{'name': 'Flat', 'key_objects': ['sofa']}],
+        items=[_shot(1, 1, characters=[{'name': 'Hero'}, {'name': 'Sidekick'}],
+                     locations=[{'name': 'Flat'}], location=None, main_subject='Hero and Sidekick',
+                     _shot_frame_spec=constraints)])
+    sb.blockout_scene_builder_tool(session_id='s', project_id='cards', enable=True)
+    chain = _read(base / '93_blockout/scene_spec.json')['chains'][0]
+    assert {obj['instance_id'] for obj in chain['objects']} == {'hero', 'sidekick', 'sofa'}
+    assert calls[0]['shots'][0]['frame_constraints'] == constraints
+    first_count = len(calls)
+    data = _read(base / '97_shots/shots.json')
+    data['items'][0]['_shot_frame_spec']['must_not_show'] = ['table']
+    _write(base / '97_shots/shots.json', data)
+    sb.blockout_scene_builder_tool(session_id='s', project_id='cards', enable=True)
+    assert len(calls) > first_count
 
 
 def test_b01_allowed_durations_narrowing_is_folded_into_report_not_caps_file(tmp_path):
     base = _setup_project(tmp_path, "b01c", items=[_shot(1, 1, duration_s=7)], supported_durations=[5, 7, 10])
-    result = sb.blockout_scene_builder_tool(session_id="s", project_id="b01c", allowed_durations=[7, 10, 99])
+    result = sb.blockout_scene_builder_tool(session_id="s", project_id="b01c", allowed_durations=[7, 10, 99], enable=True)
     assert result["status"] == "warning"
     report = _read(base / "93_blockout" / "report.json")
     codes = [c.get("code") for c in report["blockout_scene_builder"]["checks"]]
@@ -215,7 +306,7 @@ def test_b14_full_copy_without_source_end_path_raises(tmp_path):
     ]
     _setup_project(tmp_path, "b14", items=items)
     with pytest.raises(RuntimeError, match="B14"):
-        sb.blockout_scene_builder_tool(session_id="s", project_id="b14")
+        sb.blockout_scene_builder_tool(session_id="s", project_id="b14", enable=True)
 
 
 # === timeline / window math + 3-shot chain covering all 3 link_type values ====
@@ -228,7 +319,7 @@ def test_three_shot_chain_all_link_types_and_timeline_math(tmp_path):
         _shot(1, 3, link_type="reference", duration_s=10),
     ]
     base = _setup_project(tmp_path, "chain3", items=items)
-    result = sb.blockout_scene_builder_tool(session_id="s", project_id="chain3")
+    result = sb.blockout_scene_builder_tool(session_id="s", project_id="chain3", enable=True)
     assert result["shots_total"] == 3
 
     chains = _read(base / "93_blockout" / "chains.json")["chains"]
@@ -309,7 +400,7 @@ def test_asset_matching_llm_fails_substitutes_proxy_with_p01(tmp_path):
         characters=[{"name": "Герой"}],
         locations=[{"name": "Лес", "key_objects": ["Дерево"], "description": "лес"}],
     )
-    result = sb.blockout_scene_builder_tool(session_id="s", project_id="assets1")
+    result = sb.blockout_scene_builder_tool(session_id="s", project_id="assets1", enable=True)
     assert set(result["unmapped_assets"]) == {"Герой", "Лес / Дерево"}
 
     asset_map = _read(base / "93_blockout" / "asset_map.json")
@@ -344,7 +435,7 @@ def test_asset_matching_exact_name_match_uses_index_without_llm(tmp_path, monkey
 
     items = [_shot(1, 1, characters=["Герой"])]
     base = _setup_project(tmp_path, "assets2", items=items, characters=[{"name": "Герой"}], locations=[])
-    sb.blockout_scene_builder_tool(session_id="s", project_id="assets2")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="assets2", enable=True)
 
     assert llm_calls == []  # exact-name match short-circuits before any LLM call
     asset_map = _read(base / "93_blockout" / "asset_map.json")
@@ -364,7 +455,7 @@ def test_asset_matching_fetch_disabled_falls_back_to_proxy_without_network(tmp_p
 
     items = [_shot(1, 1, characters=["Герой"])]
     base = _setup_project(tmp_path, "assets3", items=items, characters=[{"name": "Герой"}], locations=[])
-    result = sb.blockout_scene_builder_tool(session_id="s", project_id="assets3")
+    result = sb.blockout_scene_builder_tool(session_id="s", project_id="assets3", enable=True)
     assert "Герой" in result["unmapped_assets"]
     asset_map = _read(base / "93_blockout" / "asset_map.json")
     assert asset_map["characters"][0]["asset_id"] == "__proxy_biped__"
@@ -387,7 +478,7 @@ def test_asset_map_existing_proxy_entry_untouched_on_rerun(tmp_path, monkeypatch
         raise AssertionError("LLM must not be called for an existing proxy record")
 
     monkeypatch.setattr(sb, "llm_resolve_asset", fail_llm)
-    sb.blockout_scene_builder_tool(session_id="s", project_id="immut1")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="immut1", enable=True)
     asset_map = _read(base / "93_blockout" / "asset_map.json")
     hero = asset_map["characters"][0]
     assert hero["height_m"] == 1.42  # untouched
@@ -413,7 +504,7 @@ def test_asset_map_real_asset_scale_recomputed_from_height_m(tmp_path):
         "locations": [], "unmapped": [],
     })
 
-    sb.blockout_scene_builder_tool(session_id="s", project_id="immut2")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="immut2", enable=True)
     asset_map = _read(base / "93_blockout" / "asset_map.json")
     hero = asset_map["characters"][0]
     # exception 1: scale recomputed from the (untouched) height_m field
@@ -429,7 +520,7 @@ def test_asset_map_orphaned_asset_id_replaced_with_proxy_and_p01(tmp_path):
         "locations": [], "unmapped": [],
     })
     # no index.json at all -> asset_id can never resolve -> exception 3
-    sb.blockout_scene_builder_tool(session_id="s", project_id="immut3")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="immut3", enable=True)
     asset_map = _read(base / "93_blockout" / "asset_map.json")
     hero = asset_map["characters"][0]
     assert hero["asset_id"] == "__proxy_biped__"
@@ -444,7 +535,7 @@ def test_asset_map_orphaned_asset_id_replaced_with_proxy_and_p01(tmp_path):
 def test_pov_camera_placed_at_subject_eye_height(tmp_path):
     items = [_shot(1, 1, camera_plan="POV — Герой", duration_s=5)]
     base = _setup_project(tmp_path, "pov1", items=items, characters=[{"name": "Герой"}], locations=[])
-    sb.blockout_scene_builder_tool(session_id="s", project_id="pov1")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="pov1", enable=True)
     scene_spec = _read(base / "93_blockout" / "scene_spec.json")
     chain = scene_spec["chains"][0]
     location_keys = chain["camera"]["tracks"]["location"]
@@ -465,7 +556,7 @@ def test_report_write_discipline_preserves_foreign_section_and_no_leftover_tmp(t
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps({"some_other_step": {"checks": [{"code": "X", "level": "info"}]}}), encoding="utf-8")
 
-    sb.blockout_scene_builder_tool(session_id="s", project_id="report1")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="report1", enable=True)
 
     report = _read(report_path)
     assert report["some_other_step"] == {"checks": [{"code": "X", "level": "info"}]}
@@ -484,7 +575,7 @@ def test_report_created_before_b01_failure_and_foreign_section_preserved(tmp_pat
     report_path.write_text(json.dumps({"foreign": {"ok": True}}), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="B01"):
-        sb.blockout_scene_builder_tool(session_id="s", project_id="report2")
+        sb.blockout_scene_builder_tool(session_id="s", project_id="report2", enable=True)
 
     report = _read(report_path)
     assert report["foreign"] == {"ok": True}
@@ -510,7 +601,7 @@ def test_merge_write_report_sidecar_lock_and_unique_tmp(tmp_path):
 def test_scene_spec_root_schema_matches_section_12(tmp_path):
     items = [_shot(1, 1)]
     base = _setup_project(tmp_path, "specroot", items=items)
-    sb.blockout_scene_builder_tool(session_id="s", project_id="specroot", fps=24, resolution="1280x720")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="specroot", fps=24, resolution="1280x720", enable=True)
     scene_spec = _read(base / "93_blockout" / "scene_spec.json")
 
     assert scene_spec["project_id"] == "specroot"
@@ -525,7 +616,7 @@ def test_scene_spec_root_schema_matches_section_12(tmp_path):
 def test_scene_spec_chain_world_ground_and_constant_sun(tmp_path):
     items = [_shot(1, 1)]
     base = _setup_project(tmp_path, "specworld", items=items)
-    sb.blockout_scene_builder_tool(session_id="s", project_id="specworld")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="specworld", enable=True)
     scene_spec = _read(base / "93_blockout" / "scene_spec.json")
     chain = scene_spec["chains"][0]
     world = chain["world"]
@@ -577,7 +668,7 @@ def test_ground_clamp_wired_through_full_tool_for_low_camera_shot(tmp_path):
     # clamp has ground.z/enabled to clamp against (раздел 10.1 + 12).
     items = [_shot(1, 1, camera_plan="MEDIUM SHOT", duration_s=5)]
     base = _setup_project(tmp_path, "groundclamp1", items=items, characters=[{"name": "Герой"}], locations=[])
-    sb.blockout_scene_builder_tool(session_id="s", project_id="groundclamp1")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="groundclamp1", enable=True)
     scene_spec = _read(base / "93_blockout" / "scene_spec.json")
     chain = scene_spec["chains"][0]
     ground = chain["world"]["ground"]
@@ -629,7 +720,8 @@ def test_position_modifier_llm_payload_carries_raw_text_and_required_fields(tmp_
     _setup_project(tmp_path, f"posmod_payload_{_POSITION_MODIFIER_EXAMPLES.index(camera_plan_text)}",
                    items=items, characters=[{"name": "Герой"}], locations=[])
     sb.blockout_scene_builder_tool(
-        session_id="s", project_id=f"posmod_payload_{_POSITION_MODIFIER_EXAMPLES.index(camera_plan_text)}"
+        session_id="s", project_id=f"posmod_payload_{_POSITION_MODIFIER_EXAMPLES.index(camera_plan_text)}",
+        enable=True,
     )
 
     assert "payload" in captured
@@ -668,7 +760,7 @@ def test_position_modifier_forces_base_lens_and_keeps_llm_authored_position(tmp_
     monkeypatch.setattr(sb, "llm_parse_chain_spatial", fake_llm)
     items = [_shot(1, 1, camera_plan=camera_plan_text, duration_s=5)]
     base = _setup_project(tmp_path, "posmodlens", items=items, characters=[{"name": "Герой"}], locations=[])
-    sb.blockout_scene_builder_tool(session_id="s", project_id="posmodlens")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="posmodlens", enable=True)
     scene_spec = _read(base / "93_blockout" / "scene_spec.json")
     chain = scene_spec["chains"][0]
 
@@ -689,7 +781,7 @@ def test_position_modifier_example_wide_shot_pov_keeps_base_lens(tmp_path):
     # (WIDE SHOT = 28mm) survives, not the POV table row's 35mm.
     items = [_shot(1, 1, camera_plan="WIDE SHOT — POV ДОЛБОЯЩЕРА", duration_s=5)]
     base = _setup_project(tmp_path, "posmod_wide_pov", items=items, characters=[{"name": "Герой"}], locations=[])
-    sb.blockout_scene_builder_tool(session_id="s", project_id="posmod_wide_pov")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="posmod_wide_pov", enable=True)
     chain = _read(base / "93_blockout" / "scene_spec.json")["chains"][0]
 
     lens_keys = chain["camera"]["tracks"]["lens_mm"]
@@ -704,6 +796,26 @@ def test_position_modifier_example_wide_shot_pov_keeps_base_lens(tmp_path):
 
 
 # === cache re-snap without LLM on fps/camera_aspect mismatch (раздел 10.1) ====
+
+
+def test_legacy_spatial_cache_without_coordinate_contract_is_recomputed(tmp_path, monkeypatch):
+    base = _setup_project(tmp_path, 'legacy_axes', characters=[{'name': 'Hero'}],
+                          items=[_shot(1, 1, characters=['Hero'], main_subject='Hero')])
+    sb.blockout_scene_builder_tool(session_id='s', project_id='legacy_axes', enable=True)
+    path = base / '93_blockout/scene_spec.json'
+    spec = _read(path)
+    plan = sb.parse_camera_plan('MEDIUM SHOT')
+    spec['chains'][0]['input_hash'] = bc.chain_input_hash({
+        'chain_id': 'sc01_ch01',
+        'shots': [{'shot_number': 1, 'duration_s': 5.0,
+                   'camera_plan_base': plan['base'], 'camera_plan_modifier': plan.get('modifier')}],
+        'character_instance_ids': ['hero'],
+    })
+    _write(path, spec)
+    calls = []
+    monkeypatch.setattr(sb, 'llm_parse_chain_spatial', lambda payload: calls.append(payload))
+    sb.blockout_scene_builder_tool(session_id='s', project_id='legacy_axes', enable=True)
+    assert calls
 
 
 def test_cache_reuse_skips_llm_on_fps_and_aspect_change_but_recomputes_distance(tmp_path, monkeypatch):
@@ -728,7 +840,7 @@ def test_cache_reuse_skips_llm_on_fps_and_aspect_change_but_recomputes_distance(
     items = [_shot(1, 1, camera_plan="MEDIUM SHOT", duration_s=5)]
     base = _setup_project(tmp_path, "cachehit1", items=items, characters=[{"name": "Герой"}], locations=[])
 
-    sb.blockout_scene_builder_tool(session_id="s", project_id="cachehit1", fps=24, resolution="1280x720")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="cachehit1", fps=24, resolution="1280x720", enable=True)
     assert call_count["n"] == 1
     scene_spec_1 = _read(base / "93_blockout" / "scene_spec.json")
     chain_1 = scene_spec_1["chains"][0]
@@ -741,7 +853,7 @@ def test_cache_reuse_skips_llm_on_fps_and_aspect_change_but_recomputes_distance(
     monkeypatch.setattr(sb, "llm_parse_chain_spatial", fail_llm)
     # blockout_common.chain_input_hash deliberately excludes fps/camera_aspect
     # (раздел 10.1, «кеш») -> this must be the cheap re-snap-without-LLM path.
-    sb.blockout_scene_builder_tool(session_id="s", project_id="cachehit1", fps=30, resolution="720x1280")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="cachehit1", fps=30, resolution="720x1280", enable=True)
 
     scene_spec_2 = _read(base / "93_blockout" / "scene_spec.json")
     chain_2 = scene_spec_2["chains"][0]
@@ -780,7 +892,7 @@ def test_b10_camera_jump_at_chain_junction_caught_and_reported(tmp_path):
     ]
     base = _setup_project(tmp_path, "b10jump", items=items, characters=[{"name": "Герой"}], locations=[],
                            supported_durations=[1])
-    result = sb.blockout_scene_builder_tool(session_id="s", project_id="b10jump")
+    result = sb.blockout_scene_builder_tool(session_id="s", project_id="b10jump", enable=True)
     assert result["status"] == "warning"  # degraded, not failed (раздел 10.3.1)
 
     report = _read(base / "93_blockout" / "report.json")
@@ -802,7 +914,7 @@ def test_b10_smooth_junction_is_not_a_false_positive(tmp_path):
               source_end_path="a/end.png", copy_from_previous_end=True),
     ]
     base = _setup_project(tmp_path, "b10smooth", items=items, characters=[{"name": "Герой"}], locations=[])
-    sb.blockout_scene_builder_tool(session_id="s", project_id="b10smooth")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="b10smooth", enable=True)
 
     report = _read(base / "93_blockout" / "report.json")
     checks = report["blockout_scene_builder"]["checks"]
@@ -846,7 +958,7 @@ def test_b08_and_b09_surface_distinct_codes_in_report(tmp_path, monkeypatch):
     monkeypatch.setattr(sb, "llm_parse_chain_spatial", lambda *a, **k: b08_response)
     items = [_shot(1, 1, camera_plan="MEDIUM SHOT", duration_s=5)]
     base = _setup_project(tmp_path, "b08rep", items=items, characters=[{"name": "Герой"}], locations=[])
-    sb.blockout_scene_builder_tool(session_id="s", project_id="b08rep")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="b08rep", enable=True)
     checks = _read(base / "93_blockout" / "report.json")["blockout_scene_builder"]["checks"]
     assert [c["code"] for c in checks if c.get("code") in ("B08", "B09")] == ["B08"]
 
@@ -856,7 +968,7 @@ def test_b08_and_b09_surface_distinct_codes_in_report(tmp_path, monkeypatch):
                                  {"t": 5.0, "v": [1, 1, 1], "interp": "linear"}])
     monkeypatch.setattr(sb, "llm_parse_chain_spatial", lambda *a, **k: b09_response)
     base2 = _setup_project(tmp_path, "b09rep", items=items, characters=[{"name": "Герой"}], locations=[])
-    sb.blockout_scene_builder_tool(session_id="s", project_id="b09rep")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="b09rep", enable=True)
     checks2 = _read(base2 / "93_blockout" / "report.json")["blockout_scene_builder"]["checks"]
     assert [c["code"] for c in checks2 if c.get("code") in ("B08", "B09")] == ["B09"]
 
@@ -867,7 +979,7 @@ def test_b08_and_b09_surface_distinct_codes_in_report(tmp_path, monkeypatch):
 def test_subject_focus_valid_id_resolves_and_dedupes(tmp_path):
     items = [_shot(1, 1, characters=["Hero"], main_subject="Hero", subject_focus=["hero", "hero"])]
     base = _setup_project(tmp_path, "subjfocus_ok", items=items, characters=[{"name": "Hero"}], locations=[])
-    sb.blockout_scene_builder_tool(session_id="s", project_id="subjfocus_ok")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="subjfocus_ok", enable=True)
     chain = _read(base / "93_blockout" / "scene_spec.json")["chains"][0]
     assert chain["shots"][0]["subject_focus"] == ["hero"]
 
@@ -892,7 +1004,7 @@ def test_subject_focus_valid_id_from_second_shots_own_location(tmp_path):
             {"name": "Cave", "key_objects": ["rock"], "description": "cave"},
         ],
     )
-    sb.blockout_scene_builder_tool(session_id="s", project_id="subjfocus_xloc")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="subjfocus_xloc", enable=True)
     chain = _read(base / "93_blockout" / "scene_spec.json")["chains"][0]
     assert chain["shots"][1]["subject_focus"] == ["rock"]
 
@@ -901,7 +1013,7 @@ def test_subject_focus_unknown_id_raises_subj_invalid(tmp_path):
     items = [_shot(1, 1, characters=["Hero"], main_subject="Hero", subject_focus=["not_a_real_instance"])]
     _setup_project(tmp_path, "subjfocus_bad", items=items, characters=[{"name": "Hero"}], locations=[])
     with pytest.raises(ValueError, match="SUBJ_INVALID"):
-        sb.blockout_scene_builder_tool(session_id="s", project_id="subjfocus_bad")
+        sb.blockout_scene_builder_tool(session_id="s", project_id="subjfocus_bad", enable=True)
 
 
 # === visible track validation (раздел 12) ======================================
@@ -924,7 +1036,7 @@ def test_chain_scene_spec_shots_carry_t_start_and_duration_s(tmp_path):
         _shot(1, 2, link_type="reference", duration_s=7),
     ]
     base = _setup_project(tmp_path, "shotcontract", items=items)
-    sb.blockout_scene_builder_tool(session_id="s", project_id="shotcontract")
+    sb.blockout_scene_builder_tool(session_id="s", project_id="shotcontract", enable=True)
     scene_spec = _read(base / "93_blockout" / "scene_spec.json")
     for chain in scene_spec["chains"]:
         for shot_entry in chain["shots"]:

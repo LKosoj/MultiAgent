@@ -39,7 +39,7 @@ SHOT_SCOPE_PROVIDERS = frozenset({"routerai", "aitunnel"})
 DEFAULT_PROVIDER = "routerai"
 DB_CONTEXT_ROWS = 500
 BRIEF_INPUTS = ("pages_min", "pages_max", "words_per_page_min", "words_per_page_max", "language",
-                "screenplay_time", "generate_screenplay", "generate_end_shots")
+                "screenplay_time", "generate_screenplay", "generate_end_shots", "frame_resolution")
 _PARTIAL_WID = re.compile(r"^sbm_partial_(?P<x>.+)_[0-9a-f]{8}$")
 _VIDEO_STEP = "video_generator"
 _SAFE_KEY = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")

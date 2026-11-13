@@ -337,6 +337,14 @@ def test_wan_documented_capabilities_are_stored_in_code(monkeypatch):
     assert config["supported_aspect_ratios"] == ["16:9", "4:3", "1:1", "3:4", "9:16"]
 
 
+
+def test_gateway_wan_accepts_seed_missing_from_catalog(monkeypatch):
+    # Каталог llmgateway не публикует seed, но шлюз передаёт его провайдеру Wan.
+    monkeypatch.setattr(common, "_ROUTERAI_MODELS_CACHE", None)
+    record = {"id": "llmgateway/wan3.0", "architecture": {"output_modalities": ["video"]}}
+    monkeypatch.setattr(common.requests, "get", lambda *args, **kwargs: Response({"data": [record]}))
+    assert common._get_routerai_video_models()[record["id"]]["supports_seed"] is True
+
 def test_routerai_default_runs_four_video_jobs_in_parallel(project, monkeypatch):
     shots, item, record = project
     items = [dict(item, shot_number=n, video_path=str(shots / f"clip{n}.mp4"), video_prompt=f"Camera movement {n}") for n in range(1, 5)]
@@ -443,3 +451,21 @@ def test_keyframe_generation_falls_back_and_reuses_downloaded_video(project, mon
     assert (shots / "clip.mp4").read_bytes() == b"backup-video"
     assert run_video()["status"] == "success"
     assert len(submitted) == 4
+
+
+def test_llmgateway_catalog_sends_key_and_knows_wan_capabilities(monkeypatch):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs.get("headers")))
+        return Response({"data": [{"id": "llmgateway/wan3.0", "architecture": {
+            "input_modalities": ["text", "image"], "output_modalities": ["video"]}}]})
+
+    monkeypatch.setenv("ROUTERAI_API_BASE", "http://gateway/v1")
+    monkeypatch.setenv("ROUTERAI_API_KEY", "gateway-key")
+    monkeypatch.setattr(common, "_ROUTERAI_MODELS_CACHE", None)
+    monkeypatch.setattr(common.requests, "get", get)
+    record = common._get_routerai_video_models()["llmgateway/wan3.0"]
+    assert calls == [("http://gateway/v1/models", {"Authorization": "Bearer gateway-key"})]
+    assert record["supported_durations"] == list(range(2, 31))
+    assert record["supports_image_references"] is True

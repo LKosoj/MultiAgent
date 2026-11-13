@@ -20,6 +20,15 @@ def test_missing_line_reports_expected_and_heard():
                             [{'text': 'привет', 'start': 0., 'end': .5}, {'text': 'привет', 'start': 1., 'end': 1.5}], 2., 'ru')
 
 
+def test_laughter_and_sneeze_variants_keep_the_whole_utterance():
+    lines = [{'id': 'a', 'text': 'Ты просто не шаришь.'}, {'id': 'b', 'text': 'Хы-хы... хы... апчхи!'}]
+    texts = ['Ты', 'просто', 'не', 'шаришь', 'Хе', '-хе', '-хе', '-хе', '-а', '-а', '-а', '-чхи']
+    words = [{'text': text, 'start': i * .5, 'end': (i + 1) * .5} for i, text in enumerate(texts)]
+    result = measure_line_timing(lines, words, 6, 'ru')
+    assert [(line['word_start'], line['word_end']) for line in result] == [(0, 4), (4, 12)]
+    assert result[-1]['end'] == 6
+
+
 def test_chunk_seam_and_repeated_words():
     ranges = chunk_ranges(350)
     assert all(end - start <= 180 for start, end in ranges)
@@ -152,6 +161,19 @@ def test_silent_scenes_become_explicit_pauses():
                            {'scene_number': 3, 'silence_duration': 2}]}
     lines = speech.screenplay_lines(data, snapshot)
     assert lines[0]['pause_before'] == 4 and lines[0]['pause_after'] == 2
+
+
+def test_silent_scene_pauses_use_final_storyboard_duration():
+    snapshot = {'characters': {'x': {'version_id': 'v', 'data': {'name': 'Лиса', 'voice': 'v'}}}}
+    data = {'screenplay': [
+        {'scene_number': 1, 'silence_duration': 2, 'storyboard': [
+            {'shot_number': 1, 'timing': '00:03'}, {'shot_number': 2, 'timing': '00:07'}]},
+        {'scene_number': 2, 'dialogue': [{'id': 'a', 'character': 'Лиса', 'line': 'Привет'}]},
+        {'scene_number': 3, 'silence_duration': 1, 'storyboard': [{'shot_number': 1, 'timing': '00:05'}]},
+    ]}
+    lines = speech.screenplay_lines(data, snapshot)
+    assert lines[0]['pause_before'] == 10
+    assert lines[0]['pause_after'] == 5
 
 
 def test_studio_edit_line_preserves_other_lines(tmp_path, monkeypatch):

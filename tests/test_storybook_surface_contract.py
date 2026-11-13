@@ -152,3 +152,22 @@ def test_media_inventory_sees_blockout_preview_but_not_frames(tmp_path, monkeypa
     assert media["counts"]["image"] == 1
     assert media["counts"]["video"] == 1
     assert not any("frames" in item["path"] for item in media["items"])
+
+
+def test_media_inventory_series_shows_only_bound_shared_references(tmp_path):
+    import json
+    from custom_tools.storybook.storybook_surface import _media_inventory
+    from tests.studio_run_fakes import make_series_project
+    series = make_series_project(tmp_path, "demo")
+    root = series.parent.parent
+    for name in ("mine", "foreign", "loose"):
+        ref = root / f"shared/references/characters/{name}.png"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(b"x")
+    record = lambda n, sid: {"id": n, "path": f"shared/references/characters/{n}.png", "kinds": ["identity"],
+                             "keys": [], "aliases": [], "parents": [], "selectable": True, "series_ids": [sid]}
+    (root / "shared/reference_catalog.json").write_text(json.dumps(
+        {"version": 1, "initialized_series": [],
+         "references": {"mine": record("mine", "main"), "foreign": record("foreign", "other")}}), encoding="utf-8")
+    paths = [item["path"] for item in _media_inventory(series, 20)["items"]]
+    assert paths == ["shared/references/characters/mine.png"]

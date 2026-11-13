@@ -155,6 +155,15 @@ def ref_rel(raw: Any) -> str | None:
     return text
 
 
+def ref_key(rel: str) -> str:
+    """Идентичность референса в отпечатке: у файла из shared/references это его sha (имя без расширения),
+    чтобы смена папки категории не давала ложного «references_changed»; иначе путь, как в шоте."""
+    # ключ берётся от пути из shots.json, а перенос файлов эти пути не переписывает, поэтому ключ стабилен
+    if rel.startswith("shared/references/"):
+        return "sha:" + rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    return rel
+
+
 def parse_ref_list(value: Any) -> list[str]:
     """reference_image_paths бывает списком или строкой-репрезентацией списка."""
     if isinstance(value, str):

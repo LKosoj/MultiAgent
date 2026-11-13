@@ -18,6 +18,15 @@ def test_module_imports_without_bpy():
     assert build_scene.bpy is None
 
 
+def test_proxy_height_uses_builder_dimensions_when_height_field_is_absent():
+    geometry = build_scene.resolve_object_geometry({
+        'instance_id': 'chibis', 'proxy': True, 'asset_id': blockout_assets.PROXY_BIPED,
+        'dimensions_m': [0.431, 0.431, 1.55],
+    })
+    assert geometry['height_m'] == pytest.approx(1.55)
+    assert geometry['warning'] is None
+
+
 # === sun_direction (раздел 12) ===============================================
 
 

@@ -126,3 +126,70 @@ def test_individual_canon_sheet_has_face_and_full_body_views():
     assert 'FULL-BODY BACK view, head-to-boots' in prompt
     assert 'neutral solid-color background' in prompt
     assert 'character, costume, proportions' in prompt
+
+
+def test_location_reference_keeps_architectural_plan_and_requested_style():
+    prompt = build_canon_image_prompt('location', {'name': 'Room', 'description': 'Photorealistic lived-in apartment'}, [])
+    assert 'Photorealistic lived-in apartment' in prompt
+    assert 'ARCHITECTURAL VISUALIZATION' in prompt
+    assert '1. Top Left: Top-down spatial plan' in prompt
+    assert prompt.index('Top-down spatial plan') < prompt.index('Wide establishing shot')
+    assert 'derive every perspective view from that exact plan' in prompt
+    assert 'never mirror, move, resize, add or remove' in prompt
+    assert 'EXACT SAME location with consistent lighting and style' in prompt
+
+
+def test_outdoor_location_plan_does_not_assume_an_apartment():
+    prompt = build_canon_image_prompt('location', {
+        'name': 'Street', 'description': 'An open street with tram tracks, trees and streetlights.',
+    }, [])
+    assert 'tram tracks, trees and streetlights' in prompt
+    assert 'Top-down spatial plan' in prompt
+    assert 'actually present in the supplied location description' in prompt
+    assert not any(word in prompt.lower() for word in ('door', 'window', 'furniture', 'floor plan'))
+
+
+def test_location_rules_are_shared_but_location_details_are_generation_inputs():
+    from custom_tools.storybook.entity_generator_utils.prompt_templates import LOCATION_REFERENCE_RULES
+    apartment = build_canon_image_prompt('location', {'name': 'Apartment', 'description': 'sofa beside a window'}, [])
+    street = build_canon_image_prompt('location', {'name': 'Street', 'description': 'tram tracks and trees'}, [])
+    assert apartment.split('\n\nLOCATION INPUT FOR THIS GENERATION:')[0] == LOCATION_REFERENCE_RULES
+    assert street.split('\n\nLOCATION INPUT FOR THIS GENERATION:')[0] == LOCATION_REFERENCE_RULES
+    assert 'sofa beside a window' in apartment and 'sofa' not in street
+    assert 'tram tracks and trees' in street and 'tram' not in apartment
+    assert not any(word in LOCATION_REFERENCE_RULES.lower() for word in ('sofa', 'tram', 'door', 'window', 'furniture', 'ears', 'photoreal'))
+
+
+def test_character_identity_sheet_is_not_its_narrative_presentation():
+    from custom_tools.storybook.entity_generator_utils.prompt_templates import build_canon_image_prompt
+    prompt = build_canon_image_prompt('character', {
+        'name': 'Presenter', 'role': 'A figure seen in an in-story representation',
+        'environment_context': 'Narrative setting and contextual objects'}, [])
+    assert 'not as its in-story presentation' in prompt
+    assert 'contextual objects must not become scenery or containers' in prompt
+    assert 'neutral solid-color background' in prompt
+    assert 'Face close-up' in prompt and 'FULL-BODY FRONT' in prompt and 'FULL-BODY BACK' in prompt
+
+
+def test_appearance_review_compares_labeled_source_and_candidate(tmp_path, monkeypatch):
+    import base64
+    import utils
+    from custom_tools.storybook import artist_batch_edit
+    source, candidate = tmp_path / 'source.png', tmp_path / 'candidate.png'
+    source.write_bytes(b'approved source')
+    candidate.write_bytes(b'candidate')
+    calls = []
+    def check(**kwargs):
+        calls.append(kwargs)
+        return '{"passed": true, "violations": []}'
+    monkeypatch.setattr(utils, 'call_openai_api', check)
+    assert artist_batch_edit._reference_requirements_met(str(candidate),
+        {'name': 'Actor', 'reference_requirements': ['Apply only the declared change.']}, str(source))
+    request = calls[0]
+    assert request['image_url'] is None
+    content = request['prompt']
+    assert content[0]['text'].startswith('APPROVED SOURCE')
+    assert content[1]['image_url']['url'].endswith(base64.b64encode(source.read_bytes()).decode())
+    assert content[2]['text'].startswith('CANDIDATE')
+    assert content[3]['image_url']['url'].endswith(base64.b64encode(candidate.read_bytes()).decode())
+    assert 'do not demand more pronounced features' in request['system_prompt']

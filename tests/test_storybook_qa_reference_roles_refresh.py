@@ -126,3 +126,44 @@ def test_qa_filters_character_not_visible_in_current_phase_only(tmp_path, monkey
     assert processed["scene_continuity_facts"] == {"hatch": "fixed"}
     assert "/97_shots/phase_scope/scene_01_shot_01/img_final_start_01_01.png" in untouched["reference_image_paths"]
     assert untouched == before_scene_two
+
+
+def test_reference_refresh_replaces_stale_shared_character_dictionary():
+    current = {'name': 'Viewer', '_shared_version_id': 'new',
+               'reference_image_path': '/shared/characters/viewer/new/reference.png'}
+    old = dict(current, _shared_version_id='old', reference_image_path='/shared/characters/viewer/old/reference.png')
+    item = {'characters': [old], 'locations': [], 'reference_image_paths': [old['reference_image_path']],
+            'english_prompt': 'Only hands hold the device.', 'shot_type': 'start',
+            '_shot_frame_spec': {'character_pose_signatures': {'Viewer': 'Only hands at the device edges.'}}}
+    qa._refresh_item_reference_roles(item, {}, {'viewer': current})
+    assert item['characters'] == [current]
+    assert item['reference_image_paths'] == [current['reference_image_path']]
+    assert 'Only hands at the device edges.' in item['reference_roles_instruction']
+
+
+def test_final_reference_compilation_uses_replaced_item_dictionary(tmp_path, monkeypatch):
+    base = tmp_path / 'p'
+    for folder in ('91_screenplay', '20_bible', '30_style'):
+        (base / folder).mkdir(parents=True)
+    character = {'name': 'Hero', 'reference_image_path': '/hero.png'}
+    old_spec = {'character_pose_signatures': {'Hero': 'standing beside a table'}}
+    new_spec = {'character_pose_signatures': {'Hero': 'only right hand beside the object'}}
+    (base / '20_bible/characters.json').write_text(json.dumps([character]))
+    (base / '91_screenplay/screenplay.json').write_text(json.dumps({'screenplay': [{
+        'scene_number': 1, 'characters': ['Hero'], 'storyboard': [{
+            'shot_number': 1, 'camera_plan': 'MEDIUM SHOT', 'description': 'Hero beside an object.'}]}]}))
+    item = {'scene_number': 1, 'shot_number': 1, 'shot_type': 'start', 'camera_plan': 'MEDIUM SHOT',
+            'english_prompt': 'Hero beside an object.', 'negative_prompt': '', 'video_prompt': '',
+            'characters': [character], 'locations': [], 'reference_image_paths': ['/hero.png'],
+            '_shot_frame_spec': old_spec}
+    data = {'items': [item]}
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    monkeypatch.setattr(qa, '_extract_shot_frame_spec_llm', lambda **kwargs: old_spec)
+    def fake_call(**kwargs):
+        if kwargs['prompt'].startswith('Validate and repair'):
+            data['items'][0] = dict(data['items'][0], _shot_frame_spec=new_spec)
+        return '{"repairs": []}'
+    monkeypatch.setattr(qa, 'call_openai_api', fake_call)
+    result = qa.shots_prompt_qa_tool('s', 'p', shots_data=data, force=True, dry_run=True)
+    assert result['items'][0] is not item
+    assert 'only right hand beside the object' in result['items'][0]['reference_roles_instruction']

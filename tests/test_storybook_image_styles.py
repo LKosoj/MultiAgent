@@ -28,7 +28,7 @@ def test_ensure_image_style_catalog_creates_once_then_uses_cache(tmp_path, monke
         raise AssertionError("cached catalog must not call the model")
 
     monkeypatch.setattr(style_keeper, "call_openai_api", fail_call)
-    second = style_keeper.ensure_image_style_catalog(base, {"art_style": "changed"})
+    second = style_keeper.ensure_image_style_catalog(base, {"art_style": "paper"})
     assert second == first
 
     saved = json.loads(
@@ -71,3 +71,31 @@ def test_ensure_image_style_catalog_empty_input_skips_model(tmp_path, monkeypatc
         ),
     )
     assert style_keeper.ensure_image_style_catalog(str(tmp_path / "project"), {}) == {}
+
+
+def test_style_change_rebuilds_cached_catalog(tmp_path, monkeypatch):
+    prompts = []
+    def generate(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return json.dumps({"default_style_id": "main", "styles": {"main": {"prompt": f"STYLE {len(prompts)}"}}})
+    monkeypatch.setattr(style_keeper, "call_openai_api", generate)
+    first = style_keeper.ensure_image_style_catalog(str(tmp_path), {"art_style": "old"})
+    second = style_keeper.ensure_image_style_catalog(str(tmp_path), {"art_style": "new"})
+    assert len(prompts) == 2
+    assert first["source_hash"] != second["source_hash"]
+    assert second["styles"]["main"]["prompt"] == "STYLE 2"
+
+
+def test_catalog_uses_project_style_instead_of_stale_episode_input(tmp_path, monkeypatch):
+    root = tmp_path / 'project'
+    source = root / 'shared/style/main/current/data.json'
+    source.parent.mkdir(parents=True)
+    source.write_text(json.dumps({'style_images': {'art_style': 'current clean photography'}}))
+    (root / 'project.json').write_text(json.dumps({'resources': {'style': {'main': 'current'}}}))
+    requests = []
+    def generate(**kwargs):
+        requests.append(json.loads(kwargs['prompt']))
+        return json.dumps({'default_style_id': 'main', 'styles': {'main': {'prompt': 'clean photography'}}})
+    monkeypatch.setattr(style_keeper, 'call_openai_api', generate)
+    style_keeper.ensure_image_style_catalog(str(root / 'series/one'), {'art_style': 'old VHS'})
+    assert requests[0]['style_images'] == {'art_style': 'current clean photography'}

@@ -48,6 +48,16 @@ _ROUTERAI_MODEL_CAPABILITIES = {
         "supported_frame_images": ["first_frame", "last_frame"],
         "supported_aspect_ratios": ["16:9", "4:3", "1:1", "3:4", "9:16"],
     },
+    # Тот же Wan 3.0 через llmgateway: каталог шлюза не публикует возможности.
+    "llmgateway/wan3.0": {
+        "supports_image_references": True,
+        "max_image_references": 10,
+        "supported_durations": list(range(2, 31)),
+        "supported_resolutions": ["480p", "720p", "1080p"],
+        "supported_frame_images": ["first_frame", "last_frame"],
+        "supported_aspect_ratios": ["16:9", "4:3", "1:1", "3:4", "9:16"],
+        "supports_seed": True,
+    },
     "bytedance/seedance-1-5-pro": {
         "max_image_references": 2,
         "supported_durations": list(range(4, 13)),
@@ -63,7 +73,10 @@ def _get_routerai_video_models(force_refresh: bool = False) -> Dict[str, Dict[st
         if _ROUTERAI_MODELS_CACHE is not None and not force_refresh:
             return _ROUTERAI_MODELS_CACHE
         base_url = os.getenv("ROUTERAI_API_BASE", "https://routerai.ru/api/v1").rstrip("/")
-        response = requests.get(f"{base_url}/models", timeout=60)
+        # Каталог routerai.ru открыт, а llmgateway отдаёт его только с ключом.
+        api_key = os.getenv("ROUTERAI_API_KEY")
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        response = requests.get(f"{base_url}/models", headers=headers, timeout=60)
         if response.status_code != 200:
             raise RuntimeError(f"RouterAI models endpoint failed: {response.status_code} - {response.text}")
         records = response.json().get("data")
@@ -76,9 +89,9 @@ def _get_routerai_video_models(force_refresh: bool = False) -> Dict[str, Dict[st
             catalog[record["id"]] = {
                 **record,
                 "supports_image_references": bool(record.get("supports_reference_images")),
+                "supports_seed": bool(record.get("seed")),
                 **_ROUTERAI_MODEL_CAPABILITIES.get(record["id"], {}),
                 "_resolution_env": "ROUTERAI_RESOLUTION",
-                "supports_seed": bool(record.get("seed")),
                 "supports_reference_video": "video" in record.get("architecture", {}).get("input_modalities", []),
             }
         _ROUTERAI_MODELS_CACHE = catalog
@@ -457,13 +470,14 @@ SELF-CHECK before output: every noun phrase either from original prompt OR from 
         
         context_values = {
             key: value for key, value in (item_context or {}).items()
-            if key in {"camera_plan", "timing", "scene_pacing", "spatial_changes_from_start"} and value
+            if key in {"camera_plan", "timing", "scene_pacing", "spatial_changes_from_start", "visual_style", "duration_s"} and value
         }
         context_block = ""
         if context_values:
             context_block = (
                 "\n\nITEM CONTEXT (authoritative camera, timing, pacing and spatial-transition constraints; "
-                "do not override START/END facts or invent details):\n"
+                "current visual_style and duration_s override legacy style wording and time marks; "
+                "preserve action order and camera, do not override START/END facts or invent details):\n"
                 + json.dumps(context_values, ensure_ascii=False)
             )
 
@@ -531,7 +545,7 @@ TASK:
                     logger.warning(f"   Оригинал: {original_prompt}...")
                     logger.warning(f"   Результат: {cleaned}...")
                     # Возвращаем простой перевод оригинала без "улучшений"
-                    return _simple_translate_prompt(original_prompt)
+                    return _simple_translate_prompt(original_prompt, item_context)
         
         # Проверка на чрезмерное увеличение размера
         result_word_count = len(cleaned.split())
@@ -540,7 +554,7 @@ TASK:
         if result_word_count > original_word_count * 5:
             logger.warning(f"⚠️ Промпт увеличился в {result_word_count/original_word_count:.1f}x раз ({original_word_count} → {result_word_count} слов)")
             # Возвращаем простой перевод
-            return _simple_translate_prompt(original_prompt)
+            return _simple_translate_prompt(original_prompt, item_context)
         
         logger.info(f"✅ Video prompt скорректирован под фактическое изображение: {original_word_count} → {result_word_count} слов")
         return cleaned
@@ -550,7 +564,7 @@ TASK:
         return None
 
 
-def _simple_translate_prompt(prompt: str) -> Optional[str]:
+def _simple_translate_prompt(prompt: str, item_context: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
     Простой перевод промпта на английский без добавления деталей.
     Используется как fallback при обнаружении галлюцинаций.
@@ -558,7 +572,8 @@ def _simple_translate_prompt(prompt: str) -> Optional[str]:
     # Если кириллицы нет — считаем, что промпт уже на английском (или в основном на английском),
     # и возвращаем его как есть (нормализуя пробелы) без обращения к API.
     import re
-    if isinstance(prompt, str) and prompt.strip():
+    context = item_context if item_context and item_context.get('visual_style') else None
+    if not context and isinstance(prompt, str) and prompt.strip():
         if not re.search(r"[А-Яа-яЁё]", prompt):
             cleaned = prompt.strip().strip('"\'')
             cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -572,8 +587,14 @@ def _simple_translate_prompt(prompt: str) -> Optional[str]:
     
     try:
         result = call_openai_api(
-            prompt=f"Translate to English. Keep structure exactly. One line output:\n\n{prompt}",
-            system_prompt="You are a translator. Translate the video prompt to English. Do NOT add any new actions or details. Keep the exact same structure and meaning.",
+            prompt=(json.dumps({'video_prompt': prompt, 'context': context}, ensure_ascii=False) if context else
+                    f"Translate to English. Keep structure exactly. One line output:\n\n{prompt}"),
+            system_prompt=("Translate the video prompt to English without adding actions or details. "
+                           "Preserve action order, camera, staging and source-visible writing verbatim. "
+                           + ("context.visual_style is authoritative: replace conflicting legacy style wording. "
+                              "context.duration_s is the actual shot duration: retime old time marks to this interval, "
+                              "achieving the required end state within it. Return one line only."
+                              if context else "Keep the exact same structure and meaning.")),
             model=model_hard,
             max_tokens=32768,
             temperature=0.0
@@ -657,6 +678,8 @@ def update_shots_with_descriptions(
     changes_made = False
     updated_count = 0
     _changes_lock = threading.Lock()
+    style_catalog_path = Path(shots_file_path).parent.parent / '30_style/image_styles.json'
+    style_catalog = json.loads(style_catalog_path.read_text()) if style_catalog_path.is_file() else {}
 
     # ------------------------------------------------------------------
     # ФАЗА 1 (параллельная): Генерация описаний изображений через vision API
@@ -803,12 +826,19 @@ def update_shots_with_descriptions(
             "camera_plan": item.get("camera_plan"),
             "timing": item.get("timing"),
             "scene_pacing": item.get("scene_pacing"),
-            "spatial_changes_from_start": item.get("spatial_changes_from_start")
+            "spatial_changes_from_start": item.get("spatial_changes_from_start"),
+            "duration_s": item.get("duration_s"),
         }
+        if style_catalog:
+            from .style_keeper import resolve_image_style_id
+            style_id = resolve_image_style_id(style_catalog, f"{scene_number}:{shot_number}:start",
+                                              item.get('locations'), item.get('style_id'))
+            item_context['visual_style'] = style_catalog['styles'][style_id]['prompt']
 
         if skip_prompt_enhancement:
             logger.info(f"⏭️ skip_enhancement=True, используем только перевод для {os.path.basename(output_path)}")
-            enhanced_prompt = _simple_translate_prompt(original_video_prompt)
+            enhanced_prompt = (_simple_translate_prompt(original_video_prompt, item_context)
+                               if item_context.get('visual_style') else _simple_translate_prompt(original_video_prompt))
         else:
             enhanced_prompt = enhance_video_prompt(
                 original_video_prompt,

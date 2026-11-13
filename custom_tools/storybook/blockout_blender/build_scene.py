@@ -137,6 +137,9 @@ def resolve_object_geometry(obj: Dict[str, Any], assets_root: Optional[Path] = N
         except ValueError:
             body_plan = "none"
         height_m = obj.get("height_m")
+        dimensions = obj.get('dimensions_m')
+        if height_m is None and isinstance(dimensions, (list, tuple)) and len(dimensions) == 3:
+            height_m = dimensions[2]
         warning = None
         if not (isinstance(height_m, (int, float)) and not isinstance(height_m, bool) and height_m > 0):
             height_m = blockout_assets.typical_height_m("character" if body_plan != "none" else "prop")
@@ -241,6 +244,7 @@ PROXY_PART_BUILDERS: Dict[str, Callable[["blockout_assets.ProxyPart"], Any]] = {
 
 def build_proxy_object(instance_id: str, body_plan: str, height_m: float) -> Any:
     _require_bpy()
+    from mathutils import Matrix
     parts = blockout_assets.proxy_part_specs(body_plan, height_m)
     built = [PROXY_PART_BUILDERS[part.kind](part) for part in parts]
     bpy.ops.object.select_all(action="DESELECT")
@@ -250,6 +254,8 @@ def build_proxy_object(instance_id: str, body_plan: str, height_m: float) -> Any
     if len(built) > 1:
         bpy.ops.object.join()
     root = bpy.context.view_layer.objects.active
+    root.data.transform(root.matrix_world)
+    root.matrix_world = Matrix.Identity(4)
     root.name = instance_id
     return root
 

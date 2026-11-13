@@ -419,3 +419,62 @@ def test_artistic_start_and_end_receive_full_style_context_and_common_core(monke
         assert "не генерируй" in lower or "do not generate" in lower
         assert "не выбирай" in lower or "do not choose" in lower
 
+
+
+@pytest.mark.parametrize('previous_cast,next_cast,previous_size,next_size', [
+    (['Баклан'],['Чибис'],'Close-up','Close-up'),
+    (['Чибис'],['Чибис'],'Close-up','Medium close-up'),
+])
+def test_copy_is_rejected_for_changed_cast_or_shot_size(previous_cast,next_cast,previous_size,next_size):
+    previous={'shot_type':'end','camera_plan':previous_size,'characters':[{'name':n} for n in previous_cast]}
+    target={'shot_type':'start','camera_plan':next_size,'characters':[{'name':n} for n in next_cast]}
+    assert shots_generator._full_copy_mismatch(previous,target)
+
+
+def test_writer_automatically_disables_wrong_copy_but_keeps_valid_copy(tmp_path):
+    previous={'scene_number':2,'shot_number':3,'shot_type':'end','output_path':'baklan-end.png',
+              'camera_plan':'Close-up','characters':[{'name':'Баклан'}],'duration_s':3.25}
+    changed={'scene_number':2,'shot_number':4,'shot_type':'start','output_path':'chibis-start.png',
+             'source_end_path':'baklan-end.png','copy_from_previous_end':True,'camera_plan':'Close-up',
+             'characters':[{'name':'Чибис'}],'reference_image_paths':['chibis-reference.png'],'duration_s':4.75}
+    same_end={'scene_number':4,'shot_number':4,'shot_type':'end','output_path':'ensemble-end.png',
+              'camera_plan':'Medium shot','characters':[{'name':'Баклан'},{'name':'Чибис'}]}
+    valid={'scene_number':4,'shot_number':5,'shot_type':'start','output_path':'ensemble-start.png',
+           'source_end_path':'ensemble-end.png','copy_from_previous_end':True,'camera_plan':'Medium shot',
+           'characters':[{'name':'Баклан'},{'name':'Чибис'}]}
+    changed['reference_roles_instruction']='image 1: same world layout and identity'
+    changed['english_prompt']='Show Chibis.\n\n'+changed['reference_roles_instruction']
+    changed['output_path']=str(tmp_path/'chibis-start.png')
+    sidecar=Path(changed['output_path']).with_suffix('.continuity.json')
+    sidecar.write_text('{}')
+    path=tmp_path/'shots.json'
+    result=shots_generator._merge_write_shots(str(path),shots_data={'items':[previous,changed,same_end,valid]},partial=False)
+    actual=json.loads(path.read_text())['items']
+    fixed=next(i for i in actual if i['output_path']==changed['output_path'])
+    assert fixed['copy_from_previous_end'] is False
+    assert fixed['link_type']=='independent'
+    assert fixed['reference_image_paths']==['chibis-reference.png']
+    assert fixed['should_use_prev_end_as_reference'] is False
+    assert fixed['duration_s']==4.75
+    assert not sidecar.exists()
+    assert 'own named' in fixed['reference_roles_instruction']
+    assert 'same world layout and identity' not in fixed['reference_roles_instruction']
+    assert 'same world layout and identity' not in fixed['english_prompt']
+    assert fixed['reference_roles_instruction'] in fixed['english_prompt']
+    sidecar.write_text('{}')
+    shots_generator._merge_write_shots(str(path),shots_data=result,partial=False)
+    assert sidecar.exists()
+    assert next(i for i in actual if i['output_path']=='ensemble-start.png')['copy_from_previous_end'] is True
+
+
+@pytest.mark.parametrize('previous_cast,current_cast,keep_previous', [
+    (['Баклан'], ['Чибис'], False),
+    (['Баклан','Чибис'], ['Чибис'], True),
+])
+def test_reference_only_cut_drops_previous_portrait_only_for_disjoint_cast(previous_cast,current_cast,keep_previous):
+    previous={'shot_type':'end','output_path':'previous.png','characters':previous_cast}
+    current={'shot_type':'start','output_path':'current.png','characters':current_cast,
+             'copy_from_previous_end':False,'reference_image_paths':['previous.png','current-actor.png','room.png']}
+    shots_generator._normalize_full_copy_links([previous,current])
+    assert ('previous.png' in current['reference_image_paths']) is keep_previous
+    assert current['reference_image_paths'][-2:]==['current-actor.png','room.png']

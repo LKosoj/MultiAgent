@@ -10,7 +10,15 @@ def apply_measured_shot_timing(items, speech, character_names=None):
     if len(index) != len(keys):
         raise ValueError('Duplicate storyboard shot')
     from .video_generator_common import parse_duration_seconds_from_timing
-    durations = [float(item.get('duration_s') or parse_duration_seconds_from_timing(item.get('timing', '5s'))) for item in starts]
+    durations = []
+    for item in starts:
+        original = item.get('storyboard_duration_s')
+        if original is None:
+            if 'start_s' in item and 'end_s' in item and item.get('timing'):
+                original = parse_duration_seconds_from_timing(item['timing'])
+            else:
+                original = item.get('duration_s') or parse_duration_seconds_from_timing(item.get('timing', '5s'))
+        durations.append(float(original))
     if any(value <= 0 for value in durations):
         raise ValueError('A storyboard shot has no duration')
     lines = speech.get('lines') or []
@@ -78,7 +86,8 @@ def apply_measured_shot_timing(items, speech, character_names=None):
     for source in items:
         item = dict(source)
         start, end, faces, relative_faces = timing[(item['scene_number'], item['shot_number'])]
-        item.update(start_s=start, end_s=end, duration_s=end - start)
+        item.update(start_s=start, end_s=end, duration_s=end - start,
+                    storyboard_duration_s=durations[index[(item['scene_number'], item['shot_number'])]])
         if faces is not None:
             item['face_visibility'] = faces
             item['face_visibility_relative'] = relative_faces

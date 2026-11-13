@@ -1,4 +1,8 @@
 """Тесты восстановления tool_calls из текстового ответа шлюза."""
+import json
+from types import SimpleNamespace
+
+import pytest
 from smolagents.models import ChatMessage
 
 from retry_openai_model import (
@@ -29,11 +33,27 @@ def test_normalize_response_content_applies_recovery():
     model = RetryOpenAIServerModel.__new__(RetryOpenAIServerModel)
     response = ChatMessage(role="assistant", content=SAMPLE_GATEWAY_OUTPUT)
 
-    normalized = model._normalize_response_content(response)
+    normalized = model._normalize_response_content(response, tools_to_call_from=["web_search"])
 
     assert normalized.tool_calls is not None
     assert len(normalized.tool_calls) == 2
     assert normalized.content.startswith("Now let me search")
+
+
+@pytest.mark.parametrize('as_sdk_response', [False, True])
+@pytest.mark.parametrize('text', [
+    '{\n  "alignment_score": 91,\n  "critical_mismatches": [\n    "s3 action: исправить жест"\n  ],\n  "screenplay_json": {"characters": [{"name": "Баклан"}], "screenplay": [{"scene_number": 3}]}\n}',
+    '{"name":"Баклан","age":"21"}',
+])
+def test_structured_response_without_tools_keeps_character_json(text, as_sdk_response):
+    json.loads(text)
+    model = RetryOpenAIServerModel.__new__(RetryOpenAIServerModel)
+    message = ChatMessage(role='assistant', content=text)
+    response = SimpleNamespace(choices=[SimpleNamespace(message=message)]) if as_sdk_response else message
+    normalized = model._normalize_response_content(response)
+    result = normalized.choices[0].message if as_sdk_response else normalized
+    assert result.content == text
+    assert not result.tool_calls
 
 
 def test_leaves_plain_text_without_calling_tools_unchanged():

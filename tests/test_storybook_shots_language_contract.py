@@ -1070,3 +1070,34 @@ def test_black_screen_storyboard_shot_llm_failure_propagates(monkeypatch):
         su.black_screen_storyboard_shot(
             "BLACK SCREEN", {"camera_anchor": "чёрный экран", "must_show": ["абсолютная тьма"]}
         )
+
+
+def test_shot_paths_stay_in_selected_series(tmp_path, monkeypatch):
+    from custom_tools.storybook import project_paths
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    monkeypatch.setattr(project_paths, '_series_scope', project_paths.ContextVar('test_series', default=('proj', 'episode')))
+    item = _create_shot_item(
+        project_id='proj', scene_number=1, shot_number=1, shot_type='end',
+        page_number=1, item_number=1, camera_plan='Close-up', timing='2s',
+        llm_result={'english_prompt': 'A quiet room'}, characters_data=[], locations_data=[])
+    expected = str(tmp_path / 'proj/series/episode/97_shots')
+    assert item['output_path'].startswith(expected + '/')
+    assert item['video_path'].startswith(expected + '/')
+    assert item['reference_image_paths'][0].startswith(expected + '/')
+
+
+def test_cached_shot_paths_rebase_only_shots_for_current_project(tmp_path, monkeypatch):
+    from custom_tools.storybook import project_paths
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    monkeypatch.setattr(project_paths, '_series_scope', project_paths.ContextVar('test_series', default=('proj', 'episode')))
+    old = 'plots/storybooks/proj/97_shots/scene_01_shot_01/start.png'
+    data = {'items': [{'output_path': old, 'source_end_path': old,
+                       'reference_image_paths': [old, 'plots/storybooks/other/97_shots/start.png'],
+                       'english_prompt': 'Edit ' + old}], 'inputs_hash': 'keep'}
+    result = shots_generator._scope_cached_shot_paths('proj', data)
+    expected = str(tmp_path / 'proj/series/episode/97_shots/scene_01_shot_01/start.png')
+    assert result['items'][0]['output_path'] == expected
+    assert result['items'][0]['source_end_path'] == expected
+    assert result['items'][0]['reference_image_paths'] == [expected, 'plots/storybooks/other/97_shots/start.png']
+    assert result['items'][0]['english_prompt'] == 'Edit ' + expected
+    assert result['inputs_hash'] == 'keep'

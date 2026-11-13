@@ -91,12 +91,12 @@ def effective_link_type(shot_elements: Sequence[Dict[str, Any]]) -> Tuple[str, b
     return raw, False
 
 
-def _shot_duration_s(shot_elements: Sequence[Dict[str, Any]]) -> Optional[int]:
+def _shot_duration_s(shot_elements: Sequence[Dict[str, Any]]) -> Optional[float]:
     for el in shot_elements:
         value = el.get("duration_s")
         if value is not None:
             try:
-                return int(value)
+                return float(value)
             except (TypeError, ValueError):
                 continue
     return None
@@ -105,7 +105,7 @@ def _shot_duration_s(shot_elements: Sequence[Dict[str, Any]]) -> Optional[int]:
 @dataclass
 class ChainShot:
     shot_number: int
-    duration_s: int
+    duration_s: float
     t_start: float
 
     def to_dict(self) -> Dict[str, Any]:
@@ -119,7 +119,7 @@ class Chain:
     shots: List[ChainShot] = field(default_factory=list)
 
     @property
-    def total_duration_s(self) -> int:
+    def total_duration_s(self) -> float:
         return sum(shot.duration_s for shot in self.shots)
 
     def to_dict(self) -> Dict[str, Any]:

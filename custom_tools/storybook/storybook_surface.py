@@ -147,28 +147,43 @@ def _artifact_inventory(project_path: Path) -> dict[str, Any]:
 def _media_inventory(project_path: Path, max_items: int) -> dict[str, Any]:
     items = []
     counts = {"image": 0, "video": 0, "audio": 0, "other": 0}
-    for relative_dir in MEDIA_DIRS:
-        media_dir = project_path / relative_dir
-        if not media_dir.exists():
+    # общие референсы серийного проекта лежат в корне проекта, а не в серии
+    root = project_paths.reference_project_dir(project_path)
+    dirs = [(project_path, d) for d in MEDIA_DIRS]
+    bound: list[Path] = []
+    if root != project_path:
+        # серия видит только привязанные к ней референсы, как галерея
+        from custom_tools.storybook.reference_catalog import bound_references
+        try:
+            records = bound_references(project_path, None)
+        except (OSError, ValueError):
+            records = []
+        bound = [root / r["path"] for r in records if str(r["path"]).startswith("shared/references/")]
+    elif (root / "shared" / "references").is_dir():
+        dirs.append((root, "shared/references"))
+    files = []
+    for base, relative_dir in dirs:
+        media_dir = base / relative_dir
+        if media_dir.exists():
+            files.extend((base, path) for path in media_dir.rglob("*")
+                         if path.is_file() and "_versions" not in path.relative_to(media_dir).parts)
+    files.extend((root, path) for path in bound if path.is_file())
+    for base, path in files:
+        kind = _media_kind(path)
+        if kind is None:
             continue
-        for path in media_dir.rglob("*"):
-            if not path.is_file() or "_versions" in path.relative_to(media_dir).parts:
-                continue
-            kind = _media_kind(path)
-            if kind is None:
-                continue
-            counts[kind] += 1
-            if len(items) >= max_items:
-                continue
-            items.append(
-                {
-                    "type": kind,
-                    "path": _relative_path(project_path, path),
-                    "name": path.name,
-                    "size": path.stat().st_size,
-                    "modified": _iso_mtime(path),
-                }
-            )
+        counts[kind] += 1
+        if len(items) >= max_items:
+            continue
+        items.append(
+            {
+                "type": kind,
+                "path": _relative_path(base, path),
+                "name": path.name,
+                "size": path.stat().st_size,
+                "modified": _iso_mtime(path),
+            }
+        )
     return {"counts": counts, "items": items, "items_limit": max_items}
 
 

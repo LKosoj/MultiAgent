@@ -115,8 +115,11 @@ def storybook_sfx_generator_tool(
                 if bounds:
                     lower = min(float(shot["start_s"]) for shot in bounds)
                     upper = max(float(shot["end_s"]) for shot in bounds)
-                    if start < lower or start >= upper or ("duration" in payload and start + payload["duration"] > upper):
+                    if start < lower or start >= upper:
                         raise ValueError(f"Звуковое событие выходит за пределы сцены {scene_number}")
+                    # Пересчёт раскадровки укорачивает кадры: длинный звук обрезается концом сцены.
+                    if "duration" in payload and start + payload["duration"] > upper:
+                        payload["duration"] = round(upper - start, 3)
                 fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20]
                 path = audio_dir / "sfx" / f"{fingerprint}.mp3"
                 if not path.is_file() or not path.stat().st_size:

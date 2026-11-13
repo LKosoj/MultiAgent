@@ -418,13 +418,22 @@ def blockout_scene_builder_tool(
     fps: Any = 24,
     allowed_durations: Optional[List[int]] = None,
     resolution: str = "1280x720",
-    enable: bool = True,
+    enable: bool = False,
 ) -> Dict[str, Any]:
     """Э2 main entrypoint. Always returns a dict, never a JSON string, and
     never ``status: "error"``/``error``/``exception`` (раздел 10.3.1).
     Blocking checks (B01, B02, B12, B14, B15) write an error record to their
     own ``report.json`` section, then raise — everything else degrades to a
     ``status: "warning"`` entry.
+
+    Args:
+        session_id: Pipeline execution identifier.
+        project_id: Storybook project identifier.
+        language: Language of the project bible.
+        fps: Requested blockout frame rate.
+        allowed_durations: Optional supported shot durations in seconds.
+        resolution: Requested frame size as WIDTHxHEIGHT.
+        enable: Whether to build the blockout scene.
     """
     del session_id  # standard tool signature; not otherwise used here
 
@@ -511,7 +520,12 @@ def blockout_scene_builder_tool(
             b01_missing.append({"scene_number": scene_no, "shot_number": shot_no})
             continue
         try:
-            in_set = int(duration) in effective_set
+            value = float(duration)
+            measured = next((e for e in elements if e.get('start_s') is not None
+                             and e.get('end_s') is not None), None)
+            in_set = math.isfinite(value) and value > 0 and (
+                math.isclose(float(measured['end_s']) - float(measured['start_s']), value, abs_tol=1e-6)
+                if measured else int(duration) in effective_set)
         except (TypeError, ValueError):
             in_set = False
         if not in_set:
@@ -520,7 +534,7 @@ def blockout_scene_builder_tool(
     if b01_missing or b01_invalid:
         entry = {
             "code": "B01", "level": "error",
-            "message": "duration_s missing or not within the allowed set for one or more shots; rerun screenplay_shots_generator",
+            "message": "duration_s missing, invalid, inconsistent with measured timing, or unsupported for unmeasured shots; rerun screenplay_shots_generator",
             "details": {"missing": b01_missing, "invalid": b01_invalid},
         }
         _report_append_checks(paths["report"], [entry])
@@ -1002,7 +1016,8 @@ def _resolve_main_subject(
 
     shot_character_names: List[str] = []
     for el in shot_elements:
-        for name in el.get("characters") or []:
+        for entry in el.get("characters") or []:
+            name = entry.get('name') if isinstance(entry, dict) else entry
             if name not in shot_character_names:
                 shot_character_names.append(name)
     matched_chars = [
@@ -1039,7 +1054,16 @@ def llm_parse_chain_spatial(chain_payload: Dict[str, Any]) -> Optional[Dict[str,
         "\"look_at\": [{\"t\", \"v\": [x,y,z], \"interp\"}]}}}. "
         "interp is one of linear/constant/bezier/ease_in/ease_out/ease_in_out. "
         "All positions are meters; all t values are seconds from the start of the "
-        "chain; every track must cover [0, total_duration_s] of the chain."
+        "chain; every track must cover [0, total_duration_s] of the chain. "
+        "Use Blender's right-handed world coordinates: +Z is up, X/Y form the ground plane z=0. "
+        "Do not use Y as height. Object location is the center of its bottom/support face, "
+        "not its bounding-box center: an object standing on the floor has location z=0. "
+        "At rotation [0,0,0] an object faces +Y. Camera location and look_at use the same world axes. "
+        "look_at is the visible subject part required by the shot framing, not automatically its base. "
+        "Preserve the requested eye-level, high or low angle and keep every required subject in frame. "
+        "Follow each shot's frame_constraints, including poses, camera_anchor, must_show and must_not_show. "
+        "Objects listed as context need not be visible: use tracks.visible [{t, v:boolean, interp:constant}] "
+        "when an object must be excluded from a shot."
     )
     user_prompt = json.dumps(chain_payload, ensure_ascii=False, default=str)
     try:
@@ -1096,7 +1120,8 @@ def _validate_chain_tracks(objects: Any, camera: Any, total_duration_s: float, f
             return "note"
         if not blockout_common.track_covers_range(keys, total_duration_s):
             return "B08"
-        if not blockout_common.track_keys_on_frame_grid(keys, fps):
+        # B08 verifies the exact terminal time; measured speech can end between frames.
+        if not blockout_common.track_keys_on_frame_grid(keys[:-1], fps):
             return "B09"
     for obj in objects:
         if not isinstance(obj, dict):
@@ -1106,7 +1131,7 @@ def _validate_chain_tracks(objects: Any, camera: Any, total_duration_s: float, f
             return "note"
         if not blockout_common.track_covers_range(loc_keys, total_duration_s):
             return "B08"
-        if not blockout_common.track_keys_on_frame_grid(loc_keys, fps):
+        if not blockout_common.track_keys_on_frame_grid(loc_keys[:-1], fps):
             return "B09"
     return None
 
@@ -1152,11 +1177,15 @@ def _apply_camera_boundary_overrides(
     boundary_points: Sequence[Tuple[float, Dict[str, Any], Optional[float], Optional[Tuple[float, float, float]]]],
     h_sensor_mm: float,
     ground: Dict[str, Any],
+    frame_bounds: Optional[Dict[float, List[Tuple[float, float, float]]]] = None,
 ) -> None:
-    """Overrides ``location``/``lens_mm`` keys at chain-boundary points per
+    """Overrides camera keys at chain-boundary points per
     the table rule (раздел 10.1, "camera_plan задаёт цель, а не мгновенное
     состояние"). ``boundary_points`` items are
-    ``(t, plan, main_subject_height_m, main_subject_location)``. POV and
+    ``(t, plan, main_subject_height_m, main_subject_location)``. For authored
+    ensemble frames, ``frame_bounds`` supplies the required body corners:
+    retain the view direction and increase distance only to fit that group.
+    POV and
     position-conflict shots are excluded from this recompute (their location
     is set separately by the caller for POV, or left as authored for
     position-conflict, раздел 10.1).
@@ -1196,6 +1225,21 @@ def _apply_camera_boundary_overrides(
             unit = _FALLBACK_CAMERA_DIRECTION
 
         distance = blockout_common.camera_distance_m(float(plan["lens_mm"]), float(s_m), float(fraction), h_sensor_mm)
+        corners = (frame_bounds or {}).get(t)
+        if corners:
+            look_at_point = tuple((min(p[i] for p in corners) + max(p[i] for p in corners)) / 2 for i in range(3))
+            horizontal = math.hypot(unit[0], unit[1])
+            right = (-unit[1] / horizontal, unit[0] / horizontal, 0.0) if horizontal > 1e-9 else (1.0, 0.0, 0.0)
+            up = (unit[1]*right[2] - unit[2]*right[1], unit[2]*right[0] - unit[0]*right[2],
+                  unit[0]*right[1] - unit[1]*right[0])
+            for corner in corners:
+                offset = tuple(corner[i] - look_at_point[i] for i in range(3))
+                depth = sum(offset[i] * unit[i] for i in range(3))
+                distance = max(distance,
+                    depth + 2 * plan['lens_mm'] * abs(sum(offset[i] * right[i] for i in range(3))) / (DEFAULT_SENSOR_MM * fraction),
+                    depth + 2 * plan['lens_mm'] * abs(sum(offset[i] * up[i] for i in range(3))) / (h_sensor_mm * fraction))
+            look_at_keys = [k for k in look_at_keys if abs(k['t'] - t) > blockout_common.FRAME_GRID_TOLERANCE]
+            look_at_keys.append({'t': t, 'v': look_at_point, 'interp': 'constant'})
         new_location = [look_at_point[i] + unit[i] * distance for i in range(3)]
 
         if ground_enabled and new_location[2] < ground_z:
@@ -1219,6 +1263,7 @@ def _apply_camera_boundary_overrides(
     lens_keys.sort(key=lambda k: k["t"])
     camera_tracks["location"] = location_keys
     camera_tracks["lens_mm"] = lens_keys
+    camera_tracks['look_at'] = sorted(look_at_keys, key=lambda k: k['t'])
 
 
 def build_world_block(object_heights_m: Sequence[float]) -> Dict[str, Any]:
@@ -1490,16 +1535,19 @@ def build_chain_scene_spec(
     for shot in chain.shots:
         elements = shot_elements_by_shot.get(shot.shot_number, [])
         for el in elements:
-            for name in el.get("characters") or []:
+            for entry in el.get("characters") or []:
+                name = entry.get('name') if isinstance(entry, dict) else entry
                 if name not in chain_character_names:
                     chain_character_names.append(name)
         shot_start = next(
             (e for e in elements if e.get("shot_type") == "start"),
             elements[0] if elements else {},
         )
-        shot_location = shot_start.get("location")
-        if shot_location and shot_location not in chain_locations:
-            chain_locations.append(shot_location)
+        locations = [shot_start['location']] if shot_start.get('location') else shot_start.get('locations') or []
+        for entry in locations:
+            shot_location = entry.get('name') if isinstance(entry, dict) else entry
+            if shot_location and shot_location not in chain_locations:
+                chain_locations.append(shot_location)
     chain_character_instance_ids = [
         name_to_instance[blockout_assets.normalize_match_name(n)]
         for n in chain_character_names
@@ -1543,6 +1591,9 @@ def build_chain_scene_spec(
             "english_prompt": start_el.get("english_prompt"),
             "video_prompt": start_el.get("video_prompt"),
             "spatial_changes_from_start": (end_el or {}).get("spatial_changes_from_start"),
+            "frame_constraints": {key: value for key, value in (start_el.get('_shot_frame_spec') or {}).items()
+                                  if key in {'scene_mode', 'camera_anchor', 'visible_characters',
+                                             'pose_signature', 'must_show', 'must_not_show'}},
         }
 
         # P2.14: subject_focus is validated against this chain's own
@@ -1560,7 +1611,8 @@ def build_chain_scene_spec(
                     )
             subject_focus_by_shot[shot.shot_number] = list(dict.fromkeys(raw_subject_focus))
 
-    input_hash = chain_input_hash_for_chain(chain, plans_by_shot, chain_character_instance_ids)
+    input_hash = chain_input_hash_for_chain(chain, plans_by_shot, chain_character_instance_ids,
+        {number: fields['frame_constraints'] for number, fields in llm_fields_by_shot.items() if fields['frame_constraints']})
 
     objects: Optional[List[Dict[str, Any]]] = None
     camera: Optional[Dict[str, Any]] = None
@@ -1591,6 +1643,7 @@ def build_chain_scene_spec(
                     "video_prompt": llm_fields_by_shot[shot.shot_number]["video_prompt"],
                     "spatial_changes_from_start": llm_fields_by_shot[shot.shot_number]["spatial_changes_from_start"],
                     "main_subject": subjects_by_shot[shot.shot_number],
+                    "frame_constraints": llm_fields_by_shot[shot.shot_number]['frame_constraints'],
                 }
                 for shot in chain.shots
             ],
@@ -1656,30 +1709,47 @@ def build_chain_scene_spec(
             chain_id=chain.chain_id,
         )
     camera_tracks = camera.setdefault("tracks", {})
-    for key_name in ("location", "look_at", "lens_mm"):
-        if key_name in camera_tracks:
-            camera_tracks[key_name] = _snap_track_times(camera_tracks[key_name], fps)
-
     camera_tracks = camera.setdefault("tracks", {})
     for key_name in ("location", "look_at", "lens_mm"):
         camera_tracks.setdefault(key_name, [{"t": 0.0, "v": _default_track_value(key_name), "interp": "constant"}])
 
     # boundary override points: t=0 (first shot's own plan) + every shot's window end
     boundary_points: List[Tuple[float, Dict[str, Any], Optional[float], Optional[Tuple[float, float, float]]]] = []
+    frame_bounds = {}
     for idx, shot in enumerate(chain.shots):
         plan = plans_by_shot[shot.shot_number]
         subject_iid = subjects_by_shot[shot.shot_number]
         subject_height = asset_index.get(subject_iid) if subject_iid else None
         window_end = shot.t_start + shot.duration_s
-        if idx == 0:
-            subject_loc0 = _lookup_object_location(objects, subject_iid, 0.0)
-            boundary_points.append((0.0, plan, subject_height, subject_loc0))
-        subject_loc_end = _lookup_object_location(objects, subject_iid, window_end)
-        boundary_points.append((window_end, plan, subject_height, subject_loc_end))
+        start = next((e for e in shot_elements_by_shot[shot.shot_number] if e.get('shot_type') == 'start'), {})
+        spec = start.get('_shot_frame_spec') or {}
+        visible_ids = [name_to_instance.get(blockout_assets.normalize_match_name(name))
+                       for name in spec.get('visible_characters', [])]
+        for t in ([0.0] if idx == 0 else []) + [window_end]:
+            boundary_points.append((t, plan, subject_height, _lookup_object_location(objects, subject_iid, t)))
+            if spec.get('scene_mode') != 'ensemble' or len(visible_ids) < 2:
+                continue
+            corners = []
+            for iid in visible_ids:
+                obj = next((o for o in objects if o['instance_id'] == iid), {})
+                dims = obj.get('dimensions_m')
+                position = _lookup_object_location(objects, iid, t)
+                if not position or not dims:
+                    corners = []
+                    break
+                height = asset_index.get(iid) or dims[2]
+                bottom = position[2] + max(0, height - (plan.get('s_m_override') or height))
+                corners.extend((x, y, z) for x in (position[0] - dims[0]/2, position[0] + dims[0]/2)
+                               for y in (position[1] - dims[1]/2, position[1] + dims[1]/2)
+                               for z in (bottom, position[2] + height))
+            if corners:
+                frame_bounds[t] = corners
 
-    _apply_camera_boundary_overrides(camera_tracks, boundary_points, h_sensor_mm, world["ground"])
+    _apply_camera_boundary_overrides(camera_tracks, boundary_points, h_sensor_mm, world["ground"], frame_bounds=frame_bounds)
     _apply_pov_overrides(camera_tracks, boundary_points)
     _apply_position_modifier_lens_overrides(camera_tracks, boundary_points)
+    for key_name in ('location', 'look_at', 'lens_mm'):
+        camera_tracks[key_name] = _snap_track_times(camera_tracks[key_name], fps)
     camera_tracks["location"] = _ensure_track_coverage(camera_tracks["location"], chain.total_duration_s)
     camera_tracks["look_at"] = _ensure_track_coverage(camera_tracks["look_at"], chain.total_duration_s)
     camera_tracks["lens_mm"] = _ensure_track_coverage(camera_tracks["lens_mm"], chain.total_duration_s)
@@ -1764,9 +1834,11 @@ def camera_aspect_to_render_hw(camera_aspect: str) -> Tuple[int, int]:
 
 
 def chain_input_hash_for_chain(
-    chain: "blockout_common.Chain", plans_by_shot: Dict[int, Dict[str, Any]], character_instance_ids: Sequence[str]
+    chain: "blockout_common.Chain", plans_by_shot: Dict[int, Dict[str, Any]], character_instance_ids: Sequence[str],
+    frame_constraints: Optional[Dict[int, dict]] = None,
 ) -> str:
     payload = {
+        "coordinate_contract": "blender_z_up_base_origin_v1",
         "chain_id": chain.chain_id,
         "shots": [
             {
@@ -1779,6 +1851,8 @@ def chain_input_hash_for_chain(
         ],
         "character_instance_ids": sorted(character_instance_ids),
     }
+    if frame_constraints:
+        payload['frame_constraints'] = frame_constraints
     return blockout_common.chain_input_hash(payload)
 
 

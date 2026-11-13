@@ -1440,6 +1440,7 @@ def _resolve_steps(pipeline: dict, static: dict, db: dict, locked: bool, active_
             row = out[sid]
             if row["state"] == "not_run" and any(
                     out[d]["state"] == "skipped" and out[d]["note_code"] in ("bypassed", "flag_off")
+                    and not (out[d]["note_code"] == "flag_off" and by_id[d]["enable"] == "{generate_blockout}")
                     for d in by_id[sid]["depends_on"] if d in out):
                 row.update(state="skipped", source="downstream", note_code="bypassed",
                            confidence="low")

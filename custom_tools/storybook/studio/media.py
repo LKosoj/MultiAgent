@@ -283,11 +283,12 @@ def scan_media(root: Path, *, include_blockout_frames: bool = False) -> list[Med
 
     def add(path: Path, type_: str, category: str, *, kind: str | None = None, key: str | None = None,
             keys: tuple[str, ...] = (), scene: int | None = None, shot: int | None = None,
-            page: int | None = None, phase: str | None = None, music_id: str | None = None) -> None:
+            page: int | None = None, phase: str | None = None, music_id: str | None = None,
+            base: Path | None = None) -> None:
         kind = kind or _kind_of(path.suffix)
         try:
             st = path.stat()
-            rel = path.relative_to(root).as_posix()
+            rel = path.relative_to(base or root).as_posix()
         except (OSError, ValueError):
             return
         out.append(MediaEntry(
@@ -306,6 +307,26 @@ def scan_media(root: Path, *, include_blockout_frames: bool = False) -> list[Med
         category = {"characters": "character", "landmarks": "landmark",
                     "background_references": "background"}.get(folder, "location")
         add(path, "reference", category)
+
+    # референсы из общего каталога проекта, привязанные к этой серии
+    from custom_tools.storybook.reference_catalog import bound_references
+    project_root = root.parent.parent if root.parent.name == "series" else root
+    try:
+        bound = bound_references(root, None)
+    except (OSError, ValueError):
+        bound = []
+    for record in bound:
+        # серийный роут отдаёт только shared/references/, остальное дало бы битую миниатюру
+        if not str(record["path"]).startswith("shared/references/"):
+            continue
+        path = project_root / record["path"]
+        if not path.resolve().is_relative_to(project_root) or _kind_of(path.suffix) != "image":
+            continue
+        kinds = set(record.get("kinds") or ())
+        category = ("character" if kinds & {"identity", "character", "appearance"}
+                    else "landmark" if "landmark" in kinds
+                    else "background" if "background" in kinds else "location")
+        add(path, "reference", category, base=project_root)
 
     # иллюстрации книги
     for path, parts in _walk(root / "50_images", root):

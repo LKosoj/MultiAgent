@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_command import model_ultimate
 from utils import call_openai_api, parse_llm_json
-from .project_paths import safe_storybook_project_dir
+from .project_paths import existing_reference_path, safe_storybook_project_dir, reference_project_dir
 
 _PLAN_VERSION = 5
 _BOUNDARY_INSTRUCTION = (
@@ -118,6 +118,7 @@ def validate_continuity_plan(plan, screenplay):
     if len(entities) != len(plan.get('entities', [])):
         raise ValueError('Duplicate continuity entity')
     states, current, transitions = {}, {}, {}
+    errors = []
     for ident, entity in entities.items():
         if (not re.fullmatch(r'[\w-]+', ident)
                 or entity.get('kind') not in {'landmark', 'prop'} or not entity.get('world_id')):
@@ -141,7 +142,11 @@ def validate_continuity_plan(plan, screenplay):
             evidence = _normalized(event.get('evidence', '')).rstrip('.!?…')
             text = _normalized(source['shot']['description'])
             if len(evidence) < 12 or evidence not in text:
-                raise ValueError(f'Continuity change has no source event: {ident}/{key}')
+                errors.append(
+                    f'Continuity change has no source event: {ident}/{key}; '
+                    f'evidence must quote shot.description, not scene.action; '
+                    f'evidence={event.get("evidence", "")!r}; '
+                    f'shot.description={source["shot"]["description"]!r}')
             transitions[(key, ident)] = event
     for key in sorted(frames, key=_order):
         frame = plan['frames'][key]
@@ -163,7 +168,10 @@ def validate_continuity_plan(plan, screenplay):
             if entities[ident]['world_id'] != frame['world_id']:
                 raise ValueError(f'Continuity object crossed worlds: {key}/{ident}')
             if binding['state_id'] != current[ident]:
-                raise ValueError(f'Continuity state changed without an event: {key}/{ident}')
+                errors.append(f'Continuity state changed without an event: {key}/{ident}; '
+                              f'expected={current[ident]!r}, actual={binding["state_id"]!r}')
+    if errors:
+        raise ValueError('\n'.join(errors))
     return plan
 
 
@@ -348,6 +356,8 @@ def _repair_candidate(base, source, plan, fingerprint, review_findings=None):
                 'в плане. Исправляй ошибочный план по исходнику, а не исходник ради оправдания плана. '
                 'Любой настоящий перенос или изменение состояния требует transitions с точной цитатой события из '
                 'соответствующего description после repairs. Не выдумывай события ради оправдания ошибочного состояния. '
+                'evidence цитирует дословно description указанного шота, а не action всей сцены; '
+                'если событие уже есть в шоте, исправь цитату в entity_replacements, не переписывая шот. '
                 'Если авторская правка меняет постановку, согласуй с ней и action сцены, и затронутые description '
                 'шотов через repairs; одного изменения entities недостаточно. Цитата авторского требования не '
                 'заменяет событие в description. '
@@ -508,6 +518,7 @@ def storybook_continuity_plan_tool(session_id: str, project_id: str, enable: boo
             'для него объекты: visible=false сохраняет существенное отсутствие/удалённое положение без требования '
             'рисовать предмет в кадре. Каждый переход состояния задаётся transitions в точной фазе. Состояние '
             'сохраняется между переходами независимо от видимости. Пиши на языке исходника, кроме shape. '
+            'evidence цитирует description указанного шота, а не action всей сцены. '
             'shape — английская фраза до 15 слов: предмет, его неизменный силуэт и материал в любом ракурсе '
             '(например, "the boulder: a perfectly round, smooth grey granite sphere"); без состояния, места и действия.'),
     )
@@ -527,15 +538,34 @@ def ensure_landmark_references(base, session_id, seed):
     from concurrent.futures import ThreadPoolExecutor
     from custom_tools.image_tools import edit_image_vse_tool
     from .background_references import _reference_path
+    from .reference_catalog import (reuse_reference, store_reference, reject_reference,
+                                    reference_review_current, accept_reference_review)
+    from .artist_batch_edit import _reference_requirements_met
 
     plan = load_continuity_plan(base)
     if not plan:
         return
     locations = {entry['name']: entry for entry in json.loads((base / '20_bible/locations.json').read_text())}
 
+    def keep_or_set_path(entity, resolved):
+        # хеши кадров берут строку пути: прежнюю не меняем, если она указывает на тот же файл
+        old = entity.get('reference_path')
+        if old:
+            try:
+                if Path(existing_reference_path(base, old)).resolve() == Path(resolved).resolve():
+                    return
+            except OSError:
+                pass
+        entity['reference_path'] = resolved
+
     def render(entity):
         source = _reference_path(base, locations[entity['reference_location']]['reference_image_path'])
-        views = ('Если объект виден из разных помещений/снаружи, покажи два согласованных вида с противоположных '
+        orientation_rule = (
+            'Если в устройстве явно не задана другая система отсчёта, слева/справа означают стороны '
+            'изображения для зрителя в первом опорном виде, а не собственные стороны объекта. '
+            'В остальных видах те же физические части сохраняются, а их экранные стороны определяются ракурсом.'
+        )
+        views = ('Если объект виден из нескольких локаций, покажи два согласованных вида с противоположных '
                  'сторон; это один объект с одними частями, а не две вариации дизайна. Экранный порядок '
                  'частей в обратном виде зеркален опорному; названия обозначают физические части, а не '
                  'экранные позиции. В остальном один вид. '
@@ -553,31 +583,78 @@ def ensure_landmark_references(base, session_id, seed):
                   + views +
                   'Никаких альтернатив конструкции или декоративных добавлений. Имя: ' + entity['name'] +
                   '. Устройство: ' + entity['geometry'] +
-                  '. Названия частей служат описанием геометрии; не наноси на рисунок буквы, метки и подписи.')
+                  '. ' + orientation_rule +
+                  '. Не придумывай соединений или опор между частями, меняющих указанное текстовое устройство. '
+                  'Названия частей служат описанием геометрии; не наноси на рисунок буквы, метки и подписи.')
         related = [other for other in plan['entities'] if other['id'] != entity['id']
                    and other['world_id'] == entity['world_id']
                    and set(other.get('locations', [])) & set(entity.get('locations', []))]
         other_landmarks = [other['name'] for other in related if other['kind'] == 'landmark']
         props = [other['name'] for other in related if other['kind'] == 'prop']
         if other_landmarks:
-            prompt += ('. Подбери кадрирование так, чтобы другие самостоятельные ориентиры оставались '
-                       'за кадром без изменения их реального положения: ' + ', '.join(other_landmarks))
+            prompt += ('. Редактируй исходное изображение: полностью УДАЛИ из этого эталона следующие '
+                       'посторонние ориентиры, включая любые их фрагменты по краям: '
+                       + ', '.join(other_landmarks) +
+                       '. Освободившиеся участки заполни продолжающимися поверхностями окружения. '
+                       'Это эталон только указанного объекта, а не общий вид расстановки ориентиров.')
         if props:
             prompt += ('. Покажи только конструкцию без переносимого и расходуемого наполнения, в том числе: '
                        + ', '.join(props))
         if locations[entity['reference_location']].get('historical_period'):
             prompt += '. Эпоха: ' + str(locations[entity['reference_location']]['historical_period'])
             prompt += '. Согласуй все детали с указанной эпохой, даже если старый референс содержит анахронизмы.'
-        digest = _digest([prompt, hashlib.sha256(source.read_bytes()).hexdigest(), seed,
+        negative = ', '.join(['персонажи', 'люди', *other_landmarks, *props])
+        digest = _digest([prompt, negative, hashlib.sha256(source.read_bytes()).hexdigest(), seed,
                           os.getenv('IMG2IMG_MODEL') or os.getenv('VSEGPT_IMG2IMG_MODEL')])
-        target = base / '20_bible/references/landmarks' / f"{entity['id']}_{digest[:12]}.png"
+        target = reference_project_dir(base) / '20_bible/references/landmarks' / f"{entity['id']}_{digest[:12]}.png"
+        review_data = {'name': entity['name'], 'reference_requirements': [
+            entity['geometry'],
+            orientation_rule,
+            'Устройство и положение названных частей должны точно соответствовать описанию выше; '
+            'несовместимая форма или положение частей являются нарушением.',
+            'Нет персонажей, людей и частей тела.',
+            'Проверяй собственную видимую конструкцию ориентира. Не требуй показывать другие ориентиры '
+            'или расширять кадр для проверки положения относительно объектов за его границами; '
+            'такие пространственные отношения проверяются по общему плану локации.',
+        ]}
+        if other_landmarks or props:
+            review_data['reference_requirements'].append(
+                'Нет следующих посторонних объектов, включая фрагменты: ' + ', '.join(other_landmarks + props))
+        review = {'name': entity['name'], 'requirements': review_data['reference_requirements']}
+        cached = reuse_reference(base, 'landmark', digest, description=prompt,
+                                 metadata={'entity': entity['name'], 'source_hashes': [hashlib.sha256(source.read_bytes()).hexdigest()]})
+        if cached:
+            if reference_review_current(base, cached, review) or _reference_requirements_met(cached, review_data):
+                accept_reference_review(base, cached, review)
+                keep_or_set_path(entity, cached)
+                return
+            reject_reference(base, cached, 'Landmark reference failed declared geometry requirements')
+            target.unlink(missing_ok=True)
+            prompt += ('. Повторная генерация: строго следуй текстовому устройству объекта. '
+                       'Несовместимые детали исходной картинки не копируй. Устройство: ' + entity['geometry'])
+        moved = existing_reference_path(base, str(target))
+        if moved != str(target):
+            target = Path(moved)  # файл уже перенесён в общий каталог
         if not target.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             edit_image_vse_tool(session_id=session_id, prompt=prompt, image_paths=[str(source)],
-                                output_path=str(target), width=1920, height=1088, seed=seed)
+                                output_path=str(target), width=1920, height=1088, seed=seed,
+                                negative_prompt=negative)
             if not target.is_file():
                 raise RuntimeError(f'Landmark reference missing: {target}')
-        entity['reference_path'] = str(target.resolve())
+        if not _reference_requirements_met(str(target), review_data):
+            rejected = store_reference(base, target, 'landmark', digest, description=prompt,
+                                       metadata={'entity': entity['name'], 'source_hashes': [hashlib.sha256(source.read_bytes()).hexdigest()]},
+                                       sources=[source])
+            reject_reference(base, rejected, 'Landmark reference failed declared geometry requirements')
+            target.unlink(missing_ok=True)
+            raise RuntimeError(f"Landmark reference failed requirements: {entity['name']}")
+        candidate = store_reference(base, target, 'landmark', digest,
+                                                   description=prompt,
+                                                   metadata={'entity': entity['name'], 'source_hashes': [hashlib.sha256(source.read_bytes()).hexdigest()]},
+                                                   sources=[source])
+        accept_reference_review(base, candidate, review)
+        keep_or_set_path(entity, candidate)
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         list((future.result() for future in [executor.submit(contextvars.copy_context().run, render, entity) for entity in plan['entities'] if entity['kind'] == 'landmark']))
@@ -588,6 +665,9 @@ def identity_reference_path(base, character, session_id, seed):
     """Normalize a legacy identity sheet once, keeping temporary props out of it."""
     from custom_tools.image_tools import edit_image_vse_tool
     from .background_references import _reference_path
+    from .reference_catalog import (reuse_reference, store_reference, reject_reference,
+                                    reference_review_current, accept_reference_review)
+    from .artist_batch_edit import _reference_requirements_met
 
     plan = load_continuity_plan(base)
     identity = (plan or {}).get('character_identity', {}).get(character['name'], {})
@@ -597,25 +677,130 @@ def identity_reference_path(base, character, session_id, seed):
     excluded.update(entity['id'] for entity in (plan or {}).get('entities', [])
                     if entity['kind'] == 'prop' and any(
                         state.get('holder') == character['name'] for state in entity['states']))
+    worn = set(identity.get('accessories', []))
+    excluded.difference_update(entity['id'] for entity in (plan or {}).get('entities', [])
+                               if entity['id'] in worn or entity['name'] in worn)
     source = _reference_path(base, character['reference_image_path'])
     if not excluded:
         return str(source)
-    names = [entity['name'] for entity in plan['entities'] if entity['id'] in excluded]
-    prompt = ('Создай нейтральный эталон только внешности этого персонажа: лицо, пропорции, '
-              'причёска и надетая на тело одежда сохраняются. Спокойная стойка, свободные руки, '
-              'однотонная бумажная основа. Без сюжетных действий или игровых поз '
-              'из исходного листа. Переносимые предметы вокруг героя и в его руках исключены: ' +
-              ', '.join(names) + '. Надетую одежду и естественные части тела не удаляй. '
-              'Сохрани художественную технику исходного изображения.')
+    names = [entity['name'] + (f" ({entity['shape']})" if entity.get('shape') else '')
+             for entity in plan['entities'] if entity['id'] in excluded]
+    removal = ', '.join(entity.get('shape') or entity['name'] for entity in plan['entities'] if entity['id'] in excluded)
+    prompt = ('Edit the supplied reference sheet. The ONLY change is to completely REMOVE these temporary props: '
+              + removal + '. Remove EVERY instance in EVERY view: face close-up, front full-body and back full-body, '
+              'including the mouth, hands, clothing and surroundings. Restore the natural continuation of the face, '
+              'body, clothing or background where a prop was removed. Keep everything else unchanged: the same '
+              'identity, face, proportions, hair, worn clothes, posture, poses, background and artistic technique. '
+              'Preserve the original composition and number of views, including the large clear face close-up if present. '
+              'Do not replace it with small heads above full-body figures. Preserve all worn accessories and their '
+              'specific distinguishing details; do not repair or idealize them. Do not remove natural body parts.')
+    review_data = dict(character)
+    if character.get('reference_requirements'):
+        review_data['reference_requirements'] = [
+            'Each of these temporary props must be completely absent from EVERY view, including the face close-up, '
+            'front full-body and back full-body, mouth, hands, clothing and surroundings. Any visible instance '
+            'in any view is a violation: ' + ', '.join(names) + '. For all following requirements, this mandatory '
+            'removal is the sole permitted exception. Ignore only clauses requiring those props to remain; '
+            'appearance, worn accessories, identity, reference-sheet layout and style must still be preserved.',
+            *character['reference_requirements'],
+        ]
     digest = _digest([prompt, hashlib.sha256(source.read_bytes()).hexdigest(), seed,
                       os.getenv('IMG2IMG_MODEL') or os.getenv('VSEGPT_IMG2IMG_MODEL')])
-    target = base / '20_bible/references/characters' / f'identity_{digest[:16]}.png'
+    detail_data = dict(character, reference_requirements=[
+        'In this enlarged fragment, these temporary props must be completely absent: '
+        + ', '.join(names) + '. Any visible instance, including in the mouth, hands, '
+        'clothing or surroundings, is a violation. Evaluate only what is visible; '
+        'do not require other views, body parts or sheet composition outside this fragment.'
+    ])
+    review = {'name': character['name'], 'requirements': review_data.get('reference_requirements'),
+              'detail_requirements': detail_data['reference_requirements']}
+    def requirements_met(path, repair_details=False):
+        if not _reference_requirements_met(path, review_data):
+            return False
+        if not character.get('reference_requirements'):
+            return True
+        # A small prop can disappear at the scale of a whole reference sheet.
+        # Check enlarged areas for removal only, without requiring off-crop views.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from tempfile import TemporaryDirectory
+        from PIL import Image
+        review_dir = base / '97_shots'
+        review_dir.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix='identity_review_', dir=review_dir) as directory, Image.open(path) as sheet:
+            columns, rows = (sheet.width + 383) // 384, (sheet.height + 383) // 384
+            paths, boxes = [], {}
+            for row in range(rows):
+                for column in range(columns):
+                    # Overlap keeps small objects crossing a tile edge readable.
+                    box = (max(0, column * sheet.width // columns - 32),
+                           max(0, row * sheet.height // rows - 32),
+                           min(sheet.width, (column + 1) * sheet.width // columns + 32),
+                           min(sheet.height, (row + 1) * sheet.height // rows + 32))
+                    tile = sheet.crop(box)
+                    scale = 896 / max(tile.size)
+                    tile = tile.resize((round(tile.width * scale), round(tile.height * scale)))
+                    detail_path = str(Path(directory) / f'{row}_{column}.png')
+                    tile.save(detail_path)
+                    paths.append(detail_path)
+                    boxes[detail_path] = box
+            failed = []
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {executor.submit(contextvars.copy_context().run,
+                                           _reference_requirements_met, detail_path, detail_data): detail_path
+                           for detail_path in paths}
+                for future in as_completed(futures):
+                    if not future.result():
+                        if not repair_details:
+                            for pending in futures:
+                                pending.cancel()
+                            return False
+                        failed.append(futures[future])
+            # The generator may miss a tiny prop on the full sheet as well.
+            # Edit only failed enlarged areas, then verify the complete sheet.
+            for detail_path in failed:
+                fixed = str(Path(detail_path).with_name(Path(detail_path).stem + '_fixed.png'))
+                with Image.open(detail_path) as detail:
+                    width, height = detail.size
+                detail_prompt = ('Remove ' + removal + ' from this image. Restore the natural surface it covered. '
+                                 'Keep everything else exactly as it is. This is a magnified fragment; return '
+                                 'the same framing, positions and size, without adding any views or content.')
+                edit_image_vse_tool(session_id=session_id, prompt=detail_prompt, image_paths=[detail_path],
+                                    output_path=fixed, width=width, height=height, seed=seed,
+                                    negative_prompt=removal)
+                if not Path(fixed).is_file() or not _reference_requirements_met(fixed, detail_data):
+                    return False
+                left, top, right, bottom = boxes[detail_path]
+                with Image.open(fixed) as detail:
+                    sheet.paste(detail.resize((right - left, bottom - top)), (left, top))
+            if failed:
+                sheet.save(path)
+                return requirements_met(path)
+            return True
+
+    target = reference_project_dir(base) / '20_bible/references/characters' / f'identity_{digest[:16]}.png'
+    cached = reuse_reference(base, 'identity', digest, description=prompt,
+                             metadata={'entity': character['name'], 'source_hashes': [hashlib.sha256(source.read_bytes()).hexdigest()]})
+    if cached:
+        if reference_review_current(base, cached, review):
+            return cached
+        if requirements_met(cached):
+            accept_reference_review(base, cached, review)
+            return cached
+        reject_reference(base, cached, 'Identity cleanup failed canonical reference requirements')
+    target = Path(existing_reference_path(base, str(target)))  # файл мог быть перенесён
     if not target.is_file():
         edit_image_vse_tool(session_id=session_id, prompt=prompt, image_paths=[str(source)],
-                            output_path=str(target), width=1920, height=1088, seed=seed)
+                            output_path=str(target), width=1920, height=1088, seed=seed,
+                            negative_prompt=removal)
         if not target.is_file():
             raise RuntimeError(f'Clean character identity missing: {target}')
-    return str(target.resolve())
+    if not requirements_met(str(target), repair_details=True):
+        target.unlink()
+        raise RuntimeError(f'Identity cleanup failed canonical reference requirements: {character["name"]}')
+    result = store_reference(base, target, 'identity', digest, description=prompt,
+                             metadata={'entity': character['name'], 'source_hashes': [hashlib.sha256(source.read_bytes()).hexdigest()]}, sources=[source])
+    accept_reference_review(base, result, review)
+    return result
 
 
 def frame_continuity(base, scene, shot, phase):
@@ -655,7 +840,8 @@ def unit_continuity_hash(base, shot_keys):
     if not contexts:
         return None
     refs = {path for context in contexts.values() for path in context['landmark_reference_paths']}
-    return _digest([contexts, {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in sorted(refs)}])
+    return _digest([contexts, {path: hashlib.sha256(Path(existing_reference_path(base, path)).read_bytes()).hexdigest()
+                    for path in sorted(refs)}])
 
 
 def image_continuity_hash(item):
@@ -665,13 +851,14 @@ def image_continuity_hash(item):
     context = frame_continuity(base, item['scene_number'], item['shot_number'], item.get('shot_type', 'start'))
     if not context:
         return None
-    from .background_references import _reference_path
+    from .background_references import _reference_candidate
     paths = list(item.get('reference_image_paths') or []) + context['landmark_reference_paths']
     if item.get('background_reference'):
         paths.append(item['background_reference']['sheet_path'])
     paths += [item[key] for key in ('source_end_path', 'image_path', 'base_image_path') if item.get(key)]
-    hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for value in paths
-              for path in [_reference_path(base, value)] if path.is_file()}
+    # Ключ — путь-кандидат (до переноса в shared/references), читаем из разрешённого файла
+    hashes = {str(candidate): hashlib.sha256(path.read_bytes()).hexdigest() for value in paths
+              for candidate, path in [_reference_candidate(base, value)] if path.is_file()}
     return _digest([context, item.get('english_prompt'), item.get('negative_prompt'),
                     item.get('background_reference'), hashes])
 

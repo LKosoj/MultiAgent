@@ -20,3 +20,4 @@ parameters:
     type: bool
     description: "If true, builds the preview from the blockout layer; if false, returns the zero contract without touching 93_blockout/"
     required: false
+    default: false

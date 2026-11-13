@@ -4,6 +4,10 @@ category: "Генерация"
 source_type: custom_function
 implementation_source: custom_tools.storybook.screenplay_shots_generator.screenplay_shots_generator_tool
 parameters:
+  - name: frame_resolution
+    type: str
+    description: "Размер видеокадров WxH; пустое значение сохраняет 1920x1088"
+    required: false
   - name: shot_keys
     type: list
     description: "Только указанные ключи scene-shot; остальные шоты сохраняются"
@@ -40,6 +44,7 @@ parameters:
     type: bool
     description: "Если True — при отсутствии/пустоте набора supported_durations модели генерация останавливается блокирующей ошибкой (B15) вместо тихого продолжения без нормализации длительности"
     required: false
+    default: false
   - name: allowed_durations
     type: list[int]
     description: "Ограничение набора длительностей модели значениями проекта (blockout_allowed_durations). Пустой список — берётся весь набор, поддерживаемый моделью"

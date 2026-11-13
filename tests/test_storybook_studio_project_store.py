@@ -568,3 +568,41 @@ def test_copy_progress_reaches_total_when_file_vanished(dirs, monkeypatch):
     calls = []
     ps.create_backup(root, backups, "alpha", progress=lambda done, total, label: calls.append((done, total)))
     assert calls and calls[-1][0] == calls[-1][1] == 4
+
+
+def _catalog(root, records):
+    shared = root / "shared"
+    shared.mkdir(exist_ok=True)
+    (shared / "reference_catalog.json").write_text(json.dumps(
+        {"version": 1, "initialized_series": [], "references": {
+            r["id"]: {"keys": [], "aliases": [], "parents": [], "selectable": True, **r} for r in records}}),
+        encoding="utf-8")
+
+
+def test_pick_cover_series_from_catalog(tmp_path):
+    from tests.studio_run_fakes import make_series_project
+    series = make_series_project(tmp_path, "demo")
+    root = series.parent.parent
+    touch(root / "shared/references/characters/aa.png")
+    touch(root / "shared/references/landmarks/bb.png")
+    assert ps.pick_cover(root) is None
+    _catalog(root, [
+        {"id": "bb", "path": "shared/references/landmarks/bb.png", "kinds": ["landmark"], "series_ids": ["main"]},
+        {"id": "aa", "path": "shared/references/characters/aa.png", "kinds": ["identity"], "series_ids": ["main"]}])
+    assert ps.pick_cover(root) == "shared/references/characters/aa.png"
+    # старые файлы обложки приоритетнее каталога
+    touch(root / "20_bible/references/characters/hero.png")
+    assert ps.pick_cover(root) == "20_bible/references/characters/hero.png"
+
+
+def test_pick_cover_catalog_skips_rejected_and_missing_file(tmp_path):
+    from tests.studio_run_fakes import make_series_project
+    root = make_series_project(tmp_path, "demo").parent.parent
+    touch(root / "shared/references/characters/aa.png")
+    touch(root / "shared/references/characters/cc.png")
+    _catalog(root, [
+        {"id": "aa", "path": "shared/references/characters/aa.png", "kinds": ["identity"],
+         "series_ids": ["main"], "selectable": False},
+        {"id": "bb", "path": "shared/references/characters/bb.png", "kinds": ["identity"], "series_ids": ["main"]},
+        {"id": "cc", "path": "shared/references/characters/cc.png", "kinds": ["character"], "series_ids": ["main"]}])
+    assert ps.pick_cover(root) == "shared/references/characters/cc.png"

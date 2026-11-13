@@ -17,7 +17,7 @@ from custom_tools.storybook.style_library_config import (
 from custom_tools.storybook.screenplay_shots_generator_utils.technical import (
     _dedup_negative_prompt,
 )
-from .project_paths import safe_storybook_project_dir
+from .project_paths import safe_storybook_project_dir, reference_project_dir
 import logging
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,23 @@ _STYLE_REFERENCE_INSTRUCTION = (
     "Без панелей, таблиц, подписей и читаемых надписей; "
     "газетная фактура передаётся растром и нечитаемыми следами печати, а не словами.\n\n"
 )
+
+
+def project_reference_style_prompt(base):
+    """Use the current project's shared style for its canonical references."""
+    root = reference_project_dir(Path(base))
+    project_path = root / "project.json"
+    if not project_path.is_file():
+        return None
+    project = json.loads(project_path.read_text(encoding="utf-8"))
+    styles = project.get("resources", {}).get("style", {})
+    if not styles:
+        return None
+    entity_id, version_id = next(iter(styles.items()))
+    source = root / "shared/style" / entity_id / version_id / "data.json"
+    style = json.loads(source.read_text(encoding="utf-8")).get("style_images", {})
+    fields = ("art_style", "color_palette", "lighting", "texture", "detail_density", "material_signature")
+    return "\n".join(f"{key}: {json.dumps(style[key], ensure_ascii=False)}" for key in fields if style.get(key))
 
 
 def resolve_image_style_id(catalog, frame_key, locations, style_id=None):
@@ -49,12 +66,21 @@ def resolve_image_style_id(catalog, frame_key, locations, style_id=None):
 
 def ensure_image_style_catalog(base: str, style_images: Dict[str, Any]) -> Dict[str, Any]:
     """Однократно очищает стили; привязки кадров впоследствии применяет код."""
+    root = reference_project_dir(Path(base))
+    project_path = root / "project.json"
+    if project_path.is_file():
+        resources = json.loads(project_path.read_text()).get("resources", {}).get("style", {})
+        if resources:
+            entity, version = next(iter(resources.items()))
+            style_images = json.loads((root / "shared/style" / entity / version / "data.json").read_text()).get("style_images", {})
+    source_hash = hashlib.sha256(json.dumps(style_images, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     path = f"{base}/30_style/image_styles.json"
     existing = {}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             existing = json.load(f)
-        if existing.get("version") == _IMAGE_STYLE_CATALOG_VERSION:
+        if (existing.get("version") == _IMAGE_STYLE_CATALOG_VERSION
+                and existing.get("source_hash") == source_hash):
             return existing
     if not style_images:
         return existing
@@ -98,6 +124,7 @@ def ensure_image_style_catalog(base: str, style_images: Dict[str, Any]) -> Dict[
         style_id not in styles for style_id in location_bindings.values()
     ):
         raise ValueError("image_styles: unknown location or style binding")
+    catalog["source_hash"] = source_hash
     catalog["version"] = _IMAGE_STYLE_CATALOG_VERSION
     catalog["frame_bindings"] = {
         key: style_id for key, style_id in existing.get("frame_bindings", {}).items()
@@ -114,40 +141,53 @@ def ensure_image_style_catalog(base: str, style_images: Dict[str, Any]) -> Dict[
 def ensure_video_style_references(base, catalog, style_ids, session_id, seed, items, width=1920, height=1088):
     """Generate one dedicated style image per requested catalog style, reusing completed files."""
     from custom_tools.image_tools import edit_image_vse_tool
-    from .background_references import _reference_path
+    from .background_references import _reference_candidate
+    from .reference_catalog import reuse_reference, store_reference
 
     if not style_ids:
         return {}
 
     def render(style_id):
         candidates = {"characters": Counter(), "locations": Counter()}
+        # Ключ — путь-кандидат (до переноса в общий каталог), файл читаем из разрешённого пути.
+        resolved = {}
         for item in items:
             key = f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
             if resolve_image_style_id(catalog, key, item.get("locations"), item.get("style_id")) != style_id:
                 continue
             for field, counts in candidates.items():
-                counts.update({str(_reference_path(Path(base), entry["reference_image_path"]))
-                               for entry in item.get(field) or [] if entry.get("reference_image_path")
-                               and _reference_path(Path(base), entry["reference_image_path"]).is_file()})
+                for entry in item.get(field) or []:
+                    if entry.get("reference_image_path"):
+                        candidate, actual = _reference_candidate(Path(base), entry["reference_image_path"])
+                        if actual.is_file():
+                            resolved[str(candidate)] = actual
+                            counts.update([str(candidate)])
         if not all(candidates.values()):
             raise ValueError(f"Style {style_id} requires at least one character and one location reference")
         inputs = [min(counts, key=lambda path: (-counts[path], path)) for counts in candidates.values()]
         prompt = _STYLE_REFERENCE_INSTRUCTION + catalog["styles"][style_id]["prompt"]
         digest = hashlib.sha256(json.dumps([style_id, prompt, seed, width, height,
                                            os.getenv("IMG2IMG_MODEL") or os.getenv("VSEGPT_IMG2IMG_MODEL"),
-                                           [(path, hashlib.sha256(Path(path).read_bytes()).hexdigest()) for path in inputs]],
+                                           [(path, hashlib.sha256(resolved[path].read_bytes()).hexdigest()) for path in inputs]],
                                           ensure_ascii=False).encode()).hexdigest()
-        path = Path(base) / "30_style/references" / f"style_{digest[:16]}.png"
+        path = reference_project_dir(Path(base)) / "30_style/references" / f"style_{digest[:16]}.png"
+        cached = reuse_reference(base, "style", digest, description=prompt,
+                                 metadata={"style_id": style_id, "source_hashes": [hashlib.sha256(resolved[path].read_bytes()).hexdigest() for path in inputs]})
+        if cached:
+            return style_id, cached
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.is_file():
             logger.info("🎨 Generating dedicated video style reference: style=%s size=%sx%s seed=%s path=%s",
                         style_id, width, height, seed, path)
-            logger.info("🎨 Style sources: character=%s location=%s", inputs[0], inputs[1])
-            result = edit_image_vse_tool(prompt=prompt, session_id=session_id, image_paths=inputs, output_path=str(path),
+            logger.info("🎨 Style sources: character=%s location=%s", resolved[inputs[0]], resolved[inputs[1]])
+            result = edit_image_vse_tool(prompt=prompt, session_id=session_id, image_paths=[str(resolved[path]) for path in inputs], output_path=str(path),
                                         width=width, height=height, seed=seed)
             if not path.is_file():
                 raise RuntimeError(f"Style reference was not generated: {result}")
-        return style_id, str(path.resolve())
+        return style_id, store_reference(base, path, "style", digest,
+                                         description=prompt,
+                                         metadata={"style_id": style_id, "source_hashes": [hashlib.sha256(resolved[path].read_bytes()).hexdigest() for path in inputs]},
+                                         sources=[str(resolved[path]) for path in inputs])
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         references = dict(executor.map(render, sorted(set(style_ids))))

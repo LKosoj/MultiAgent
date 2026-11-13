@@ -88,3 +88,39 @@ def test_style_images_are_dedicated_cached_and_regenerated_only_for_changed_styl
     assert len(calls) == 4
     assert new_source["cold"] == changed["cold"] and new_source["warm"] != changed["warm"]
     assert json.loads((tmp_path / "30_style/image_styles.json").read_text())["reference_images"] == new_source
+
+
+def test_moving_input_reference_to_shared_does_not_regenerate_style(tmp_path, monkeypatch):
+    from custom_tools.storybook import background_references as backgrounds
+    (tmp_path / "30_style").mkdir()
+    catalog = {"default_style_id": "cold", "styles": {"cold": {"prompt": "Cold ink"}}, "frame_bindings": {},
+               "location_bindings": {"Room": "cold"}}
+    old_hero, old_room = tmp_path / "references/hero.png", tmp_path / "references/room.png"
+    new_hero, new_room = tmp_path / "shared/hero.png", tmp_path / "shared/room.png"
+    for path in (new_hero, new_room):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (16, 16), "gray").save(path)
+    items = [{"scene_number": 1, "shot_number": 1, "style_id": "cold",
+              "characters": [{"reference_image_path": str(old_hero)}],
+              "locations": [{"name": "Room", "reference_image_path": str(old_room)}]}]
+    # Путь-кандидат (где файл лежал до переноса) не меняется, разрешённый путь переезжает.
+    moved = {"value": False}
+    monkeypatch.setattr(backgrounds, "_reference_candidate", lambda base, value: (
+        Path(value), {str(old_hero): new_hero, str(old_room): new_room}[value] if moved["value"] else Path(value)))
+    for path in (old_hero, old_room):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (16, 16), "gray").save(path)
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        Image.new("RGB", (16, 16), "gray").save(kwargs["output_path"])
+        return kwargs["output_path"]
+
+    monkeypatch.setattr(image_tools, "edit_image_vse_tool", generate)
+    first = styles.ensure_video_style_references(tmp_path, catalog, ["cold"], "s", 42, items)
+    moved["value"] = True
+    old_hero.unlink()
+    old_room.unlink()
+    assert styles.ensure_video_style_references(tmp_path, catalog, ["cold"], "s", 42, items) == first
+    assert len(calls) == 1

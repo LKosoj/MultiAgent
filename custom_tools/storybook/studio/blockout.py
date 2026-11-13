@@ -39,12 +39,12 @@ _BLENDER_TTL_S = 60.0
 
 # запасные значения совпадают с inputs в storybook_pipeline.yaml (сверяет тест)
 DEFAULTS: dict[str, Any] = {
-    "generate_blockout": True,
+    "generate_blockout": False,
     "blockout_fps": 24,
     "blockout_resolution": "1280x720",
     "blockout_jobs": 0,
     "blockout_preview_burnin": True,
-    "blockout_use_as_image_reference": True,
+    "blockout_use_as_image_reference": False,
     "blockout_use_as_video_reference": False,
 }
 

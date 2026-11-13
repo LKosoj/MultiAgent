@@ -282,3 +282,18 @@ def test_speech_clip_is_trimmed_without_retime_or_embedded_audio(tmp_path, monke
     subprocess.run(['ffmpeg', '-v', 'error', '-ss', '6.95', '-i', str(output), '-frames:v', '1', str(frame)], check=True)
     red, _, blue = Image.open(frame).convert('RGB').getpixel((80, 48))
     assert red > blue
+
+
+def test_export_keeps_executable_script_owned_by_other_user(tmp_path, monkeypatch):
+    base, items = _project(tmp_path, monkeypatch)
+    path = base / "97_shots" / "photo_shots_timeline.fcpxml"
+    fg._generate_photo_fcpxml("test", items, str(path))
+    script = path.parent / "fix_timeline_paths.sh"
+    assert script.stat().st_mode & 0o777 == 0o755
+    script.chmod(0o775)  # так файл получается при umask 0002
+
+    def foreign_chmod(self, mode):
+        raise PermissionError(1, "Operation not permitted", str(self))
+    monkeypatch.setattr(Path, "chmod", foreign_chmod)
+    fg._generate_photo_fcpxml("test", items, str(path))
+    assert script.is_file()

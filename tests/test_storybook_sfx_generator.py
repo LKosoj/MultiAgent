@@ -203,3 +203,17 @@ def test_failed_sfx_step_preserves_all_existing_tracks(project, monkeypatch):
     assert manifest['audio_tracks'] == tracks
     assert manifest['sfx_status'] == 'error'
     assert json.loads((project / '98_audio/sfx_manifest.json').read_text())['audio_tracks'] == [tracks[0]]
+
+
+def test_sfx_longer_than_scene_rest_is_trimmed_to_scene_end(project, monkeypatch):
+    # Пересчёт раскадровки укорачивает кадры: заданная длина звука не должна ронять шаг.
+    _write(project / "91_screenplay/screenplay.json", {"screenplay": [
+        {"scene_number": 2, "sfx": [{"prompt": "Мотор пылесоса", "shot_number": 6, "duration": 4}]}]})
+    _write(project / "97_shots/shots.json", {"items": [
+        {"scene_number": 2, "shot_number": 5, "start_s": 38.2, "end_s": 40.0},
+        {"scene_number": 2, "shot_number": 6, "start_s": 40.0, "end_s": 41.8}]})
+    calls = []
+    monkeypatch.setattr(sfx.requests, "post", lambda url, **kwargs: calls.append(kwargs["json"]) or SimpleNamespace(
+        content=b"mp3-bytes", headers={"Content-Type": "audio/mpeg"}, raise_for_status=lambda: None))
+    assert sfx.storybook_sfx_generator_tool("session", "project", series_id="series")["status"] == "success"
+    assert calls[0]["duration"] == pytest.approx(1.8)

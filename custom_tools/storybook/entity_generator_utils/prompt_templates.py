@@ -1,6 +1,27 @@
 from typing import Dict, Any, List, Optional
 
 
+LOCATION_REFERENCE_RULES = (
+    "Create a canonical reference sheet using the supplied generation-specific location description. "
+    "Target location description takes priority. Respect its stated time, conditions and visual style. "
+    "Take spatial details only from that description and its declared references; do not copy another location. "
+    "Show the location without characters. "
+    "FORMAT INSTRUCTION: Create a LOCATION SHEET / ARCHITECTURAL VISUALIZATION. "
+    "First establish one top-down plan of the location, then derive every perspective view from that exact plan. "
+    "Use 4 panels in this order:\n"
+    "1. Top Left: Top-down spatial plan. This is the spatial source of truth for all remaining panels.\n"
+    "2. Top Right: Wide establishing shot derived from the plan\n"
+    "3. Bottom Left: Low-angle perspective derived from the same plan\n"
+    "4. Bottom Right: Key detail or side view\n"
+    "Ensure ALL panels show the EXACT SAME location with consistent lighting and style. "
+    "Identify the fixed spatial elements actually present in the supplied location description. "
+    "Preserve their count, relative positions, orientation and proportions established in the plan. "
+    "Do not invent elements absent from that description merely to satisfy the reference-sheet format. "
+    "Only the camera changes: never mirror, move, resize, add or remove those elements to fit a new view. "
+    "Occlusion is allowed; relocating hidden objects is not. Check every view against the plan before completing the sheet."
+)
+
+
 def get_character_nature(entity_data: Dict[str, Any]) -> str:
     """
     Универсальная классификация типа персонажа без хардкода под конкретные виды.
@@ -89,7 +110,7 @@ def build_canon_image_prompt(entity_type: str, entity_data: Dict[str, Any], cons
         base_prompt = f"Create canonical reference image of character '{entity_name}'. "
         base_prompt += "Show ONLY the described entity against neutral background. Respect whether its role describes an individual or a collective group. For a group, show several members together, not a single representative. "
         base_prompt += f"CRITICAL: Character '{entity_name}' must be VISUALLY DISTINCT and UNIQUE from other characters. "
-        base_prompt += "Use reference images ONLY for drawing technique and material texture, NOT for character appearance or surroundings. The historical period and environment context below govern clothing and props; keep the neutral background. "
+        base_prompt += "Use reference images ONLY for drawing technique and material texture, NOT for character appearance or surroundings. The historical period and environment context below guide attire, not staging or surroundings; keep the neutral background. "
         nature = get_character_nature(entity_data)
         constraints = _nature_constraints_text(entity_name, nature)
         if constraints:
@@ -138,10 +159,10 @@ def build_canon_image_prompt(entity_type: str, entity_data: Dict[str, Any], cons
         
         # CHARACTER SHEET: multi-view для лучшего reference matching
         base_prompt += "\n\nFORMAT INSTRUCTION: For an individual, create a CHARACTER SHEET with multiple views of the SAME character:\n"
-        base_prompt += "1. Face close-up, front or 3/4 view\n"
+        base_prompt += "1. Face close-up, large and sharp, front or 3/4 view, occupying approximately half the sheet width; facial identity must be clearly readable, not a tiny head above a full body.\n"
         base_prompt += "2. FULL-BODY FRONT view, head-to-boots\n"
         base_prompt += "3. FULL-BODY BACK view, head-to-boots\n"
-        base_prompt += "Use a neutral solid-color background. Ensure ALL views show the EXACT SAME character, costume, proportions, features and style.\n"
+        base_prompt += "Depict the character directly as an identity reference, not as its in-story presentation. Narrative role, setting, presentation frames and contextual objects must not become scenery or containers around the character. Keep only objects intrinsic to the character itself or worn as clothing/accessories. Use a neutral solid-color background. Ensure ALL views show the EXACT SAME character, costume, proportions, features and style.\n"
         base_prompt += "For a collective entity, instead create a GROUP SHEET: several members together, their shared silhouette rhythm and group poses. Preserve anonymous or indistinct faces when specified; do not replace the group with one person's portraits or close-ups.\n"
 
         base_prompt += f"\nCRITICAL INSTRUCTION: Create character '{entity_name}' with ALL these SPECIFIC features. Do NOT blend or average features from reference images. Each character MUST be visually unique and easily distinguishable."
@@ -150,14 +171,8 @@ def build_canon_image_prompt(entity_type: str, entity_data: Dict[str, Any], cons
         base_prompt += f"\n\nNEGATIVE (avoid): unrelated characters, blended features from other entities, inconsistent canonical features between views"
     
     else:  # location
-        base_prompt = f"Create canonical reference image of location '{entity_name}'. "
-        if entity_data.get("historical_period"):
-            base_prompt = f"Historical setting: {entity_data['historical_period']}. " + base_prompt
-        base_prompt += "Show ONLY this specific location WITHOUT any characters. "
-        base_prompt += f"CRITICAL: Location '{entity_name}' must be VISUALLY DISTINCT and UNIQUE from other locations. "
-        base_prompt += "Use reference images ONLY for drawing technique and material texture, NOT for location appearance. Target location description takes priority for historical period, architecture, weather, season, lighting, palette and objects. Do not copy another location's setting. "
-        base_prompt += "Treat the specified historical period as a literal date constraint, not merely a vintage aesthetic: buildings, landmarks and objects, including their architectural details and emblems in the distant background, must be shown as they existed in that period, not in their present-day form. For a background detail whose dating is uncertain, choose a neutral period-compatible detail instead. "
-        base_prompt += f"Location '{entity_name}' must have these SPECIFIC and UNIQUE features:\n"
+        base_prompt = LOCATION_REFERENCE_RULES
+        base_prompt += f"\n\nLOCATION INPUT FOR THIS GENERATION:\nName: {entity_name}\n"
         
         # Динамически добавляем все атрибуты локации (кроме name и reference_image_path)
         # Структурируем атрибуты по важности
@@ -180,16 +195,6 @@ def build_canon_image_prompt(entity_type: str, entity_data: Dict[str, Any], cons
                 field_name = key.replace('_', ' ').title()
                 base_prompt += f"\n- {field_name}: {value}"
         
-        # === СПЕЦИАЛЬНАЯ ИНСТРУКЦИЯ ДЛЯ LOCATION SHEET ===
-        base_prompt += "\n\nFORMAT INSTRUCTION: Create a LOCATION SHEET / ARCHITECTURAL VISUALIZATION. "
-        base_prompt += "Split the image into 4 panels showing different angles of the SAME location:\n"
-        base_prompt += "1. Top Left: Wide establishing shot\n"
-        base_prompt += "2. Top Right: Cinematic low angle\n"
-        base_prompt += "3. Bottom Left: Top-down floor plan view\n"
-        base_prompt += "4. Bottom Right: Key detail or side view\n"
-        base_prompt += "Ensure ALL panels show the EXACT SAME location with consistent lighting and style."
-        
-        base_prompt += f"\n\nCRITICAL INSTRUCTION: Create location '{entity_name}' with ALL these SPECIFIC features. Do NOT blend or average features from reference images. Each location MUST be visually unique and easily distinguishable."
     
     # Добавляем только релевантные правила
     relevant_rules = [rule["rule"] for rule in consistency_rules 
@@ -260,6 +265,7 @@ def get_character_description_system_prompt(main_characters_summary_text: str) -
 ТРЕБОВАНИЯ:
 - Если персонаж говорит - опиши особенности речи на основе диалогов
 - Если роль второстепенная - сделай описание менее детальным
+- immutable_attributes описывают только собственную внешность. Место в сцене, способ показа персонажа и взаимодействия с окружением записывай в role/environment_context, а не в неизменные черты.
 - entity_nature заполняй строго по смыслу: если в сценарии явно "человек" — human; если антропоморфное животное — anthropomorphic_animal; если обычное животное — animal; если робот/андроид — robot; иначе other
 - species указывай только для animal/anthropomorphic_animal (например: badger/fox/cat), иначе оставляй пустым
 - Стиль должен соответствовать главным персонажам"""

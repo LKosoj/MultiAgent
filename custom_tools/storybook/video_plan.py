@@ -14,10 +14,19 @@ from pathlib import Path
 import requests
 
 from . import video_run_config
-from .project_paths import safe_storybook_project_dir
+from .project_paths import existing_reference_path, safe_storybook_project_dir
 from .video_budget import reserve_budget
 from .video_generator_common import parse_duration_seconds_from_timing
 from .video_prompt_rules import VIDEO_PROMPT_RULES, finalize_video_prompt
+
+
+def _load_video_plan(project_id, path):
+    from .screenplay_shots_generator import _scope_cached_shot_paths
+    original = json.loads(path.read_text())
+    scoped = _scope_cached_shot_paths(project_id, original)
+    if scoped != original:
+        path.write_text(json.dumps(scoped, ensure_ascii=False, indent=2))
+    return scoped
 
 
 def _load_speech_for_planning(project_id, base):
@@ -96,7 +105,7 @@ def _require_current_video_plan(project_id, base, speech, items, shot_keys=None)
     path = base / '97_shots/video_plan.json'
     try:
         selected = set(shot_keys) if shot_keys is not None else {_key(item) for item in _starts(items)}
-        plan = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+        plan = _load_video_plan(project_id, path) if path.is_file() else {}
         units = plan.get('units', [])
         if not isinstance(units, list):
             raise ValueError('invalid units')
@@ -218,19 +227,21 @@ def _speech_fragment(item):
 def _fingerprint(items, language='ru', catalog=None, seed=None, base=None, speech=None, project_id=None):
     from .video_contract import _active_video_tool_name
     from .style_keeper import _STYLE_REFERENCE_INSTRUCTION
-    from .background_references import _reference_path
+    from .background_references import _reference_candidate
     prefix = 'AITUNNEL' if _active_video_tool_name() == 'video_generator_aitunnel_tool' else 'ROUTERAI'
-    assets = {str(_reference_path(base, entry['reference_image_path']))
+    # Ключ — путь-кандидат (до переноса), содержимое читаем из разрешённого файла
+    assets = {str(candidate): resolved
               for item in items for field in ('characters', 'locations') for entry in item.get(field) or []
-              if base is not None and entry.get('reference_image_path')}
-    return _digest({'items': [_planning_shot(i) for i in _starts(items)], 'speech': speech, 'language': language, 'reference_prompt_version': 9,
+              if base is not None and entry.get('reference_image_path')
+              for candidate, resolved in [_reference_candidate(base, entry['reference_image_path'])]}
+    return _digest({'items': [_planning_shot(i) for i in _starts(items)], 'speech': speech, 'language': language, 'reference_prompt_version': 10,
                     'styles': {key: style['prompt'] for key, style in (catalog or {}).get('styles', {}).items()},
                     'style_image_model': os.getenv('IMG2IMG_MODEL') or os.getenv('VSEGPT_IMG2IMG_MODEL'), 'seed': seed,
                     'style_reference_instruction': _STYLE_REFERENCE_INSTRUCTION,
                     'style_source_frames': [(_key(item), item.get('shot_type'), item.get('style_id'),
                                              item.get('characters'), item.get('locations')) for item in items],
-                    'style_source_images': {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
-                                            if Path(path).is_file() else None for path in assets},
+                    'style_source_images': {key: hashlib.sha256(path.read_bytes()).hexdigest()
+                                            if path.is_file() else None for key, path in assets.items()},
                     'model': video_run_config.video_setting('VIDEO_MODEL', prefix.lower(), project_id if project_id else (base.name if base else None)) or None,
                     'provider_tool': _active_video_tool_name(),
                     'resolution': video_run_config.video_setting('RESOLUTION', prefix.lower(), project_id if project_id else (base.name if base else None)) or None})
@@ -243,7 +254,7 @@ def apply_video_plan(project_id, items):
     path = safe_storybook_project_dir(project_id) / '97_shots/video_plan.json'
     if not path.is_file():
         return items
-    units = json.loads(path.read_text()).get('units', [])
+    units = _load_video_plan(project_id, path).get('units', [])
     starts = {_key(i): i for i in _starts(items)}
     order = list(starts)
     replacements, covered = {}, set()
@@ -292,6 +303,10 @@ def reference_request(item, model, seed, provider_name='routerai'):
     from .video_generator_aitunnel_media import _infer_aspect_ratio
     model = item.get('video_model') or model
     paths = item['reference_image_paths']
+    if item.get('project_id'):
+        # Референс мог быть перенесён в каталог: путь в данных может быть старым.
+        base = safe_storybook_project_dir(item['project_id'])
+        paths = [existing_reference_path(base, path) for path in paths]
     hashes = [hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in paths]
     payload = {'model': model, 'prompt': item['video_prompt'],
                'duration': item.get('video_duration_s') or (math.ceil(_duration(item)) if item.get('speech_source_path') else int(round(_duration(item)))),
@@ -406,7 +421,7 @@ def generate_reference_video(item, api_key, model, seed, store, model_catalog,
         os.replace(temporary, output)
         return dict(success=True, video_path=str(output), scene_number=item['scene_number'],
                     shot_number=item['shot_number'], model=model, error=None)
-    if item.get('speech_source_path'):
+    if item.get('speech_source_path') or not item.get('video_duration_s'):
         durations = [value for value in config['supported_durations'] if value >= _duration(item)]
         if not durations:
             raise ValueError('Speech fragment exceeds supported video duration; split at a natural pause')
@@ -613,7 +628,7 @@ def _split_action(group, config):
             duration += _duration(group[index])
             if duration > limit:
                 break
-            if duration in allowed:
+            if any(duration <= value <= limit for value in allowed):
                 end = index + 1
         if end is None:
             raise ValueError(f'Action shot {_key(group[cursor])} cannot fit supported video durations up to {limit}s')
@@ -627,7 +642,7 @@ def select_image_items(project_id, items):
     path = safe_storybook_project_dir(project_id) / '97_shots/video_plan.json'
     if not path.is_file():
         return items
-    units = [u for u in json.loads(path.read_text()).get('units', []) if u.get('start_reference_path')]
+    units = [u for u in _load_video_plan(project_id, path).get('units', []) if u.get('start_reference_path')]
     if not units:
         return items
     by_key = {key: u for u in units for key in u['shot_keys']}
@@ -672,6 +687,28 @@ def photo_items_for_plan(project_id, items):
     return result
 
 
+_REFERENCE_ROLE_TEXT = {'character_appearance': 'character appearance',
+                        'character_state': 'character current appearance',
+                        'location': 'location materials and architecture',
+                        'continuity': 'continuity reference'}
+
+
+def _reference_lines(state, count):
+    """Каждый референс отдельной строкой «Image N — кто: роль»: модель не путает, что откуда брать."""
+    labels = {ref['image']: ': '.join(filter(None, [ref.get('subject'), _REFERENCE_ROLE_TEXT[ref['role']]]))
+              for ref in state.get('reference_images') or []}
+    labels.update({landmark['image_number']: f"{landmark['name']}: landmark object construction"
+                   for landmark in state.get('landmark_image_roles') or []})
+    for key, text in [('style_image_number', 'visual style only: medium, palette, lighting, line and surface'),
+                      ('initial_image_number', 'opening world state and character placement'),
+                      ('continuity_image_number', 'earlier interrupted action to continue'),
+                      ('final_image_number', 'required end state of the clip')]:
+        if state.get(key):
+            labels[state[key]] = text
+    return '\n'.join(f"Image {number} — {labels.get(number, _REFERENCE_ROLE_TEXT['continuity'])}"
+                     for number in range(1, count + 1))
+
+
 def prepare_reference_prompt(base, group, state, refs, language='ru', final_image=None,
                              initial_image=None, continuity_image=None, style_image=None):
     """Bind scene-state images and a separate saved style reference."""
@@ -685,6 +722,15 @@ def prepare_reference_prompt(base, group, state, refs, language='ru', final_imag
         str(Path(last['video_path']).parent), last['scene_number'], last['shot_number'], 'end')
     refs = list(refs)
     state = dict(state)
+    catalog_path = base / '30_style/image_styles.json'
+    style = None
+    if catalog_path.is_file():
+        from .style_keeper import resolve_image_style_id
+        catalog = json.loads(catalog_path.read_text())
+        binding = f"{first['scene_number']}:{first['shot_number']}:start"
+        style_id = resolve_image_style_id(catalog, binding, first.get('locations'), first.get('style_id'))
+        style = catalog['styles'][style_id]['prompt']
+        state['visual_style'] = style
     for role, path in [('style_image_number', style_image), ('initial_image_number', initial_image),
                        ('continuity_image_number', continuity_image)]:
         if path:
@@ -705,7 +751,8 @@ def prepare_reference_prompt(base, group, state, refs, language='ru', final_imag
         if entity['kind'] == 'landmark' and entity.get('reference_path') in refs}.values())
     response = call_openai_api(prompt=json.dumps(state, ensure_ascii=False), model=model_ultimate,
         system_prompt=(f'Write one concise video prompt in {language} for one continuous shot. '
-                       'Bind every reference explicitly using Image N and its assigned role. '
+                       'A separate list already binds each Image N to its subject and role, one per line; '
+                       'do not repeat that list, refer to images as Image N where needed. '
                        'If final_image_number is provided, reach its required visual state by the end: '
                        'preserve its environment geometry, object condition and drawn treatment. '
                        'It is an ordinary image reference, not an API last_frame; do not mention API '
@@ -724,6 +771,11 @@ def prepare_reference_prompt(base, group, state, refs, language='ru', final_imag
                        'direction and achieved progress, while respecting the current fragment camera and lighting. '
                        'Continuity states govern movable props and shared landmark identity throughout the clip. '
                        'Preserve current_video_prompt motion choices when adapting existing directions; '
+                       'visual_style is the authoritative bound project style: replace conflicting legacy style '
+                       'wording while preserving actions. Supplied duration_s and shot intervals are authoritative; '
+                       'retime stale time marks from current_video_prompt to these intervals without changing event order. '
+                       'If generation_duration_s is longer, achieve the end state by duration_s and preserve it '
+                       'with natural ongoing motion during the remaining provider padding. '
                        'do not restore outdated actions from source descriptions. Current physical continuity '
                        'and recorded continuity events still govern any necessary correction. '
                        'Treat must_not_show as phase-scoped constraints, not blanket prohibitions for the whole clip. '
@@ -757,15 +809,9 @@ def prepare_reference_prompt(base, group, state, refs, language='ru', final_imag
                        + '- Here the main event is the one continuous action across the supplied shots; '
                          'keep every required event at its supplied time.\n'),
         max_tokens=32768, temperature=0.2, response_format={'type': 'json_object'})
-    prompt = finalize_video_prompt(parse_llm_json(response)['video_prompt'], group)
-    catalog_path = base / '30_style/image_styles.json'
-    if catalog_path.is_file():
-        catalog = json.loads(catalog_path.read_text())
-        first = group[0]
-        binding = f"{first['scene_number']}:{first['shot_number']}:start"
-        from .style_keeper import resolve_image_style_id
-        style_id = resolve_image_style_id(catalog, binding, first.get('locations'), first.get('style_id'))
-        style = catalog['styles'][style_id]['prompt']
+    prompt = _reference_lines(state, len(refs)) + '\n\n' + finalize_video_prompt(
+        parse_llm_json(response)['video_prompt'], group)
+    if style:
         prompt = style + '\n\n' + prompt
     return prompt, refs
 
@@ -814,7 +860,7 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
             catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding='utf-8')
     target = base / '97_shots/video_plan.json'
     source_hash = _fingerprint(items, language, catalog, shots.get('seed'), base, speech, project_id)
-    previous_plan = json.loads(target.read_text()) if target.is_file() else {}
+    previous_plan = _load_video_plan(project_id, target) if target.is_file() else {}
     scope = set(shot_keys) if shot_keys is not None else {_key(i) for i in _starts(items)}
     known_keys = {_key(i) for i in _starts(items)}
     if not scope or not scope.issubset(known_keys):
@@ -911,6 +957,9 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
                 state_shots.append(summary)
             state = {'duration_s': offset, 'shots': state_shots,
                      'opening': state_shots[0]['opening'], 'ending': state_shots[-1]['ending']}
+            supported = [value for value in config['supported_durations'] if value >= offset]
+            if supported:
+                state['generation_duration_s'] = min(supported)
             state['reference_images'] = _reference_roles(base, chunk, refs)
             style_id = chunk[0]['style_id']
             # Эталон стиля нарисован с героем: в пустой план он подмешал бы персонажа.
@@ -940,8 +989,10 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
                 style_id=style_id, style_reference_path=style_image,
                 continues_from_shot=_key(chunks[number - 1][-1]) if number else (_key(resumed) if resumed is not None else None),
                 seed=shots.get('seed'), model=model, resolution=video_run_config.video_setting('RESOLUTION', prefix.lower(), project_id) or '480p'))
+            supported = [value for value in config['supported_durations'] if value >= offset]
+            if supported:
+                planned[-1]['video_duration_s'] = min(supported)
             if schedule:
-                supported = [value for value in config['supported_durations'] if value >= offset]
                 if not supported:
                     from .shot_speech_timing import split_speech_interval
                     planned[-1]['speech_supported_durations'] = config['supported_durations']
@@ -990,7 +1041,7 @@ def adopt_reference_test(project_id, directory, shot_keys):
     if unit['duration_s'] != context['duration_seconds']:
         raise ValueError('Accepted test duration differs from covered shots')
     for ref in context['references']:
-        if hashlib.sha256(Path(ref['path']).read_bytes()).hexdigest() != ref['sha256']:
+        if hashlib.sha256(Path(existing_reference_path(base, ref['path'])).read_bytes()).hexdigest() != ref['sha256']:
             raise ValueError('Test reference changed')
     output.parent.mkdir(parents=True, exist_ok=True)
     if not output.is_file():

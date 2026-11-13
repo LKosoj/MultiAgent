@@ -32,6 +32,16 @@ describe("storybook client", () => {
     expect(client.thumbUrl("p", "a.png", 128)).toBe("http://h/v1/storybook/projects/p/series/s%201/thumb?path=a.png&size=128&t=tok");
   });
 
+  it("общие образцы серии идут серийным роутом с неизменённым путём", async () => {
+    const transport = vi.fn().mockResolvedValue(tokenReply(Date.now() / 1000 + 3600));
+    const client = createStorybookClient(transport, { apiBase: "http://h", seriesId: "s1" });
+    await client.ensureMediaToken("p");
+    const path = "shared/references/characters/abc.png";
+    const enc = "shared%2Freferences%2Fcharacters%2Fabc.png";
+    expect(client.mediaUrl("p", path)).toBe(`http://h/v1/storybook/projects/p/series/s1/media?path=${enc}&t=tok`);
+    expect(client.thumbUrl("p", path, 128)).toBe(`http://h/v1/storybook/projects/p/series/s1/thumb?path=${enc}&size=128&t=tok`);
+  });
+
   it("status:error превращает в StudioError с кодом", async () => {
     const transport = vi.fn().mockResolvedValue({
       status: "error",

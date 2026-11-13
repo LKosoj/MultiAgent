@@ -579,10 +579,18 @@ def _continuity_parser(src: str) -> Callable[[dict, dict], tuple[list[Finding], 
             try:
                 group = parse_shot_keys(rid)
                 found: list[Finding] = []
+                auto = _dict(rec.get("auto_accepted"))
                 if rec.get("passed") is True:
                     meta["passed"] += 1
-                else:
-                    meta["failed"] += 1
+                if auto:
+                    # Принята после неудачных ремонтов: замечания остаются предупреждениями.
+                    found.append(_finding(src, "warning", "continuity_auto_accepted",
+                                          f"Группа шотов {rid} принята автоматически после "
+                                          f"{auto.get('failed_rounds')} неудачных ремонтов.", file,
+                                          related=group, details={"group": rid}))
+                if rec.get("passed") is not True or auto:
+                    if rec.get("passed") is not True:
+                        meta["failed"] += 1
                     for verdict in _list(rec.get("verdicts")):
                         v = _dict(verdict)
                         meta["dismissed"] += len(_list(v.get("dismissed")))
@@ -596,7 +604,7 @@ def _continuity_parser(src: str) -> Callable[[dict, dict], tuple[list[Finding], 
                                 continue
                             seen.add(mark)
                             found.append(_finding(
-                                src, "error", "continuity_violation",
+                                src, "warning" if auto else "error", "continuity_violation",
                                 observed or "Нарушение непрерывности без описания.", file,
                                 shot_key=key, related=() if key else group, phase=phase,
                                 details={"required": _clean_text(vd.get("required")),
@@ -610,7 +618,7 @@ def _continuity_parser(src: str) -> Callable[[dict, dict], tuple[list[Finding], 
                             seen.add(mark)
                             found.append(_finding(src, "warning", "continuity_uncertain", text, file,
                                                   related=group, details={"group": rid}))
-                    if not found:
+                    if not found and not auto:
                         found.append(_finding(src, "error", "continuity_failed",
                                               f"Группа шотов {rid} не принята проверкой.", file,
                                               related=group, details={"group": rid}))

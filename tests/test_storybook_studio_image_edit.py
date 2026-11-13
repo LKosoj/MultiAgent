@@ -733,3 +733,14 @@ def test_regenerate_start_rejects_bool_confirm(project):
     err = bad("regenerate_start", what="images", launcher="backend", expected_plan_digest="x",
               shot_keys=["1-1"], confirm_cost_rub=True)
     assert err["code"] == "invalid_argument"
+
+
+def test_shared_reference_as_sample_ok_but_not_as_target(project):
+    shared = project.parents[1] / "shared/references/characters"
+    shared.mkdir(parents=True)
+    (shared / "a.png").write_bytes(png())
+    rel = "shared/references/characters/a.png"
+    r = preview(path="50_images/page_001/a.png", reference_paths=[rel])
+    assert [x["path"] for x in r["references"]] == [rel]
+    err = bad("image_edit_preview", path=rel)
+    assert err["code"] == "invalid_argument" and str(project) not in json.dumps(err)

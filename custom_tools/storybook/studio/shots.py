@@ -436,6 +436,7 @@ class _Ctx:
         self.units = _cached(self.root / PLAN_REL, _load_units) or {}
         self.hook_errors: list[str] = []
         self._cores: dict[str, dict] = {}
+        self._ref_cache: dict[str, tuple[str | None, str | None]] = {}
         self._gen: bool | None = None
         self._active: bool | None = None
         self._review: dict | None | bool = False
@@ -455,6 +456,50 @@ class _Ctx:
             return None
         path = self.root / rel
         return fp.file_token(path) if self.inside(path) else None
+
+    def resolve_ref(self, rel: str | None) -> tuple[str | None, str | None]:
+        """Референс шота -> (путь для показа, токен файла). Файл мог переехать в shared/references:
+        тогда его находим по каталогу, а старый путь остаётся лишь алиасом."""
+        if not rel or rel.startswith("/") or ".." in rel.split("/") or "\0" in rel:
+            return rel, None
+        if rel in self._ref_cache:
+            return self._ref_cache[rel]
+        series = self.root.parent.name == "series"
+        project_root = self.root.parent.parent if series else self.root
+        candidates = [self.root / rel] + ([project_root / rel] if series else [])
+        sid = self.root.name
+        if series and rel.startswith("20_bible/references/"):  # единственный алиас записи — под _series/<sid>
+            tail = rel[len("20_bible/references/"):]
+            candidates.append(project_root / "20_bible/references/_series" / sid / tail)
+        found: Path | None = None
+        try:
+            from custom_tools.storybook.reference_catalog import resolve_reference
+        except ImportError:  # pragma: no cover
+            resolve_reference = None
+        for candidate in candidates:
+            if candidate.is_file() and candidate.is_relative_to(self.root):
+                found = candidate  # внутри серии: как есть
+                break
+            if resolve_reference is None:
+                continue
+            try:  # корень проекта и алиасы: только через каталог, файл «на месте» не доказательство
+                resolved = resolve_reference(self.root, candidate)
+            except (ValueError, OSError):  # запись не привязана к серии: файла для неё нет
+                continue
+            if resolved.is_file():
+                found = resolved
+                break
+        display, token = rel, None
+        if found is not None:
+            real = Path(os.path.realpath(found))
+            shared = Path(os.path.realpath(project_root / "shared/references"))
+            if real.is_relative_to(shared):
+                display = "shared/references/" + real.relative_to(shared).as_posix()
+                token = fp.file_token(real)
+            elif self.inside(found) or real.is_relative_to(Path(os.path.realpath(project_root))):
+                token = fp.file_token(found)
+        self._ref_cache[rel] = (display, token)
+        return display, token
 
     def scan_files(self, pair: _Pair) -> dict[str, dict | None]:
         found: dict[str, dict | None] = {"start": None, "end": None, "video": None}
@@ -547,10 +592,11 @@ class _Ctx:
         for raw in item["refs"]:
             rel = fp.ref_rel(raw)
             if rel and not (skip_prefix and rel.startswith(skip_prefix)):
-                entries.append([rel, self.token_of_rel(rel)])
+                # ключ по пути из шота: перенос файла не меняет его, меняется только токен содержимого
+                entries.append([fp.ref_key(rel), self.resolve_ref(rel)[1]])
         bg = fp.ref_rel(item["bg"]) if item["bg"] else None
         if bg:
-            entries.append(["bg:" + bg, self.token_of_rel(bg)])
+            entries.append(["bg:" + fp.ref_key(bg), self.resolve_ref(bg)[1]])
         return entries
 
     def _image_components(self, item: dict, skip_prefix: str | None) -> dict:
@@ -792,7 +838,8 @@ def _ref_view(ctx: _Ctx, item: dict | None) -> list[dict]:
     out = []
     for raw in (item or {}).get("refs", []):
         rel = fp.ref_rel(raw)
-        out.append({"path": rel, "exists": bool(rel and ctx.token_of_rel(rel))})
+        display, token = ctx.resolve_ref(rel)
+        out.append({"path": display, "exists": bool(token)})
     return out
 
 

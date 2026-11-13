@@ -146,7 +146,7 @@ def shots_from_chains_payload(payload: Optional[Dict[str, Any]]) -> List[Dict[st
             try:
                 scene_number_int = int(scene_number)
                 shot_number_int = int(shot.get("shot_number"))
-                duration_s_int = int(shot.get("duration_s"))
+                duration_s = float(shot.get("duration_s"))
             except (TypeError, ValueError):
                 continue
             shots.append(
@@ -154,7 +154,7 @@ def shots_from_chains_payload(payload: Optional[Dict[str, Any]]) -> List[Dict[st
                     "scene_number": scene_number_int,
                     "shot_number": shot_number_int,
                     "chain_id": chain_id,
-                    "duration_s": duration_s_int,
+                    "duration_s": duration_s,
                     "is_first_in_chain": idx == 0,
                 }
             )
@@ -217,8 +217,8 @@ def escape_drawtext_text(text: str) -> str:
 # =============================================================================
 
 
-def shot_burnin_summary_text(scene_number: int, shot_number: int, duration_s: int) -> str:
-    return f"SC {int(scene_number):02d}·SH {int(shot_number):02d}·{int(duration_s)}s"
+def shot_burnin_summary_text(scene_number: int, shot_number: int, duration_s: float) -> str:
+    return f"SC {int(scene_number):02d}·SH {int(shot_number):02d}·{duration_s:g}s"
 
 
 def build_shot_burnin_line1_filter(
@@ -481,7 +481,7 @@ def _run(project_id: str, burnin: bool) -> Dict[str, Any]:
     burnin_path = preview_dir / "blockout_all_burnin.mp4"
     burnin_path.unlink(missing_ok=True)
 
-    total_duration_s = sum(int(seg["duration_s"]) for seg in included)
+    total_duration_s = sum(float(seg["duration_s"]) for seg in included)
     ffmpeg_bin = _find_ffmpeg()
     concat_ok = False
     burnin_built = False
@@ -672,7 +672,15 @@ def _crash_fallback(project_id: str, exc: Exception) -> Dict[str, Any]:
 # =============================================================================
 
 
-def blockout_preview_tool(session_id: str, project_id: str, burnin: bool = True, enable: bool = True) -> Dict[str, Any]:
+def blockout_preview_tool(session_id: str, project_id: str, burnin: bool = True, enable: bool = False) -> Dict[str, Any]:
+    """Assemble the blockout preview and contact sheets.
+
+    Args:
+        session_id: Pipeline execution identifier.
+        project_id: Storybook project identifier.
+        burnin: Whether to create a preview with frame labels.
+        enable: Whether to build the preview.
+    """
     del session_id
     if not _as_bool(enable):
         try:

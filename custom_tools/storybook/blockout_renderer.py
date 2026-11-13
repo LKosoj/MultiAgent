@@ -843,7 +843,7 @@ def blockout_renderer_tool(
     resolution: str = "1280x720",
     jobs: int = 0,
     scope: str = "all",
-    enable: bool = True,
+    enable: bool = False,
     shots: str = "",
     quiet: bool = False,
     engine: str = "eevee",
@@ -868,6 +868,18 @@ def blockout_renderer_tool(
     since ``color_type='SINGLE'`` rules out a pixel-based check) is
     speculative work beyond this step's accepted scope; left for a later
     pass when an acceptance criterion actually requires them.
+
+    Args:
+        session_id: Pipeline execution identifier.
+        project_id: Storybook project identifier.
+        fps: Requested blockout frame rate.
+        resolution: Requested frame size as WIDTHxHEIGHT.
+        jobs: Requested number of rendering workers.
+        scope: Scope of frames and clips to render.
+        enable: Whether to render the blockout.
+        shots: Optional shot selection.
+        quiet: Whether to suppress Blender output.
+        engine: Blender rendering engine.
     """
     del session_id, jobs
 
@@ -1023,7 +1035,7 @@ def blockout_renderer_tool(
 
         shots_meta = []
         for shot in chain_shots:
-            duration_s = int(shot["duration_s"])
+            duration_s = float(shot["duration_s"])
             n_render = blockout_common.n_render(duration_s, fps_int)
             chain_frame_start = blockout_common.frame_blender(float(shot["t_start"]), fps_int)
             shot_key = f"scene_{chain_spec.get('scene_number'):02d}_shot_{shot.get('shot_number'):02d}"
@@ -1121,7 +1133,7 @@ def blockout_renderer_tool(
             shot_number = shot.get("shot_number")
             meta = shots_meta[idx]
             shot_result = results_by_key.get(meta["shot_key"])
-            duration_s = int(shot["duration_s"])
+            duration_s = float(shot["duration_s"])
             n_render = meta["n_render"]
             n_video = blockout_common.n_video(duration_s, fps_int)
 

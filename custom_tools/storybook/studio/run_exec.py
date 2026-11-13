@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import copy
 import importlib
+import json
 import logging
 import os
 import socket
@@ -726,6 +727,12 @@ def _build_context(engine, plan: dict, prepared: dict):
         if plan.get("reuse_workflow_id"):
             variables = {**copy.deepcopy(getattr(base, "variables", None) or {}), **variables}
     outputs.update(copy.deepcopy(prepared.get("step_outputs") or {}))
+    selected = set(plan["steps_to_run"])
+    if (plan["mode"] in ("single_step", "from_step")
+            and "character_reference_states" in selected and "shots_prompt_qa" not in selected):
+        shots_path = project_paths.safe_storybook_project_dir(project_id) / "97_shots/shots.json"
+        if shots_path.is_file():
+            outputs["shots_prompt_qa"] = json.loads(shots_path.read_text(encoding="utf-8"))
     if source:
         metadata["source_workflow_id"] = source
     if plan["mode"] == "single_step":

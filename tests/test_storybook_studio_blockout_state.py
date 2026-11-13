@@ -45,7 +45,7 @@ def manifest_path(env, scene=1, shot=1):
 
 def test_fresh_project(env):
     r = state()
-    assert r["built"] and r["empty_reason"] is None and r["enabled"] is True
+    assert r["built"] and r["empty_reason"] is None and r["enabled"] is False
     assert r["summary"] == {"total": 3, "rendered": 3, "stale": 0, "missing": 0, "junction_error": 0, "p10": 0}
     assert [s["scene_number"] for s in r["scenes"]] == [1, 2]
     assert r["scenes"][0]["chains"][0]["shot_keys"] == ["1-1", "1-2"]

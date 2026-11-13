@@ -4,6 +4,10 @@ category: "storybook"
 source_type: custom_function
 implementation_source: custom_tools.storybook.music_planner.music_planner_tool
 parameters:
+  - name: enable
+    type: bool
+    description: "Prepare the plan only when music is enabled"
+    required: false
   - name: session_id
     type: str
     description: "Execution trace/session identifier"
