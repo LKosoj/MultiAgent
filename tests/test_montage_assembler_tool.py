@@ -35,6 +35,13 @@ def test_audio_check_rejects_short_or_late_audio_stream():
     assert montage_assembler._audio_check(full, volume, True, 13.0)["passed"]
 
 
+
+def test_audio_check_measures_coverage_against_rendered_video():
+    # Видео короче плана в пределах допуска длины: звук должен покрывать само видео.
+    probe = _probe_payload(67.875, with_audio=True)
+    probe["streams"][1]["duration"] = "67.752"
+    assert montage_assembler._audio_check(probe, {"mean_volume_db": -22.0}, True, 72.666)["passed"]
+
 def test_audio_check_marks_missing_stream_coverage_unavailable():
     probe = {"format": {"duration": "13"}, "streams": [{"codec_type": "video"}, {"codec_type": "audio"}]}
 

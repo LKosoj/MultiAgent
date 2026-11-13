@@ -1436,6 +1436,8 @@ def _audio_check(
     except (TypeError, ValueError):
         start_time = None
         duration = None
+    # Длина видео сверяется с планом отдельно: звук должен покрывать само видео.
+    expected_duration = _probe_duration(final_probe) or expected_duration
     tolerance = max(0.25, expected_duration * 0.02)
     coverage_ok = (
         expected_duration <= 0

@@ -149,3 +149,65 @@ def test_long_speech_parts_reuse_jobs_and_join_without_audio(tmp_path, monkeypat
     info = json.loads(probe.stdout)
     assert abs(float(info['format']['duration']) - 8) < 0.15
     assert [stream['codec_type'] for stream in info['streams']] == ['video']
+
+
+def _speech_unit(tmp_path, speech):
+    from PIL import Image
+    ref = tmp_path / 'reference.png'
+    Image.new('RGB', (16, 16)).save(ref)
+    source = tmp_path / 'speech.wav'
+    source.write_bytes(speech)
+    return dict(scene_number=1, shot_number=1, video_mode='references', duration_s=4,
+                start_s=0, end_s=4, speech_source_path=str(source),
+                speaker_schedule=[dict(speaker_id='hero', start=0.1, end=4)],
+                video_prompt='Hero speaks.', reference_image_paths=[str(ref)],
+                video_path=str(tmp_path / 'units' / 'video.mp4'))
+
+
+def _generate_with_answers(tmp_path, monkeypatch, item, answers):
+    import shutil
+    monkeypatch.setenv('AITUNNEL_API_BASE', 'https://api.aitunnel.ru/v1')
+    Path(item['video_path']).parent.mkdir(exist_ok=True)
+    store = _ProviderJobStore(str(tmp_path / 'jobs.json'), provider_name='aitunnel')
+    calls = []
+    def post(url, **kwargs):
+        calls.append(kwargs['json'])
+        response = requests.Response()
+        response.status_code = 202
+        response._content = json.dumps({'id': f'job-{len(calls)}'}).encode()
+        return response
+    monkeypatch.setattr(vp.requests, 'post', post)
+    monkeypatch.setattr(generator, '_wait_for_video_completion_aitunnel', lambda *a, **k: {'unsigned_urls': ['https://cdn.example/result.mp4']})
+    monkeypatch.setattr(generator, '_download_video_aitunnel',
+                        lambda url, path, headers: shutil.copyfile(answers[len(calls) - 1], path))
+    result = generator._generate_single_video_aitunnel(
+        item=item, session_id='test', api_key='test', model_catalog={'wan-3.0': {
+            'supports_image_references': True, 'supported_durations': [5]}},
+        configured_model='wan-3.0', seed=None, language='ru', job_store=store, provider_name='aitunnel')
+    return result, calls, json.loads((tmp_path / 'jobs.json').read_text())['jobs']
+
+
+def test_downloaded_speech_video_is_aligned_with_speech(tmp_path, monkeypatch):
+    from test_storybook_speech_video_sync import _frame_number, _model_video, _speech
+    speech = _speech(1)
+    item = _speech_unit(tmp_path, speech)
+    answer = _model_video(tmp_path / 'answer.mp4', speech, 5, 'adelay=500:all=1')
+    result, calls, jobs = _generate_with_answers(tmp_path, monkeypatch, item, [answer])
+    assert result['success'] and len(calls) == 1
+    assert abs(_frame_number(item['video_path'], 0) - 5) <= 1
+    assert (tmp_path / 'units' / 'original' / 'video.mp4').read_bytes() == answer.read_bytes()
+    assert [job['status'] for job in jobs] == ['downloaded']
+
+
+@pytest.mark.parametrize('mode, audio_filter', [('', None), ('regenerate', 'adelay=300:all=1,atempo=0.95')])
+def test_mismatched_speech_video_is_regenerated_once(tmp_path, monkeypatch, mode, audio_filter):
+    from test_storybook_speech_video_sync import _model_video, _speech
+    monkeypatch.setenv('AITUNNEL_VIDEO_SYNC', mode)
+    item = _speech_unit(tmp_path, _speech(1))
+    voice = _speech(1) if audio_filter else _speech(9)
+    answer = _model_video(tmp_path / 'answer.mp4', voice, 5, audio_filter)
+    result, calls, jobs = _generate_with_answers(tmp_path, monkeypatch, item, [answer, answer, answer])
+    # Вторая неудача не тратит деньги дальше: ролик берётся как есть.
+    assert result['success'] and len(calls) == 2
+    assert Path(item['video_path']).read_bytes() == answer.read_bytes()
+    assert [(job['status'], job.get('sync_failures', 0)) for job in jobs] == [('failed', 1), ('downloaded', 1)]
