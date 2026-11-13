@@ -3,6 +3,7 @@ import contextvars
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import shutil
@@ -15,9 +16,12 @@ import requests
 
 from . import video_run_config
 from .project_paths import existing_reference_path, safe_storybook_project_dir
+from .speech_video_sync import SoundtrackMismatchError, SoundtrackUnavailableError, align_speech_video
 from .video_budget import reserve_budget
 from .video_generator_common import parse_duration_seconds_from_timing
 from .video_prompt_rules import VIDEO_PROMPT_RULES, finalize_video_prompt
+
+logger = logging.getLogger(__name__)
 
 
 def _load_video_plan(project_id, path):
@@ -439,13 +443,17 @@ def generate_reference_video(item, api_key, model, seed, store, model_catalog,
         return result
     job = store.find_current_job(key, input_hash)
     if not job or job.get('status') == 'failed':
-        job = store.ensure_job(_new_provider_job(
+        sync_failures = (job or {}).get('sync_failures')
+        job = _new_provider_job(
             shot_key=key, model=model, prompt_hash=_digest(item['video_prompt']),
             source_image_hashes={str(n): h for n, h in enumerate(identity['image_hashes'])},
             input_hash=input_hash, output_path=output, provider_name=provider_name,
             resolved_duration=payload['duration'], resolved_size_params={
                 'resolution': payload['resolution'], 'aspect_ratio': payload['aspect_ratio']},
-        ))
+        )
+        if sync_failures:
+            job['sync_failures'] = sync_failures
+        job = store.ensure_job(job)
     default_base = 'https://routerai.ru/api/v1' if provider_name == 'routerai' else 'https://api.aitunnel.ru/v1'
     base = os.getenv(f'{provider_name.upper()}_API_BASE', default_base).rstrip('/')
     headers = {'Authorization': 'Bearer ' + api_key}
@@ -473,6 +481,21 @@ def generate_reference_video(item, api_key, model, seed, store, model_catalog,
     url = urls[0] if urls else f'{base}/videos/{task_id}/content?index=0'
     store.update_job(key, input_hash, {'status': 'downloading', 'video_url': url}, 'completed_at')
     _download_video_aitunnel(url, output, headers if url.startswith(base + '/') else {})
+    speech = _speech_fragment(item)
+    if speech is not None:
+        warp = video_run_config.video_setting('VIDEO_SYNC', provider_name) != 'regenerate'
+        try:
+            align_speech_video(output, speech, warp=warp)
+        except SoundtrackUnavailableError as exc:
+            logger.warning('Видео %s не выровнено по речи: %s', key, exc)
+        except SoundtrackMismatchError as exc:
+            # Одна платная перегенерация; повторный промах берётся как есть, чтобы не платить по кругу.
+            if not job.get('sync_failures'):
+                logger.warning('Видео %s не совпало с речью, генерируется заново: %s', key, exc)
+                store.update_job(key, input_hash, {'status': 'failed', 'error': str(exc), 'sync_failures': 1}, 'failed_at')
+                return generate_reference_video(item, api_key, model, seed, store, model_catalog,
+                                                deadline, started_at, remaining, workers, provider_name)
+            logger.warning('Видео %s снова не совпало с речью, берётся как есть: %s', key, exc)
     store.update_job(key, input_hash, {'status': 'downloaded', 'error': None}, 'downloaded_at')
     return dict(result, task_id=task_id)
 
