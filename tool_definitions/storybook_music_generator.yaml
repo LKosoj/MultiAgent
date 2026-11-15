@@ -22,7 +22,7 @@ parameters:
     required: false
   - name: provider
     type: str
-    description: "Music provider name; currently suno"
+    description: "Music provider: llmgateway/music by default, with Suno fallback; suno uses Suno directly"
     required: false
   - name: prompt
     type: str
@@ -34,7 +34,7 @@ parameters:
     required: false
   - name: wait_for_completion
     type: bool
-    description: "Poll provider job until audio is ready and downloaded"
+    description: "Controls Suno polling; Gateway always returns completed audio"
     required: false
   - name: poll_interval_seconds
     type: int

@@ -16,6 +16,7 @@ _COOKIE = "__client=client-abc; ajs_anonymous_id=anon-1; __session=sess-1"
 def _fake_browser_submit(monkeypatch):
     monkeypatch.setattr(music_generator, "_load_env_file", lambda: None)
     monkeypatch.delenv("SUNO_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE_DB", raising=False)
     monkeypatch.setitem(
         sys.modules,
         "custom_tools.storybook.suno_browser",

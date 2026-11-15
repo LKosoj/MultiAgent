@@ -391,9 +391,9 @@ def validate(stored: Any, project_id: str, *, running: bool = False, strict: boo
                              f"Для провайдера {info['title']} не найден ключ доступа или модель. "
                              f"Не хватает: {', '.join(info['missing_env']) or 'настроек'}.",
                              scope="run", missing_env=info["missing_env"]))
-    if values["music"] and not _env("SUNO_COOKIE"):
+    if values["music"] and not ((_env("OPENAI_API_BASE_DB") and _env("OPENAI_API_KEY_DB")) or _env("SUNO_COOKIE")):
         issues.append(_issue("music_cookie_missing", "error", "audio.music",
-                             "Музыка включена, но не задан доступ к Suno (SUNO_COOKIE): шаг музыки упадёт.", scope="run"))
+                             "Музыка включена, но не задан доступ к Gateway (OPENAI_API_BASE_DB, OPENAI_API_KEY_DB) или Suno (SUNO_COOKIE).", scope="run"))
     if values["sfx"]:
         issues.append(_issue("credentials_unknown_sfx", "warning", "audio.sfx",
                              "Для звуковых эффектов наличие ключа определить нельзя: не проверяется.", scope="run"))

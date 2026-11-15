@@ -44,7 +44,7 @@ def storybook_music_generator_tool(
     project_id: str,
     language: str = "ru",
     enable: bool = True,
-    provider: str = "suno",
+    provider: str = "llmgateway/music",
     prompt: Optional[str] = None,
     instrumental: bool = True,
     wait_for_completion: bool = True,
@@ -56,7 +56,7 @@ def storybook_music_generator_tool(
 
     When ``98_audio/music_plan.json`` exists and is valid (see
     ``music_planner_tool`` / docs/plans/2026-08-18-4a-music-per-scene-leitmotif-design.md),
-    this generates one Suno track per leitmotif plus a neutral track
+    this generates one track per leitmotif plus a neutral track
     (``98_audio/music_manifest.json`` + ``98_audio/music/*.mp3``). Otherwise it
     falls back 100% to the legacy single-track behavior.
 
@@ -65,16 +65,18 @@ def storybook_music_generator_tool(
         project_id: Storybook project identifier under plots/storybooks.
         language: Language code stored in generated metadata.
         enable: If false, skip music generation and write a skipped manifest.
-        provider: Music provider name. Currently only "suno" is implemented.
+        provider: Defaults to "llmgateway/music", with Suno as fallback.
+            Explicit "suno" uses the existing Suno implementation.
         prompt: Optional explicit music prompt (legacy single-track path only).
             If empty, it is derived from screenplay/brief data.
-        instrumental: Request instrumental music from Suno.
-        wait_for_completion: If true, poll until an audio URL is available and download it.
+        instrumental: Request instrumental music.
+        wait_for_completion: Controls Suno polling; Gateway always returns completed audio.
         poll_interval_seconds: Polling interval for async provider jobs.
         timeout_seconds: Max polling time for async provider jobs.
         force_regenerate: If false, reuse existing track(s) when already generated.
     """
-    if _as_bool(enable) and str(provider or "suno").strip().lower() == "suno":
+    provider = str(provider or "llmgateway/music").strip().lower()
+    if _as_bool(enable) and provider in {"llmgateway/music", "suno"}:
         try:
             base_dir = _safe_project_dir(project_id)
         except ValueError:
@@ -189,7 +191,7 @@ def _multi_track_path(
     timeout_seconds: int,
     force_regenerate: bool,
 ) -> Dict[str, Any]:
-    """Generate one Suno track per leitmotif plus a neutral track from music_plan.json.
+    """Generate one track per leitmotif plus a neutral track from music_plan.json.
 
     A failed required track is aliased to an already generated neutral track.
     If required coverage is unavailable, return an error without submitting a
@@ -221,10 +223,11 @@ def _multi_track_path(
                 poll_interval_seconds=poll_interval_seconds,
                 timeout_seconds=timeout_seconds,
                 force_regenerate=normalized_force,
+                provider=provider,
             )
             manifest[track_id] = mp3_relpath
         except Exception as exc:
-            logger.warning("Suno failed for %s: %s", track_id, exc)
+            logger.warning("Music generation failed for %s: %s", track_id, exc)
 
     manifest_path = _write_manifest(base_dir, manifest)
 
@@ -309,8 +312,9 @@ def _generate_single_track(
     poll_interval_seconds: int,
     timeout_seconds: int,
     force_regenerate: bool,
+    provider: str = "suno",
 ) -> Path:
-    """Generate (or reuse) a single Suno track at target_path.
+    """Generate (or reuse) a single track, falling back from Gateway to Suno.
 
     H4 cache priority: reuse is decided solely by the prompt-hash cache (there is no
     separate target_path.exists() fast path), so a changed suno_prompt always
@@ -340,6 +344,14 @@ def _generate_single_track(
         raise RuntimeError("Multi-track music generation requires wait_for_completion=True")
 
     _load_env_file()
+    submitted = _read_submitted_state(base_dir, track_id)
+    pending_suno = bool(submitted and submitted.get("prompt_hash") == _prompt_hash(suno_prompt)
+                        and submitted.get("clip_ids"))
+    if provider == "llmgateway/music" and not pending_suno:
+        if _try_gateway_music(suno_prompt, target_path, instrumental, timeout_seconds):
+            _copy_file(target_path, cache_path)
+            return target_path
+
     cookie_raw = _env("SUNO_COOKIE")
     if not cookie_raw:
         raise RuntimeError("SUNO_COOKIE is not configured")
@@ -477,7 +489,7 @@ def _legacy_single_track_path(
     project_id: str,
     language: str = "ru",
     enable: bool = True,
-    provider: str = "suno",
+    provider: str = "llmgateway/music",
     prompt: Optional[str] = None,
     instrumental: bool = True,
     wait_for_completion: bool = True,
@@ -496,7 +508,7 @@ def _legacy_single_track_path(
     instrumental = _as_bool(instrumental)
     wait_for_completion = _as_bool(wait_for_completion)
     force_regenerate = _as_bool(force_regenerate)
-    provider = str(provider or "suno").strip().lower()
+    provider = str(provider or "llmgateway/music").strip().lower()
 
     try:
         base_dir = _safe_project_dir(project_id)
@@ -509,7 +521,7 @@ def _legacy_single_track_path(
     manifest_path = audio_dir / "music_manifest.json"
     audio_manifest_path = audio_dir / "audio_manifest.json"
 
-    if provider != "suno":
+    if provider not in {"llmgateway/music", "suno"}:
         payload = _manifest_payload(
             session_id=session_id,
             project_id=project_id,
@@ -538,6 +550,9 @@ def _legacy_single_track_path(
         return _tool_result(payload, manifest_path, music_path)
 
     if music_path.exists() and not force_regenerate:
+        saved_manifest = _read_json(manifest_path)
+        if isinstance(saved_manifest, dict):
+            provider = saved_manifest.get("provider") or provider
         track = _music_track(music_path, provider, task_id=None, reused=True)
         payload = _manifest_payload(
             session_id=session_id,
@@ -555,6 +570,20 @@ def _legacy_single_track_path(
         return _tool_result(payload, manifest_path, music_path)
 
     _load_env_file()
+    music_prompt = _clip_prompt(prompt or _build_music_prompt(base_dir, language))
+    pending_suno = not force_regenerate and _saved_submitted_clip_ids(manifest_path)
+    if provider == "llmgateway/music" and not pending_suno:
+        if _try_gateway_music(music_prompt, music_path, instrumental, timeout_seconds):
+            track = _music_track(music_path, provider, task_id=None, reused=False)
+            payload = _manifest_payload(
+                session_id=session_id, project_id=project_id, language=language,
+                provider=provider, status="success", message="Generated music track",
+                music_path=music_path, prompt=music_prompt, track=track,
+            )
+            _write_json(manifest_path, payload)
+            _merge_music_status(audio_manifest_path, payload, track=track)
+            return _tool_result(payload, manifest_path, music_path)
+    provider = "suno"
     cookie_raw = _env("SUNO_COOKIE")
     if not cookie_raw:
         payload = _manifest_payload(
@@ -570,7 +599,6 @@ def _legacy_single_track_path(
         _merge_music_status(audio_manifest_path, payload, track=None)
         return _tool_result(payload, manifest_path, music_path)
 
-    music_prompt = _clip_prompt(prompt or _build_music_prompt(base_dir, language))
     task_id: Optional[str] = None
     clip_ids: List[str] = []
     try:
@@ -749,6 +777,35 @@ def _legacy_single_track_path(
     _write_json(manifest_path, payload)
     _merge_music_status(audio_manifest_path, payload, track=track)
     return _tool_result(payload, manifest_path, music_path)
+
+
+def _try_gateway_music(prompt: str, target_path: Path, instrumental: bool, timeout_seconds: int) -> bool:
+    base_url = _env("OPENAI_API_BASE_DB").rstrip("/")
+    api_key = _env("OPENAI_API_KEY_DB")
+    if not base_url or not api_key:
+        return False
+    payload = {"model": "llmgateway/music", "input": prompt, "response_format": "mp3"}
+    if instrumental:
+        payload["lyrics"] = "[instrumental]"
+    try:
+        response = requests.post(
+            f"{base_url}/audio/speech", json=payload,
+            headers={"Authorization": f"Bearer {api_key}", "X-Title": "MAgent"},
+            timeout=max(420, timeout_seconds),
+        )
+        response.raise_for_status()
+        if not response.content or not response.headers.get("Content-Type", "").lower().startswith("audio/"):
+            raise RuntimeError("Music gateway did not return an audio file")
+    except (requests.RequestException, RuntimeError) as exc:
+        logger.warning("Music gateway unavailable, falling back to Suno: %s", exc)
+        return False
+    temporary = target_path.with_name(f".{target_path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(response.content)
+        os.replace(temporary, target_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
 
 
 def _load_env_file() -> None:
@@ -1161,7 +1218,9 @@ def _merge_music_status(audio_manifest_path: Path, music_manifest: Dict[str, Any
     tracks = [
         existing
         for existing in tracks
-        if not (isinstance(existing, dict) and existing.get("role") == "music" and existing.get("provider") == music_manifest.get("provider"))
+        if not (isinstance(existing, dict) and existing.get("role") == "music" and
+                (existing.get("provider") == music_manifest.get("provider") or
+                 (track and existing.get("path") == track.get("path"))))
     ]
     if track:
         if previous:

@@ -1180,3 +1180,16 @@ def test_workflow_actions_merge_studio_registry_and_supersedes(monkeypatch):
 
 def test_legacy_workflow_actions_have_no_streamlit_surface():
     assert all("streamlit" not in a["surfaces"] for a in video_contract._LEGACY_WORKFLOW_ACTIONS)
+
+
+def test_music_readiness_accepts_gateway_without_suno(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    monkeypatch.delenv("SUNO_COOKIE", raising=False)
+    monkeypatch.setenv("OPENAI_API_BASE_DB", "http://gateway.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY_DB", "test-key")
+    result = video_contract.storybook_video_music_readiness("demo")
+    assert result["capabilities"]["music"] is True
+    assert result["music"]["configured"] is True
+    assert result["music"]["provider"] == "llmgateway/music"
+    assert result["music"]["model"] == "llmgateway/music"

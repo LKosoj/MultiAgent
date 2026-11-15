@@ -166,6 +166,7 @@ def test_limited_provider_warns_and_refuses_sample(project):
 def test_environment_problems_block_run_not_save(project, monkeypatch):
     monkeypatch.delenv("ROUTERAI_API_KEY")
     monkeypatch.delenv("SUNO_COOKIE")
+    monkeypatch.delenv("OPENAI_API_BASE_DB", raising=False)
     issues = rs.validate(settings(), "demo")
     run_only = [i for i in issues if i["code"] in {"video_provider_not_configured", "music_cookie_missing"}]
     assert {i["code"] for i in run_only} == {"video_provider_not_configured", "music_cookie_missing"}
@@ -264,3 +265,10 @@ def test_preflight_summary_uses_unsaved_provider_for_readiness(project, monkeypa
     monkeypatch.setattr(video_contract, "storybook_video_music_readiness", fake)
     ok(invoke("run_preflight_summary", {"project_id": "demo", "series_id": "main", "settings": settings(video={"provider": "aitunnel"})}))
     assert seen["video_provider"] == "aitunnel"
+
+
+def test_gateway_music_does_not_require_suno_cookie(project, monkeypatch):
+    monkeypatch.delenv("SUNO_COOKIE")
+    monkeypatch.setenv("OPENAI_API_BASE_DB", "http://gateway.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY_DB", "test-key")
+    assert "music_cookie_missing" not in codes(rs.validate(settings(), "demo"))

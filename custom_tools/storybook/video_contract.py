@@ -638,9 +638,10 @@ def storybook_video_music_readiness(
     final_video_path = final_dir / "final_video.mp4"
     subtitles_path = audio_dir / "subtitles.srt"
     capabilities = dict(summary["capabilities"])
-    capabilities["music"] = _has_env("SUNO_COOKIE")
+    gateway_music_configured = _has_env("OPENAI_API_BASE_DB") and _has_env("OPENAI_API_KEY_DB")
+    capabilities["music"] = gateway_music_configured or _has_env("SUNO_COOKIE")
     music_enabled = _as_bool(generate_music)
-    music_configured = _has_env("SUNO_COOKIE")
+    music_configured = capabilities["music"]
     music_exists = music_path.exists()
     generation_enabled = _as_bool(enable)
     blocking_reasons = _readiness_blockers(summary, capabilities)
@@ -678,10 +679,10 @@ def storybook_video_music_readiness(
         },
         "music": {
             "enabled": music_enabled,
-            "provider": "suno",
+            "provider": "llmgateway/music" if gateway_music_configured else "suno",
             "configured": music_configured,
-            "api_base_url": "https://studio-api.prod.suno.com",
-            "model": (os.getenv("SUNO_MODEL") or "chirp-fenix").strip(),
+            "api_base_url": os.getenv("OPENAI_API_BASE_DB", "").rstrip("/") if gateway_music_configured else "https://studio-api.prod.suno.com",
+            "model": "llmgateway/music" if gateway_music_configured else (os.getenv("SUNO_MODEL") or "chirp-fenix").strip(),
             "captcha_token_configured": _has_env("SUNO_HCAPTCHA_TOKEN"),
             "status": "disabled" if not music_enabled else music_manifest.get("status") or audio_manifest.get("music_status") or "not_generated",
             "task_id": music_manifest.get("task_id"),

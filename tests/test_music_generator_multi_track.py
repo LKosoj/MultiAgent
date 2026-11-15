@@ -88,6 +88,7 @@ def _install_common_fakes(monkeypatch, post_suno_generate) -> None:
 
 def _prepare_env(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENAI_API_BASE_DB", raising=False)
     monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
     monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
     monkeypatch.delenv("SUNO_CUSTOM_MODE", raising=False)
@@ -372,7 +373,7 @@ def test_multi_track_all_tracks_fail_returns_error_without_legacy_resubmission(t
     assert audio_manifest["music_status"] == "error"
 
     warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert sum("suno failed for" in msg.lower() for msg in warning_messages) == 3
+    assert sum("music generation failed for" in msg.lower() for msg in warning_messages) == 3
 
 
 def test_multi_track_resumes_from_submitted_state(tmp_path, monkeypatch):

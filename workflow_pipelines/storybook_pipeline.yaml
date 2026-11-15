@@ -589,7 +589,7 @@ steps:
     project_id: '{project_id}'
     language: '{language}'
     enable: '{generate_music}'
-    provider: suno
+    provider: llmgateway/music
     timeout_seconds: 1200
     instrumental: true
     wait_for_completion: true
