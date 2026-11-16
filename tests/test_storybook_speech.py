@@ -62,6 +62,36 @@ def test_snapshot_voices_and_narrator():
     assert lines[1]['shot_number'] == 2
 
 
+@pytest.mark.parametrize('kind', ['characters', 'narrators'])
+@pytest.mark.parametrize('existing_audio', [False, True])
+def test_missing_voice_stops_before_speech_preparation(tmp_path, monkeypatch, kind, existing_audio):
+    from custom_tools.storybook.studio import series
+    monkeypatch.setattr(series, 'series_dir', lambda p, s: tmp_path)
+    monkeypatch.setattr(series, 'resolve_snapshot', lambda p, s: {kind: {'speaker': {'version_id': 'v1', 'data': {'name': 'Герой'}}}})
+    scene = {'scene_number': 1}
+    if kind == 'characters':
+        scene['dialogue'] = [{'character': 'Герой', 'line': 'Привет'}]
+    else:
+        scene['voiceover'] = 'Привет'
+    script = tmp_path / '91_screenplay/screenplay.json'
+    script.parent.mkdir()
+    script.write_text(json.dumps({'screenplay': [scene]}))
+    path = tmp_path / '98_audio/speech.json'
+    old_content = b'{"status":"success","audio_path":"speech/old.mp3"}'
+    if existing_audio:
+        path.parent.mkdir()
+        path.write_bytes(old_content)
+    monkeypatch.setattr(speech, 'prepare_speech', lambda *args, **kwargs: pytest.fail('speech preparation called'))
+    monkeypatch.setattr(speech, '_synthesize', lambda *args, **kwargs: pytest.fail('synthesis called'))
+    monkeypatch.setattr(speech, '_post', lambda *args, **kwargs: pytest.fail('network called'))
+
+    result = speech.storybook_speech_tool('run', 'p', 's')
+
+    assert result['status'] == 'error'
+    assert 'Не задан голос говорящего speaker' in result['error']
+    assert path.read_bytes() == old_content if existing_audio else not path.exists()
+
+
 def test_subtitles_use_measured_speech(tmp_path, monkeypatch):
     from custom_tools.storybook import audio_subtitle
     from custom_tools.storybook.studio import series
