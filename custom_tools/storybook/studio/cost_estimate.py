@@ -19,7 +19,7 @@ from . import provider_catalog
 logger = logging.getLogger(__name__)
 
 VIDEO_STEP = "video_generator"
-IMAGE_STEPS = ("artist_batch", "character_reference_states", "background_references", "artist_batch_shots")
+IMAGE_STEPS = ("artist_batch", "character_reference_states", "artist_batch_shots")
 MUSIC_STEP = "storybook_music_generator"
 SFX_STEP = "storybook_sfx_generator"
 _REPO_ROOT = Path(__file__).resolve().parents[3]

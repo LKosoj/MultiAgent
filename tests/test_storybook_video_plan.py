@@ -181,6 +181,15 @@ def test_video_groups_ignore_character_list_order():
     assert len(vp._action_groups(items, choices)) == 1
 
 
+def test_reference_labels_preserve_location_when_shared_with_landmark():
+    state = {'reference_images': [{'image': 1, 'subject': 'Control room', 'role': 'location'}],
+             'landmark_image_roles': [{'image_number': 1, 'name': 'Main display'}]}
+    prompt = vp._reference_lines(state, 1)
+    assert 'Control room: location materials and architecture' in prompt
+    assert 'Main display: landmark object construction' in prompt
+    assert prompt.count('Image 1') == 1
+
+
 def test_reference_prompt_binds_final_image_and_saved_style(project, monkeypatch):
     import utils
     base, items = project
@@ -196,7 +205,7 @@ def test_reference_prompt_binds_final_image_and_saved_style(project, monkeypatch
 
     def generate(**kwargs):
         captured.update(kwargs)
-        return '{"video_prompt":"Use Image 2 for style; travel, then finish on Image 3."}'
+        return '{"selected_images":[1,2,3],"video_prompt":"SAVED INK STYLE. Use Image 2 for style; travel, then finish on Image 3."}'
 
     monkeypatch.setattr(utils, 'call_openai_api', generate)
     group = vp._starts(items)[1:]
@@ -209,16 +218,18 @@ def test_reference_prompt_binds_final_image_and_saved_style(project, monkeypatch
     assert json.loads(captured['prompt'])['visual_style'] == 'SAVED INK STYLE'
     assert json.loads(captured['prompt'])['landmark_image_roles'] == [
         {'entity_id': 'arch', 'name': 'Station arch', 'image_number': 1}]
-    assert prompt == ('SAVED INK STYLE\n\nImage 1 — Station arch: landmark object construction\n'
+    assert prompt == ('Image 1 — Station arch: landmark object construction\n'
                       'Image 2 — visual style only: medium, palette, lighting, line and surface\n'
                       'Image 3 — required end state of the clip\n\n'
-                      'Use Image 2 for style; travel, then finish on Image 3.')
+                      'SAVED INK STYLE. Use Image 2 for style; travel, then finish on Image 3.')
     assert 'not the choice of style' in captured['system_prompt']
     assert 'WRONG' not in prompt
     assert 'ordinary image reference' in captured['system_prompt']
     assert 'Reserve the last two seconds' not in captured['system_prompt']
     assert 'Do not invent fixed-duration holds' in captured['system_prompt']
     assert 'Snapshot limb positions are not timed instructions' in captured['system_prompt']
+    assert 'Write one concise English video prompt' in captured['system_prompt']
+    assert 'speaker_schedule is authoritative for mouth movement timing' in captured['system_prompt']
 
 
 def planning_setup(project, monkeypatch):
@@ -391,7 +402,7 @@ def test_reference_units_receive_only_their_own_style_image(project, monkeypatch
     monkeypatch.setattr(vp, 'choose_video_method', lambda state: {
         'method': 'keyframes' if state['current']['shot_key'] == '1-1' else 'references', 'continuity': 'continue'})
     vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items, 'seed': 123})
-    assert requested == [{'ink', 'wash'}]
+    assert requested == []
     bindings = json.loads((base / '30_style/image_styles.json').read_text())['frame_bindings']
     assert bindings['1:1:start'] == 'pencil' and bindings['1:1:end'] == 'pencil'
     assert bindings['1:2:start'] == 'wash' and bindings['1:2:end'] == 'wash'
@@ -399,7 +410,7 @@ def test_reference_units_receive_only_their_own_style_image(project, monkeypatch
     units = json.loads((base / '97_shots/video_plan.json').read_text())['units']
     assert [unit['style_id'] for unit in units] == ['wash', 'ink']
     for unit in units:
-        assert unit['style_reference_path'] in unit['reference_image_paths']
+        assert unit['style_reference_path'] is None
         other = 'ink' if unit['style_id'] == 'wash' else 'wash'
         assert str((base / f'{other}.png').resolve()) not in unit['reference_image_paths']
 
@@ -543,7 +554,7 @@ def test_reference_prompt_discovers_existing_opening_and_binds_visible_subjects(
 
     def generate(**kwargs):
         captured.update(kwargs)
-        return '{"video_prompt":"Begin in motion on Image 2; reach Image 3."}'
+        return '{"selected_images":[1,2,3],"video_prompt":"Begin in motion on Image 2; reach Image 3."}'
 
     monkeypatch.setattr(utils, 'call_openai_api', generate)
     _, refs = vp.prepare_reference_prompt(base, group, {}, ['hero.png'], final_image=final)
@@ -591,8 +602,8 @@ def test_empty_shot_unit_gets_no_style_image_with_hero(project, monkeypatch):
     vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items, 'seed': 123})
     units = {tuple(u['shot_keys']): u for u in json.loads((base / '97_shots/video_plan.json').read_text())['units']}
     style = str((base / 'style_ink.png').resolve())
-    assert units[('1-2',)]['style_reference_path'] == style
-    assert style in units[('1-2',)]['reference_image_paths']
+    assert units[('1-2',)]['style_reference_path'] is None
+    assert style not in units[('1-2',)]['reference_image_paths']
     assert units[('1-3',)]['style_reference_path'] is None
     assert style not in units[('1-3',)]['reference_image_paths']
     assert str(base / 'hero.png') not in units[('1-3',)]['reference_image_paths']
@@ -637,7 +648,7 @@ def test_method_uses_speech_before_model_choice(monkeypatch):
 
 
 def test_planning_forces_visible_speech_and_carries_audio(project, monkeypatch):
-    base, items, _ = planning_setup(project, monkeypatch)
+    base, items, prompt_calls = planning_setup(project, monkeypatch)
     (base / '98_audio').mkdir()
     (base / '98_audio/speech.json').write_text(json.dumps({
         'status': 'success', 'audio_path': 'speech.wav', 'lines': [dict(id='l1', speaker_id='hero', kind='on_screen', start=2.5, end=4)]}))
@@ -659,6 +670,7 @@ def test_planning_forces_visible_speech_and_carries_audio(project, monkeypatch):
     clip = next(i for i in rendered if i.get('video_mode') == 'references')
     assert clip['speech_source_path'].endswith('98_audio/speech.wav')
     assert clip['speaker_schedule'] == [dict(line_id='l1', speaker_id='hero', kind='on_screen', start=0.5, end=2)]
+    assert prompt_calls[0][1]['speaker_schedule'] == clip['speaker_schedule']
 
 
 def test_references_keep_default_hero_when_other_has_state(project):
@@ -929,7 +941,7 @@ def test_reference_prompt_lists_each_image_with_subject_and_role_on_own_line(pro
 
     def generate(**kwargs):
         captured.update(kwargs)
-        return '{"video_prompt":"Static camera. 0-2s: Hero walks."}'
+        return '{"selected_images":[1,2,3,4],"video_prompt":"Static camera. 0-2s: Hero walks."}'
 
     monkeypatch.setattr(utils, 'call_openai_api', generate)
     group = vp._starts(items)[1:]
@@ -944,3 +956,175 @@ def test_reference_prompt_lists_each_image_with_subject_and_role_on_own_line(pro
                      'Image 4 — required end state of the clip']
     assert prompt.endswith('Static camera. 0-2s: Hero walks.')
     assert 'do not repeat that list' in captured['system_prompt']
+
+
+def test_reference_selection_renumbers_images_and_rejects_invalid_references(project, monkeypatch):
+    import utils
+    base, items = project
+    opening, ending = base / 'start.png', base / 'end.png'
+    state = {'reference_images': [dict(image=1, subject='Hero', role='character_appearance'),
+                                  dict(image=2, subject='Room', role='location')]}
+    group = vp._starts(items)[1:]
+    answer = {'selected_images': [3, 2], 'video_prompt': 'Image 1 opens; Image 2 shows the room.'}
+    monkeypatch.setattr(utils, 'call_openai_api', lambda **kwargs: json.dumps(answer))
+    prompt, refs = vp.prepare_reference_prompt(base, group, state, ['hero.png', 'room.png'],
+                                               initial_image=opening, final_image=ending)
+    assert refs == [str(opening), 'room.png']
+    assert 'Image 1 — opening world state' in prompt
+    assert 'Image 2 — Room: location' in prompt
+    answer['video_prompt'] = 'Image 3 appears.'
+    with pytest.raises(ValueError, match='image reference'):
+        vp.prepare_reference_prompt(base, group, state, ['hero.png', 'room.png'],
+                                    initial_image=opening, final_image=ending)
+
+
+def test_final_prompt_limit_includes_speaker_schedule():
+    prompt = 'word ' * 140
+    schedule = [dict(line_id='a', speaker_id='hero', kind='on_screen', start=0, end=1)]
+    with pytest.raises(ValueError, match='too long'):
+        vp._validate_reference_prompt_length(prompt, schedule)
+
+
+def test_planning_rejects_overlong_final_prompt_before_saving(project, monkeypatch):
+    base, items, _ = planning_setup(project, monkeypatch)
+    monkeypatch.setattr(vp, 'choose_video_method', lambda state: {'method': 'references', 'continuity': 'new'})
+    monkeypatch.setattr(vp, 'prepare_reference_prompt', lambda *args, **kwargs: ('word ' * 151, ['image.png']))
+    with pytest.raises(ValueError, match='too long'):
+        vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items})
+    assert not (base / '97_shots/video_plan.json').exists()
+
+
+def test_new_plan_rechecks_full_action_after_1600_characters(project, monkeypatch):
+    base, items, calls = planning_setup(project, monkeypatch)
+    monkeypatch.setattr(vp, 'choose_video_method', lambda state: {'method': 'references', 'continuity': 'continue'})
+    for item in items:
+        item['shot_description'] = 'a' * 1600 + ' first event'
+    vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items})
+    first_count = len(calls)
+    assert vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items})['cached']
+    for item in items:
+        item['shot_description'] = 'a' * 1600 + ' different event'
+    result = vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items})
+    assert result['cached'] is False
+    assert len(calls) > first_count
+    assert calls[-1][1]['shots'][0]['action'].endswith('different event')
+
+
+def test_legacy_cached_plan_reuses_accepted_job_without_post(project, monkeypatch):
+    from custom_tools.storybook.video_generator_aitunnel_jobs import _ProviderJobStore
+    base, items, calls = planning_setup(project, monkeypatch)
+    Image.new('RGB', (16, 16)).save(base / 'hero.png')
+    monkeypatch.setattr(vp, 'choose_video_method', lambda state: {'method': 'references', 'continuity': 'continue'})
+    vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items})
+    path = base / '97_shots/video_plan.json'
+    plan = json.loads(path.read_text())
+    plan.pop('full_action_hash')
+    path.write_text(json.dumps(plan))
+    for ref in plan['units'][0]['reference_image_paths']:
+        if not Path(ref).exists():
+            Image.new('RGB', (16, 16)).save(ref)
+    item = vp.apply_video_plan('test', items)[0]
+    Path(item['video_path']).write_bytes(b'accepted video')
+    store = _ProviderJobStore(str(base / '97_shots/provider_jobs.json'), provider_name='routerai')
+    identity = vp.reference_input_hash(item, 'alibaba/wan-3.0', None)
+    store.ensure_job(dict(shot_key=vp._reference_job_key(item), input_hash=identity,
+                          provider='routerai', status='downloaded', task_id='accepted',
+                          output_path=item['video_path']))
+    monkeypatch.setattr(vp.requests, 'post', lambda *args, **kwargs: pytest.fail('Unexpected POST'))
+    count = len(calls)
+    assert vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items})['cached']
+    assert len(calls) == count
+    assert 'full_action_hash' not in json.loads(path.read_text())
+    item = vp.apply_video_plan('test', items)[0]
+    result = vp.generate_reference_video(item, 'secret', 'alibaba/wan-3.0', None, store, {
+        'alibaba/wan-3.0': {'supports_image_references': True, 'supported_durations': list(range(2, 31)),
+                           'max_image_references': 10}})
+    assert result['success'] and Path(item['video_path']).read_bytes() == b'accepted video'
+
+
+def test_scoped_plan_ignores_other_shot_action_tail_and_reuses_job(project, monkeypatch):
+    from custom_tools.storybook.video_generator_aitunnel_jobs import _ProviderJobStore
+    base, items, calls = planning_setup(project, monkeypatch)
+    Image.new('RGB', (16, 16)).save(base / 'hero.png')
+    for item in items:
+        item['shot_description'] = 'a' * 1600 + ' original event'
+    monkeypatch.setattr(vp, 'choose_video_method', lambda state: {'method': 'references', 'continuity': 'continue'})
+    vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items}, shot_keys=['1-1'])
+    plan = json.loads((base / '97_shots/video_plan.json').read_text())
+    for ref in plan['units'][0]['reference_image_paths']:
+        if not Path(ref).exists():
+            Image.new('RGB', (16, 16)).save(ref)
+    item = vp.apply_video_plan('test', items)[0]
+    Path(item['video_path']).write_bytes(b'accepted video')
+    store = _ProviderJobStore(str(base / '97_shots/provider_jobs.json'), provider_name='routerai')
+    identity = vp.reference_input_hash(item, 'alibaba/wan-3.0', None)
+    store.ensure_job(dict(shot_key=vp._reference_job_key(item), input_hash=identity,
+                          provider='routerai', status='downloaded', task_id='accepted',
+                          output_path=item['video_path']))
+    monkeypatch.setattr(vp.requests, 'post', lambda *args, **kwargs: pytest.fail('Unexpected POST'))
+    for item in items:
+        if item['shot_number'] == 2:
+            item['shot_description'] = 'a' * 1600 + ' changed event'
+    count = len(calls)
+    assert vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items}, shot_keys=['1-1'])['cached']
+    assert len(calls) == count
+    item = vp.apply_video_plan('test', items)[0]
+    assert vp.reference_input_hash(item, 'alibaba/wan-3.0', None) == identity
+    result = vp.generate_reference_video(item, 'secret', 'alibaba/wan-3.0', None, store, {
+        'alibaba/wan-3.0': {'supports_image_references': True, 'supported_durations': list(range(2, 31)),
+                           'max_image_references': 10}})
+    assert result['success'] and Path(item['video_path']).read_bytes() == b'accepted video'
+
+
+@pytest.mark.parametrize(('action', 'selected'), [
+    ('Hero turns, revealing an unseen face', [4, 1]),
+    ('A new hero enters', [4, 2]),
+    ('Hero transforms into a bird', [4, 5]),
+    ('Camera reveals the room', [4, 3]),
+    ('A static insert', [4]),
+])
+def test_reference_selection_keeps_scenario_requirements(project, monkeypatch, action, selected):
+    import utils
+    base, items = project
+    group = vp._starts(items)[1:]
+    state = {'shots': [{'action': action}], 'reference_images': [
+        dict(image=1, subject='Hero', role='character_appearance'),
+        dict(image=2, subject='New hero', role='character_appearance'),
+        dict(image=3, subject='Room', role='location')]}
+    captured = []
+    def respond(**kwargs):
+        captured.append(kwargs)
+        return json.dumps({'selected_images': selected,
+                           'video_prompt': f'Ink. {action}. The sign reads OPEN.'})
+    monkeypatch.setattr(utils, 'call_openai_api', respond)
+    opening, ending = base / 'start.png', base / 'end.png'
+    prompt, refs = vp.prepare_reference_prompt(base, group, state, ['hero.png', 'new.png', 'room.png'],
+                                               initial_image=opening, final_image=ending)
+    assert len(captured) == 1 and json.loads(captured[0]['prompt'])['shots'][0]['action'] == action
+    assert refs == [(['hero.png', 'new.png', 'room.png', str(opening), str(ending)])[n - 1] for n in selected]
+    assert action in prompt and 'OPEN' in prompt
+    assert 'face not reliably visible' in captured[0]['system_prompt']
+
+
+def test_reference_shared_location_and_landmark_keep_both_roles(project, monkeypatch):
+    import utils
+    base, items = project
+    shared = str(base / 'room.png')
+    group = vp._starts(items)[1:]
+    group[0]['locations'] = [dict(name='Room', reference_image_path=shared)]
+    group[0]['_continuity'] = {'start': {'entities': [dict(id='arch', name='Arch', kind='landmark', reference_path=shared)]}}
+    state = {'reference_images': vp._reference_roles(base, group, [shared])}
+    monkeypatch.setattr(utils, 'call_openai_api', lambda **kwargs: json.dumps(
+        {'selected_images': [1], 'video_prompt': 'The camera reveals the arch.'}))
+    prompt, _ = vp.prepare_reference_prompt(base, group, state, [shared])
+    assert 'Room: location materials and architecture; Arch: landmark object construction' in prompt
+
+
+@pytest.mark.parametrize('selection', [[], [1, 1], [0], [True], [99], [1]])
+def test_reference_selection_rejects_invalid_or_missing_start(project, monkeypatch, selection):
+    import utils
+    base, items = project
+    monkeypatch.setattr(utils, 'call_openai_api', lambda **kwargs: json.dumps(
+        {'selected_images': selection, 'video_prompt': 'Camera moves.'}))
+    with pytest.raises(ValueError, match='selected image'):
+        vp.prepare_reference_prompt(base, vp._starts(items)[1:], {}, ['hero.png'], initial_image=base / 'start.png')

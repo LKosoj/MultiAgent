@@ -8,6 +8,7 @@ import pytest
 import custom_tools.storybook.shots_prompt_qa as qa
 
 
+@pytest.mark.parametrize("dry_run", [True, False])
 @pytest.mark.parametrize("scene_count", [1, 2])
 @pytest.mark.parametrize(
     "invalid_response",
@@ -22,7 +23,7 @@ import custom_tools.storybook.shots_prompt_qa as qa
     ],
 )
 def test_invalid_qa_response_does_not_mark_requested_scene_complete(
-    tmp_path, monkeypatch, scene_count, invalid_response
+    tmp_path, monkeypatch, scene_count, invalid_response, dry_run
 ):
     project_id = "p"
     screenplay_dir = tmp_path / project_id / "91_screenplay"
@@ -83,9 +84,17 @@ def test_invalid_qa_response_does_not_mark_requested_scene_complete(
             project_id=project_id,
             shots_data={"items": items, "consistency_rules": []},
             force=True,
-            dry_run=True,
+            dry_run=dry_run,
             global_max_repairs=0,
         )
+
+    if not dry_run and scene_count == 2:
+        shots_dir = tmp_path / project_id / '97_shots'
+        saved = json.loads((shots_dir / 'shots.json').read_text())
+        assert saved['prompts_validated'] is False
+        assert saved['prompts_validated_scenes'] == [1]
+        report = json.loads((shots_dir / 'shots_prompt_qa_report.json').read_text())
+        assert report['scenes_processed'] == 1
 
 
 def test_detected_video_violations_require_repairs_for_each_affected_shot(tmp_path, monkeypatch):

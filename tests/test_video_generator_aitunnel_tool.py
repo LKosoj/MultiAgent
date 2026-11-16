@@ -1931,11 +1931,14 @@ def test_input_hash_ignores_catalog_size_and_duration(tmp_path, monkeypatch):
     assert all(job["status"] != "stale" for job in jobs)
 
 
-def test_input_hash_stores_resolved_params_as_metadata(tmp_path, monkeypatch):
+@pytest.mark.parametrize('actual_duration, requested_duration', [(None, 6), (6.972, 7), (1.842, 2)])
+def test_input_hash_stores_resolved_params_as_metadata(tmp_path, monkeypatch, actual_duration, requested_duration):
     _patch_project_mode(monkeypatch)
     shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
     shots_dir.mkdir(parents=True)
     item = _make_project_item(shots_dir, 1)
+    if actual_duration is not None:
+        item['duration_s'] = actual_duration
     project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
 
     # Requested 1920x1080 / 6s resolves to a different catalog size/duration.
@@ -1996,7 +1999,7 @@ def test_input_hash_stores_resolved_params_as_metadata(tmp_path, monkeypatch):
             "start_image": aitunnel_module._hash_source_image(item["start_image"]),
             "end_image": None,
         },
-        requested_duration=6,
+        requested_duration=requested_duration,
         requested_width=1920,
         requested_height=1080,
         seed=None,

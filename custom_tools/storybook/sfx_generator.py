@@ -104,8 +104,8 @@ def storybook_sfx_generator_tool(
                 payload = {"model": MODEL, "input": prompt, "response_format": "mp3"}
                 if effect.get("duration") is not None:
                     duration = float(effect["duration"])
-                    if not 0 < duration < float("inf"):
-                        raise ValueError(f"SFX duration must be positive (scene {scene_number})")
+                    if not 0 < duration <= 120:
+                        raise ValueError(f"SFX duration must be greater than 0 and at most 120 seconds (scene {scene_number})")
                     payload["duration"] = duration
                 level = float(effect.get("level", 1))
                 start = _event_start(effect, scene_number, speech, shots)

@@ -64,7 +64,8 @@ def test_qa_restores_catalog_style_after_model_rewrites(tmp_path, monkeypatch, r
         assert 'PARAPHRASED STYLE' not in call['prompt']
         assert 'START.video_prompt covers the whole shot' in call['system_prompt']
         assert 'END.video_prompt is intentionally empty' in call['system_prompt']
-        assert 'preceding storyboard descriptions' in call['system_prompt']
+        assert 'Original storyboard descriptions and camera plans' in call['system_prompt']
+        assert 'states persist until the source changes them' in call['system_prompt']
         assert 'partial change does not imply complete absence' in call['system_prompt']
 
 

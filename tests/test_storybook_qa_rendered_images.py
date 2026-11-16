@@ -9,9 +9,10 @@ from PIL import Image
 from custom_tools.storybook import shots_prompt_qa as qa
 
 
+@pytest.mark.parametrize("missing_actor", [True, False])
 @pytest.mark.parametrize("with_images", [True, False])
 @pytest.mark.parametrize("reverse_items", [True, False])
-def test_qa_receives_phase_images_and_original_brief(tmp_path, monkeypatch, with_images, reverse_items):
+def test_qa_receives_phase_images_and_original_brief(tmp_path, monkeypatch, with_images, reverse_items, missing_actor):
     base = tmp_path / "gate"
     (base / "91_screenplay").mkdir(parents=True)
     source = "The gate must close completely."
@@ -20,10 +21,13 @@ def test_qa_receives_phase_images_and_original_brief(tmp_path, monkeypatch, with
     (base / "20_bible/references/locations").mkdir(parents=True)
     (base / "20_bible/locations.json").write_text(json.dumps([location]))
     Image.new("RGB", (800, 450), "blue").save(base / "20_bible/references/locations/gate.png")
+    character = {"name": "Hero", "reference_image_path": str(base / "hero.png")}
+    Image.new("RGB", (800, 450), "yellow").save(base / "hero.png")
+    (base / "20_bible/characters.json").write_text(json.dumps([character]))
     (base / "00_brief.json").write_text(json.dumps({"language": "ru", "storybook_prompt": source}))
     (base / "91_screenplay/screenplay.json").write_text(json.dumps({"screenplay": [{
         "scene_number": 1, "characters": [], "scene_continuity_facts": continuity_facts, "storyboard": [{
-            "shot_number": 1, "camera_plan": "MEDIUM SHOT", "description": "Ворота закрываются",
+            "shot_number": 1, "camera_plan": "MEDIUM SHOT", "description": "Ворота закрываются; на мониторе виден портрет Hero.",
         }],
     }]}))
     items = []
@@ -34,14 +38,18 @@ def test_qa_receives_phase_images_and_original_brief(tmp_path, monkeypatch, with
         items.append({"scene_number": 1, "shot_number": 1, "shot_type": phase,
                       "english_prompt": "Закрытые ворота", "negative_prompt": "blur, do not move background anchors, без замены фоновой архитектуры, deformed hands",
                       "video_prompt": "", "output_path": str(path),
-                      "locations": [location], "reference_image_paths": [location["reference_image_path"]]})
+                      "characters": [character], "locations": [location], "reference_image_paths": [location["reference_image_path"]]})
     if reverse_items:
         items.reverse()
     outside = {"scene_number": 2, "shot_number": 1, "shot_type": "start",
                "english_prompt": "Unrelated scene", "negative_prompt": "без другого задника"}
     items.append(dict(outside))
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    monkeypatch.setattr(qa, "_extract_shot_frame_spec_llm", lambda **kwargs: {"primary_subject": "gate"})
+    allowed_names = []
+    def fake_extract(**kwargs):
+        allowed_names.append(kwargs["scene_characters"])
+        return {"primary_subject": "gate", "visible_characters": [] if missing_actor else ["Hero"]}
+    monkeypatch.setattr(qa, "_extract_shot_frame_spec_llm", fake_extract)
     calls = []
 
     def fake_call(**kwargs):
@@ -56,6 +64,9 @@ def test_qa_receives_phase_images_and_original_brief(tmp_path, monkeypatch, with
     assert len(calls) == (2 if with_images else 1)
     assert len(main_calls) == 1
     payload = json.loads(main_calls[0]["prompt"].split("INPUT:\n", 1)[1])
+    assert allowed_names == [["Hero"]]
+    assert payload["characters"] == []
+    assert {entry["name"] for entry in payload["available_references"]} >= {"Hero", "Gate"}
     assert payload["source_brief"] == source
     assert [item["shot_type"] for item in payload["generated_shots"]] == ["start", "end"]
     assert payload["generated_shots"][0]["negative_prompt"] == "blur, deformed hands"
@@ -63,6 +74,10 @@ def test_qa_receives_phase_images_and_original_brief(tmp_path, monkeypatch, with
     assert next(item for item in result["items"] if item["scene_number"] == 2) == outside
     if with_images:
         audit_payload = json.loads(calls[0]["prompt"].split("AUDIT_INPUT:\n", 1)[1])
+        assert "SOURCE PRIORITY (highest to lowest)" in calls[0]["system_prompt"]
+        assert audit_payload["canonical_character_names"] == ["Hero"]
+        assert "missing canonical identity reference is a violation" in calls[0]["system_prompt"]
+        assert audit_payload["canonical_characters"] == ([] if missing_actor else [{"label": "CANONICAL_CHARACTER_1", "name": "Hero"}])
         assert audit_payload["scene_continuity_facts"] == continuity_facts
         assert all(shot["negative_prompt"] == "blur, deformed hands" for shot in audit_payload["generated_shots"])
         url = calls[0]["image_url"]
@@ -135,3 +150,32 @@ def test_visual_audit_receives_bound_styles_for_each_phase(tmp_path, monkeypatch
     assert "UNUSED STYLE" not in json.dumps(audit_payload, ensure_ascii=False)
     assert "UNUSED STYLE" not in json.dumps(main_payload, ensure_ascii=False)
     assert all("READY STYLE" not in shot["english_prompt"] for shot in main_payload["generated_shots"])
+
+
+def test_spec_cast_repair_restores_missing_reference_only_in_visible_phase():
+    hero = {'name': 'Hero', 'reference_image_path': '/references/characters/hero.png'}
+    spec = {'visible_characters': ['Hero'], 'start_state_spec': {'visible_characters': []},
+            'end_state_spec': {'visible_characters': ['Hero'], 'character_pose_signatures': {'Hero': 'Inside a monitor only.'}}}
+    items = [{
+        'shot_type': phase, 'characters': [], 'reference_image_paths': ['/references/locations/hall.png'],
+        'english_prompt': 'A command room with a monitor.', '_shot_frame_spec': spec,
+    } for phase in ('start', 'end')]
+    for item in items:
+        qa._refresh_item_reference_roles(item, character_index_by_name={'hero': hero})
+    assert items[0]['characters'] == []
+    assert hero['reference_image_path'] not in items[0]['reference_image_paths']
+    assert items[1]['characters'] == [hero]
+    assert hero['reference_image_path'] in items[1]['reference_image_paths']
+    assert 'Inside a monitor only.' in items[1]['english_prompt']
+
+
+def test_existing_identity_variant_does_not_gain_duplicate_canonical_reference(tmp_path):
+    variant = tmp_path / 'variant.png'
+    variant.write_bytes(b'existing identity variant')
+    current = {'name': 'Hero', 'reference_image_path': str(tmp_path / 'master.png')}
+    existing = {'name': 'Hero', 'reference_image_path': str(variant)}
+    item = {'shot_type': 'end', 'characters': [existing], 'reference_image_paths': [str(variant)],
+            'english_prompt': 'A monitor.', '_shot_frame_spec': {'visible_characters': ['Hero']}}
+    qa._refresh_item_reference_roles(item, character_index_by_name={'hero': current})
+    assert item['characters'] == [existing]
+    assert item['reference_image_paths'] == [str(variant)]

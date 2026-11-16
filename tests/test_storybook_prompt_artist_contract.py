@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import requests
 import yaml
+from PIL import Image
 
 import utils
 from custom_tools.storybook import artist_batch_edit as artist
@@ -70,7 +71,7 @@ def test_pp01_direct_edit_receives_built_negative_prompt(monkeypatch, tmp_path):
 
     def fake_edit(**kwargs):
         captured.append(kwargs)
-        Path(kwargs["output_path"]).write_bytes(b"png")
+        Image.new('RGB', (kwargs['width'], kwargs['height']), 'blue').save(kwargs['output_path'])
         return "ok"
 
     monkeypatch.setattr(artist, "edit_image_vse_tool", fake_edit)
@@ -100,6 +101,8 @@ def test_pp01_direct_edit_receives_built_negative_prompt(monkeypatch, tmp_path):
 
 
 def test_cached_batch_does_not_copy_previous_actor_into_changed_cast(monkeypatch, tmp_path):
+    monkeypatch.setattr(artist, "black_screen_storyboard_shot", lambda *_args: False)
+    monkeypatch.setattr(artist, "_collect_visible_text_bindings", lambda *_args: [])
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
     (tmp_path / "project").mkdir()
     previous = tmp_path / "baklan-end.png"
@@ -111,7 +114,7 @@ def test_cached_batch_does_not_copy_previous_actor_into_changed_cast(monkeypatch
 
     def fake_edit(**kwargs):
         captured.append(kwargs)
-        Path(kwargs["output_path"]).write_bytes(b"New Chibis pixels")
+        Image.new('RGB', (kwargs['width'], kwargs['height']), 'blue').save(kwargs['output_path'])
         return "ok"
 
     monkeypatch.setattr(artist, "edit_image_vse_tool", fake_edit)
@@ -128,12 +131,57 @@ def test_cached_batch_does_not_copy_previous_actor_into_changed_cast(monkeypatch
              characters=[{"name": "Чибис"}], reference_image_paths=[str(reference)],
              english_prompt="Show Chibis. " + old_role, reference_roles_instruction=old_role),
     ]}, max_concurrency=1, language="en")
-    assert target.read_bytes() == b"New Chibis pixels"
+    with Image.open(target) as image:
+        assert image.getpixel((0, 0)) == (0, 0, 255)
     assert len(captured) == 1
     assert "own named character reference" in captured[0]["prompt"]
     assert old_role not in captured[0]["prompt"]
     assert str(previous) not in captured[0]["image_paths"]
     assert str(reference) in captured[0]["image_paths"]
+
+
+@pytest.mark.parametrize('phase,current,other', [('start', 'blue spiral', 'red cross'),
+                                               ('end', 'red cross', 'blue spiral')])
+def test_render_receives_only_current_registered_state(monkeypatch, phase, current, other):
+    captured = []
+    monkeypatch.setattr(artist, '_collect_visible_text_bindings',
+                        lambda item, prompt, language: captured.append(prompt) or [])
+    item = {'shot_type': phase, '_continuity': {
+        'start': {'states': {'panel': {'description': 'blue spiral', 'visible': False, 'support': 'rear wall'}}},
+        'end': {'states': {'panel': {'description': 'red cross', 'visible': True, 'support': 'rear wall'}}}}}
+    prompt, _ = artist._build_image_generation_prompts(item, 'A close-up face.', 'ru')
+    assert current in prompt and current in captured[0]
+    assert other not in prompt and other not in captured[0]
+    assert 'rear wall' in prompt
+    assert 'visible=false neither requires nor forbids depiction' in prompt
+    assert 'If depicted, preserve its current state' in prompt
+
+
+@pytest.mark.parametrize('phase,other_phase', [('start', 'end'), ('end', 'start')])
+def test_local_edit_receives_only_current_physical_state(tmp_path, phase, other_phase):
+    target = tmp_path / 'frame.png'
+    target.write_bytes(b'current image')
+    item = {'output_path': str(target), 'reference_image_paths': [str(target)],
+            'shot_type': phase, 'english_prompt': 'A room.',
+            '_continuity_edit_findings': [{'required': 'Restore the bag strap.'}],
+            '_continuity': {phase: {'states': {'lantern': {'description': 'CURRENT_LANTERN_NOT_YET_ACQUIRED', 'visible': False}}},
+                            other_phase: {'states': {'lantern': {'description': 'OTHER_PHASE_LANTERN_ACQUIRED'}}}}}
+    _, _, _, prompt = artist._build_edit_instruction('s', item, language='en')
+    assert 'CURRENT_LANTERN_NOT_YET_ACQUIRED' in prompt
+    assert 'OTHER_PHASE_LANTERN_ACQUIRED' not in prompt
+    assert 'visible=false neither requires nor forbids depiction' in prompt
+
+
+def test_local_edit_preserves_requested_sides_and_allows_placement_changes(tmp_path):
+    target = tmp_path / 'frame.png'
+    target.write_bytes(b'current image')
+    required = 'Move the figure to the left and keep the anatomical left hand visible.'
+    item = {'output_path': str(target), 'reference_image_paths': [str(target)],
+            'english_prompt': 'A close-up scene.', '_continuity_edit_findings': [{'required': required}]}
+    _, _, _, prompt = artist._build_edit_instruction('s', item, language='en')
+    assert required in prompt
+    assert "anatomical right hand, not screen-right" not in prompt
+    assert 'unaffected' in prompt.split('Image 1 is the current target frame', 1)[1]
 
 
 def test_pp02_identity_is_retained_once_in_english_and_sent_to_translation(monkeypatch):

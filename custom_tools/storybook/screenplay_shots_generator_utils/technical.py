@@ -4,6 +4,7 @@
 
 from typing import Dict, Any, Optional, List
 from ..project_paths import current_series_scope, safe_storybook_project_dir
+from ..continuity import _PHASE_SOURCE_RULES
 import json
 import re
 import os
@@ -226,15 +227,15 @@ LAYER A — ROLE + CONTRACT
 ═══════════════════════════════════════════════════════════════
 Ты -- оператор-постановщик. Технический анализ START кадра (T=0).
 
-[P0] SHOT_FRAME_SPEC = SOURCE OF TRUTH:
-- shot_frame_spec -- выбранный source of truth для шота.
+[P0] SHOT_FRAME_SPEC = DERIVED PHASE DESCRIPTION:
+- shot_frame_spec -- производное описание, подчинённое исходнику и зарегистрированным состояниям START/END.
 - Обязательные поля: primary_subject, visible_characters, must_show, must_not_show, camera_anchor.
 - pose_signature (из shot_frame_spec или start_state_spec) обязательна: initial_state_summary, character_actions и композиция сохраняют жестовый рисунок.
 - character_pose_signatures из start_state_spec -- authoritative позы; не своди второстепенных к generic massing.
-- scene_action/scene_continuity_facts шире шота -> следуй shot_frame_spec. Нельзя подменять шот другим событием сцены.
+- scene_continuity_facts.continuity задаёт зарегистрированные границы START/END; scene_action и прочие сводки шире шота и не подменяют его другим событием.
 
 [P0] STORYBOARD LOCKS:
-- Приоритет: shot_frame_spec > shot_description > scene_action (исключение: устойчивые факты сцены).
+- Приоритет: исходный storyboard > зарегистрированные состояния START/END > производный shot_frame_spec > промпты; scene_action остаётся общим контекстом.
 - Анализируй ТОЛЬКО текущий кадр. T=0 — один видимый момент согласно start_state_spec.t0_mode: frozen до события, early_motion в начале движения, mid_action внутри действия.
 - scene_continuity_facts (гардероб/предметы/элементы): используй если не противоречат shot_description и уместны по крупности (Wide/Medium -- включай; Close-up -- только если попадает в кадр). НЕ добавляй токсичность/мат/искажение имен.
 
@@ -353,7 +354,7 @@ JSON OUTPUT FORMAT:
 --------------------------------
 План камеры: {extended_context.get('camera_plan', '')}
 --------------------------------
-SHOT FRAME SPEC (авторитетный source of truth):
+SHOT FRAME SPEC (производное описание, подчинённое исходнику и зарегистрированным состояниям START/END):
 {json.dumps(extended_context.get('shot_frame_spec', {}), ensure_ascii=False, indent=2)}
 --------------------------------
 Персонажи в сцене: {extended_context.get('scene_characters', [])}
@@ -412,7 +413,7 @@ SHOT FRAME SPEC (авторитетный source of truth):
     try:
         response = call_openai_api(
             prompt=user_prompt,
-            system_prompt=system_prompt,
+            system_prompt=_PHASE_SOURCE_RULES + system_prompt,
             model=model_hard,
             max_tokens=32768,
             temperature=0.1,
@@ -444,7 +445,7 @@ def _analyze_end_shot_technical(
 Ты -- технический директор. Анализ КОНЕЧНОГО состояния END кадра (T=final).
 Глоссарий: shot_size=крупность, ratio=масштаб (1.0=без изменений, >1.0=приближение), delta=% изменения [-60..+60].
 
-**[P0] SHOT_FRAME_SPEC = SOURCE OF TRUTH:**
+**[P0] SHOT_FRAME_SPEC = DERIVED PHASE DESCRIPTION:**
 END-кадр обязан оставаться в границах shot_frame_spec: primary_subject, visible_characters, must_show, must_not_show. Чужие объекты/персонажи из video_prompt или scene-level контекста, отсутствующие в shot_frame_spec, -- ошибка.
 
 **[P0] STORYBOARD LOCKS (camera_plan + shot_description):**
@@ -452,7 +453,7 @@ END-кадр обязан оставаться в границах shot_frame_sp
 - final_shot_size согласуется: shot_description/camera_plan/shot_frame_spec, затем optional video_prompt.
 - PRIMARY SUBJECT LOCK: главный субъект определяется своей фазой shot_description и shot_frame_spec. Не переключай его произвольно; явную смену внимания или уход героя, заданные внутри этого же шота, сохрани в END.
 
-PRIMARY SOURCE OF TRUTH: END выводится из shot_description + shot_frame_spec. Если video_prompt пустой -- восстанови END как стоп-кадр shot_description, не выдумывай динамику. Если video_prompt есть -- только как вторичная transition-подсказка в пределах shot_frame_spec.
+END определяется исходным шотом и зарегистрированным конечным состоянием; shot_frame_spec описывает эту фазу. Если video_prompt пустой -- не выдумывай динамику. Если video_prompt есть -- используй только как вторичную подсказку перехода в тех же границах.
 
 === LAYER B: STEP-BY-STEP ALGORITHM ===
 
@@ -556,7 +557,7 @@ STORYBOARD (истина для текущего кадра):
 - shot_description: {extended_context.get('shot_description','')}
 - scene_continuity_facts (устойчивые факты сцены; применять если уместно по camera_plan и не противоречит shot_description):
 {json.dumps(extended_context.get('scene_continuity_facts', {}), ensure_ascii=False)}
-- shot_frame_spec (авторитетный source of truth для этого шота):
+- shot_frame_spec (производное описание, подчинённое исходнику и зарегистрированным состояниям START/END):
 {json.dumps(extended_context.get('shot_frame_spec', {}), ensure_ascii=False, indent=2)}
 
 НАЧАЛЬНЫЕ ПАРАМЕТРЫ (START):
@@ -598,7 +599,7 @@ TRANSITION HINT (optional video_prompt; may be empty):
     try:
         response = call_openai_api(
             prompt=user_prompt,
-            system_prompt=system_prompt,
+            system_prompt=_PHASE_SOURCE_RULES + system_prompt,
             model=model_hard,
             max_tokens=32768,
             temperature=0.1,
@@ -2333,6 +2334,7 @@ def _sanitize_start_via_llm(
         "scene_action": extended_context.get("scene_action", ""),
         "scene_continuity_facts": extended_context.get("scene_continuity_facts", {}),
         "scene_characters": extended_context.get("scene_characters", []),
+        "shot_frame_spec": extended_context.get("shot_frame_spec", {}),
         "previous_shot": extended_context.get("previous_shot", {}),
         "next_shot": extended_context.get("next_shot", {}),
         "current_shot_position": extended_context.get("current_shot_position", ""),
@@ -2343,6 +2345,7 @@ def _sanitize_start_via_llm(
         f"<context>\n"
         f"shot_description (ПРИОРИТЕТ): {json.dumps(context_summary['shot_description'], ensure_ascii=False)}\n"
         f"scene_continuity_facts: {json.dumps(context_summary['scene_continuity_facts'], ensure_ascii=False)}\n"
+        f"shot_frame_spec: {json.dumps(context_summary['shot_frame_spec'], ensure_ascii=False)}\n"
         f"scene_characters: {json.dumps(context_summary['scene_characters'], ensure_ascii=False)}\n"
         f"</context>\n\n"
         f"<raw_start_result>\n{json.dumps(start_result, ensure_ascii=False, indent=2)}\n</raw_start_result>\n\n"
@@ -2357,7 +2360,7 @@ def _sanitize_start_via_llm(
     try:
         response = call_openai_api(
             prompt=user_prompt,
-            system_prompt=system_prompt,
+            system_prompt=_PHASE_SOURCE_RULES + system_prompt,
             model=model_hard,
             max_tokens=32768,
             temperature=0.0,
@@ -2553,6 +2556,8 @@ def _sanitize_end_via_llm(
     context = {
         "start_result": start_result,
         "end_result": end_result,
+        "shot_description": extended_context.get("shot_description", ""),
+        "shot_frame_spec": extended_context.get("shot_frame_spec", {}),
         "video_prompt": video_prompt,
         "scene_continuity_facts": extended_context.get("scene_continuity_facts", {}),
         "previous_shot": extended_context.get("previous_shot", {}),
@@ -2564,6 +2569,8 @@ def _sanitize_end_via_llm(
         f"Санитайз END кадра (T=final). Приоритет P1-P2. Если ОК → верни без изменений.\n\n"
         f"<context>\n"
         f"video_prompt: {json.dumps(context['video_prompt'], ensure_ascii=False)}\n"
+        f"shot_description: {json.dumps(context['shot_description'], ensure_ascii=False)}\n"
+        f"shot_frame_spec: {json.dumps(context['shot_frame_spec'], ensure_ascii=False)}\n"
         f"scene_continuity_facts: {json.dumps(context['scene_continuity_facts'], ensure_ascii=False)}\n"
         f"next_shot: {json.dumps(context['next_shot'], ensure_ascii=False)}\n"
         f"</context>\n\n"
@@ -2580,7 +2587,7 @@ def _sanitize_end_via_llm(
     try:
         response = call_openai_api(
             prompt=user_prompt,
-            system_prompt=system_prompt,
+            system_prompt=_PHASE_SOURCE_RULES + system_prompt,
             model=model_hard,
             max_tokens=32768,
             temperature=0.0,

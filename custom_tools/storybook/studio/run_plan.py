@@ -746,6 +746,9 @@ def build_plan(project_id: str, mode: str, *, start_step: str | None = None, ste
     if mode == "single_step" and start == _VIDEO_STEP and merged.get("video_provider"):
         env["STORYBOOK_VIDEO_PROVIDER"] = str(merged["video_provider"])
 
+    if _VIDEO_STEP in run_ids and 'brief_from_prompt' not in run_ids:
+        step_params.setdefault(_VIDEO_STEP, {})['seed'] = brief.get('seed')
+
     _check_busy_and_jobs(root, problems)
 
     if mode == "resume":

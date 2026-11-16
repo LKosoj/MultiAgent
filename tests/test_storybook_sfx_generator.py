@@ -26,6 +26,8 @@ def project(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("effect,expected_duration", [
     ({"prompt": "Ветер, птицы. Выстрел. Пауза. Птицы поют громче", "duration": 20}, 20),
+    ({"prompt": "Один низкий удар с затуханием", "duration": 120}, 120),
+    ({"prompt": "Один сухой щелчок", "duration": 1.2}, 1.2),
     ({"prompt": "Ветер, птицы. Выстрел. 20 секунд"}, None),
     ("Ветер и птицы", None),
 ])
@@ -97,7 +99,7 @@ def test_silent_scene_does_not_call_model(project, monkeypatch):
     assert sfx.storybook_sfx_generator_tool("session", "project", series_id="series")["track_count"] == 0
 
 
-@pytest.mark.parametrize("duration", [0, -1, "NaN"])
+@pytest.mark.parametrize("duration", [0, -1, "NaN", 121, "inf"])
 def test_invalid_duration_does_not_call_model(project, monkeypatch, duration):
     _write(project / "91_screenplay/screenplay.json", {"screenplay": [{
         "scene_number": 1, "sfx": {"prompt": "wind", "duration": duration},

@@ -1,4 +1,5 @@
 import json
+import math
 import copy
 import base64
 import io
@@ -13,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent_command import model_hard, model_mapping
+from .continuity import _PHASE_SOURCE_RULES
 from utils import call_openai_api, extract_json_from_markdown
 from custom_tools.storybook.screenplay_shots_generator_utils.shared_utils import (
     _extract_shot_frame_spec_llm,
@@ -20,6 +22,7 @@ from custom_tools.storybook.screenplay_shots_generator_utils.shared_utils import
     _build_shot_frame_spec_cache_key,
     _SHOT_FRAME_SPEC_VERSION,
     _normalize_shot_frame_spec,
+    _frame_character_allowlist,
     _store_shot_frame_spec_to_disk_cache,
     _SHOT_FRAME_SPEC_CACHE,
     _shot_frame_spec_lock,
@@ -171,7 +174,7 @@ def _cache_set(cache: dict, key: Any, value: Any, maxsize: int = _LLM_CACHE_MAXS
         cache[key] = value
 
 
-_VIDEO_JUDGE_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+_VIDEO_JUDGE_CACHE: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
 _CLOSEUP_ROOM_CHECK_CACHE: Dict[Tuple[str, str, str], List[str]] = {}
 
 
@@ -193,18 +196,16 @@ def _llm_check_closeup_room_details(video_prompt: str, camera_plan: str, storybo
     if cached is not None:
         return list(cached)
 
-    sys = (
+    sys = _PHASE_SOURCE_RULES + (
         "You are a strict close-up framing validator for video prompts.\n"
         "Source of truth: storyboard_description defines the subject and required visible details; camera_plan tells the framing tightness.\n"
         "Task: find visible room/venue/environment SETTING-DETAIL phrases that contradict close-up framing.\n"
         "The specified subject, its parts/support and details explicitly required by storyboard_description are allowed. "
+        "Match those details by meaning across languages, including the objects used or moved by an authored action and the source of an effect. "
         "Do not classify them as forbidden setting merely because they are furniture, architecture or ground. "
         "For unrelated setting only, close-up framing means background is acceptable as blur-hints "
-        "(soft light, blurred shapes, bokeh, atmospheric haze). Naming furniture/architecture/audience/"
-        "stage elements as visible parts of the frame breaks close-up framing.\n\n"
-        "Allowed: the source subject and required visible details, blur-hints, atmospheric cues, light/shadow, color tones, generic background softness.\n"
-        "Disallowed when unrelated to the source subject or required details (examples, NOT a closed list): named seats/chairs/podium/stage/screen/curtains/"
-        "chandeliers/auditorium/hall/venue/architecture/audience rows when described as visible elements.\n\n"
+        "(soft light, blurred shapes, bokeh, atmospheric haze). Flag only establishing details unrelated to the source subject, "
+        "authored actions and their supports or sources, never an explicitly required actor, object or action.\n\n"
         "Return STRICT JSON: {\"violations\": [\"<offending phrase 1>\", ...]}.\n"
         "If no violations, return {\"violations\": []}.\n"
         "Each violation MUST be a verbatim substring copied from video_prompt (lowercased exact slice)."
@@ -283,6 +284,7 @@ def _llm_judge_video_prompt_lite(
     storyboard_camera_plan: str,
     model_override: Optional[Any] = None,
     frame_spec: Optional[Dict[str, Any]] = None,
+    duration_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Universal judge/rewriter for START video_prompt vs storyboard.
@@ -299,6 +301,7 @@ def _llm_judge_video_prompt_lite(
         str(candidate_video_prompt or "").strip(),
         str(storyboard_camera_plan or "").strip() + "||" + str(storyboard_description or "").strip()
         + "||" + json.dumps(frame_spec or {}, ensure_ascii=False, sort_keys=True),
+        str(duration_s),
     )
     # .get() — одна атомарная операция под GIL: не упадёт с KeyError, даже если
     # конкурентный _cache_set вытеснит ключ между проверкой и чтением (теперь, когда
@@ -311,22 +314,24 @@ def _llm_judge_video_prompt_lite(
     needs_close, needs_extreme = _requires_closeup_tokens(storyboard_camera_plan)
 
     # --- Layer A: Role + validation scope + source of truth ---
-    sys = (
+    sys = _PHASE_SOURCE_RULES + (
         "You are a strict consistency judge for video prompts.\n"
         "Source of truth: storyboard_description + camera_plan.\n"
         "shot_frame_spec supplies the achieved START/END states and physical geometry. Preserve its compatible phase visibility and opaque-barrier occlusion; a costume list is not a requirement to reveal hidden body parts.\n"
-        "Task: decide if BEFORE contradicts storyboard; evaluate CANDIDATE compliance; rewrite if non-compliant.\n"
+        "Task: evaluate the text requested by INPUT.mode against the source; rewrite only if non-compliant.\n"
         "Output: STRICT JSON object only. video_prompt = single-line English instructions; preserve source-visible text verbatim in its original script.\n\n"
         # --- Layer B: Step-by-step validation algorithm ---
         "## Evaluation algorithm\n"
         "1. Parse INPUT.mode:\n"
         "   - \"before_only\": evaluate BEFORE vs storyboard. Set contradiction_before. If true, output rewritten_candidate.\n"
-        "   - \"candidate_eval\": evaluate both BEFORE and CANDIDATE. If candidate_ok=false, output rewritten_candidate.\n"
-        "2. Extract 3-6 MUST_INCLUDE_FACTS from storyboard_description (identity, POV/anchor, key action, key objects, emotion/tone).\n"
-        "3. BEFORE contradicts if it misses any must_include_fact OR contains incompatible facts (wrong place/anchor/roles/objects/action/timing, invented props/symbols/displays).\n"
+        "   - \"candidate_eval\": evaluate CANDIDATE only; BEFORE is omitted because its separate check is already complete. Set contradiction_before=false. If candidate_ok=false, output rewritten_candidate.\n"
+        "2. Extract every source-authored event and reaction in source order, plus identity, POV/anchor, key objects and emotion/tone, as MUST_INCLUDE_FACTS.\n"
+        "3. In before_only mode, BEFORE contradicts if it misses any must_include_fact OR contains incompatible facts (wrong place/anchor/roles/objects/action/timing, invented props/symbols/displays).\n"
         "Required end results must be explicitly achieved by END, not merely approached or intended.\n"
-        "4. Candidate_ok=true only if all must_include_facts satisfied, no incompatible additions.\n"
-        "5. Rewrite structure: camera clause + framing token + primary subject + key action/timing + (optional) one blur-hint + tempo.\n\n"
+        "4. Candidate_ok=true only if all must_include_facts are satisfied in source order, with no incompatible additions, and the format rules below are met.\n"
+        "5. Accept a compliant candidate unchanged. Otherwise make minimal edits to CANDIDATE, preserving its compliant wording. "
+        "To meet the word limit, first remove repeated appearance, incidental wardrobe, lighting and set dressing; never omit an authored event or reaction. "
+        "Keep camera clause + framing token + primary subject + complete action/timing + optional blur-hint + tempo.\n\n"
         # --- Layer C: Violation types table + constraints ---
         "## Violation locks\n"
         "| Lock | Rule |\n"
@@ -362,9 +367,10 @@ def _llm_judge_video_prompt_lite(
         "mode": "before_only" if candidate_video_prompt is None else "candidate_eval",
         "storyboard_camera_plan": storyboard_camera_plan or "",
         "storyboard_description": storyboard_description or "",
-        "before_video_prompt": before_video_prompt or "",
+        **({"before_video_prompt": before_video_prompt or ""} if candidate_video_prompt is None else {}),
         "candidate_video_prompt": candidate_video_prompt or "",
         "shot_frame_spec": frame_spec or {},
+        "duration_s": duration_s,
     }
     resp = call_openai_api(
         prompt="INPUT:\n" + json.dumps(payload, ensure_ascii=False),
@@ -448,7 +454,7 @@ def _llm_judge_end_english_prompt_candidate(
 
     model_obj = model_override or model_hard
     # --- Layer A: Role + validation scope ---
-    sys = (
+    sys = _PHASE_SOURCE_RULES + (
         "You are a strict validator+rewriter for END english_prompt.\n"
         "Source of truth: storyboard_description (primary subject, objects), camera_plan (base framing), transition_video_prompt (camera movement).\n"
         "phase_state_spec and scene_continuity_facts specify the current phase and retained states when compatible with that source. repair_reasons explain the correction being checked. Do not restore rejected BEFORE facts while rewriting a correction.\n"
@@ -540,7 +546,7 @@ def _llm_judge_english_prompt_set_safe(
         return out
 
     model_obj = model_override or model_hard
-    sys = (
+    sys = _PHASE_SOURCE_RULES + (
         "You are a strict validator for a proposed full replacement of english_prompt.\n"
         "Decide whether AFTER is safe to apply given storyboard (camera_plan + description).\n"
         "Output STRICT JSON only.\n\n"
@@ -650,6 +656,7 @@ def _apply_repairs_to_items(
         storyboard_desc: str,
         storyboard_camera_plan: str,
         frame_spec: Dict[str, Any],
+        duration_s: Optional[float] = None,
     ) -> bool:
         """
         Universal: allow START video_prompt edits only when it clearly contradicts storyboard.
@@ -660,6 +667,7 @@ def _apply_repairs_to_items(
             storyboard_description=storyboard_desc or "",
             storyboard_camera_plan=storyboard_camera_plan or "",
             frame_spec=frame_spec,
+            duration_s=duration_s,
         )
         return bool(verdict.get("contradiction_before"))
 
@@ -859,12 +867,12 @@ def _apply_repairs_to_items(
                         if not desc:
                             field_block_reasons.append("video_prompt_blocked:no_storyboard_description")
                             continue
-                        # Deterministic allowance for close-up plans: if formal violations exist (missing tokens / room-markers),
-                        # allow the edit even if the LLM-judge contradiction check is flaky.
-                        if _detect_closeup_video_prompt_violations(before_vp, cam_plan, desc):
+                        # Existing formal rules also permit repair without a story contradiction.
+                        if (_detect_closeup_video_prompt_violations(before_vp, cam_plan, desc)
+                                or video_prompt_violations(before_vp, target.get("duration_s"))):
                             pass
                         else:
-                            if not _video_prompt_contradiction(before_vp, desc, cam_plan, validation_frame_spec):
+                            if not _video_prompt_contradiction(before_vp, desc, cam_plan, validation_frame_spec, target.get("duration_s")):
                                 field_block_reasons.append("video_prompt_blocked:not_contradictory")
                                 continue
 
@@ -881,6 +889,7 @@ def _apply_repairs_to_items(
                         storyboard_description=desc or "",
                         storyboard_camera_plan=cam_plan or "",
                         frame_spec=validation_frame_spec,
+                        duration_s=target.get("duration_s"),
                     )
                     # Extra deterministic guard: enforce explicit framing tokens.
                     needs_close, needs_extreme = _requires_closeup_tokens(cam_plan or "")
@@ -931,19 +940,26 @@ def _apply_repairs_to_items(
                         continue
                     # Instructions stay English; source-visible writing keeps its original script.
                     frame_spec = validation_frame_spec
-                    if _video_prompt_has_unexpected_cyrillic(str(v or ""), frame_spec):
+                    if (_video_prompt_has_unexpected_cyrillic(str(v or ""), frame_spec)
+                            or video_prompt_violations(str(v or ""), target.get("duration_s"))):
                         judge2 = _llm_judge_video_prompt_lite(
                             before_video_prompt=before_vp or "",
                             candidate_video_prompt=str(v or ""),
                             storyboard_description=desc or "",
                             storyboard_camera_plan=cam_plan or "",
                             frame_spec=frame_spec,
+                            duration_s=target.get("duration_s"),
                         )
                         rewritten2 = judge2.get("rewritten_candidate")
-                        if isinstance(rewritten2, str) and rewritten2.strip() and not _video_prompt_has_unexpected_cyrillic(rewritten2, frame_spec):
+                        if (isinstance(rewritten2, str) and rewritten2.strip()
+                                and not _video_prompt_has_unexpected_cyrillic(rewritten2, frame_spec)
+                                and not video_prompt_violations(rewritten2, target.get("duration_s"))):
                             v = rewritten2.strip()
                         else:
-                            field_block_reasons.append("video_prompt_blocked:contains_cyrillic")
+                            if _video_prompt_has_unexpected_cyrillic(str(v or ""), frame_spec):
+                                field_block_reasons.append("video_prompt_blocked:contains_cyrillic")
+                            field_block_reasons.extend(
+                                f"video_prompt_blocked:{reason}" for reason in video_prompt_violations(str(v or ""), target.get("duration_s")))
                             continue
                 if v is None:
                     continue
@@ -1124,6 +1140,24 @@ def _refresh_item_reference_roles(
         or "#000000" in str(item.get("reference_roles_instruction") or "")
     ):
         return
+
+    spec = item.get("_shot_frame_spec") or {}
+    phase = spec.get(f"{item.get('shot_type', 'start')}_state_spec") or spec
+    for name in phase.get("visible_characters", spec.get("visible_characters", [])):
+        current = (character_index_by_name or {}).get(str(name).strip().lower())
+        if not current or not current.get("reference_image_path"):
+            continue
+        characters = item.setdefault("characters", [])
+        entry = next((entry for entry in characters
+                      if (entry if isinstance(entry, str) else entry.get("name", "")).casefold()
+                      == current["name"].casefold()), None)
+        if entry is None:
+            characters.append(current)
+            entry = current
+        reference = entry.get("reference_image_path") if isinstance(entry, dict) else None
+        reference = reference or current["reference_image_path"]
+        if reference not in item["reference_image_paths"]:
+            item["reference_image_paths"].append(reference)
 
     replacements = {}
     for field, index in (("characters", character_index_by_name or {}), ("locations", location_index_by_name or {})):
@@ -1336,6 +1370,7 @@ def _apply_global_repairs_to_items(
                                 storyboard_description=desc or "",
                                 storyboard_camera_plan=cam_plan or "",
                                 frame_spec=target.get("_shot_frame_spec") or {},
+                                duration_s=target.get("duration_s"),
                             )
                             if not bool(verdict.get("contradiction_before")):
                                 continue
@@ -1351,6 +1386,7 @@ def _apply_global_repairs_to_items(
                             storyboard_description=desc or "",
                             storyboard_camera_plan=cam_plan or "",
                             frame_spec=target.get("_shot_frame_spec") or {},
+                            duration_s=target.get("duration_s"),
                         )
                         if needs_extreme and not any(t in cand_l for t in ["extreme close-up", "extreme close up"]):
                             verdict2["candidate_ok"] = False
@@ -1442,7 +1478,7 @@ def _global_screenplay_repair_pass(
             }
         )
 
-    system_prompt = """You are the FINAL guardrail for screenplay alignment.
+    system_prompt = _PHASE_SOURCE_RULES + """You are the FINAL guardrail for screenplay alignment.
 
 ## Layer A: Role + scope + source of truth
 
@@ -1663,6 +1699,7 @@ def shots_prompt_qa_tool(
         logger.warning("🧪 shots_prompt_qa_tool: screenplay пустой или не найден, пропускаем")
         return shots_data
 
+    character_catalog = _read_json(f"{base}/20_bible/characters.json") or []
     items: List[Dict[str, Any]] = shots_data.get("items", []) or []
     # Lookup storyboard meta by (scene_number, shot_number) for gating video_prompt edits
     storyboard_lookup: Dict[Tuple[int, int], Dict[str, Any]] = {}
@@ -1680,7 +1717,7 @@ def shots_prompt_qa_tool(
                 "camera_plan": sh.get("camera_plan", "") or "",
                 "description": sh.get("description", "") or "",
                 "timing": sh.get("timing", "") or "",
-                "characters": list(sc.get("characters") or []),
+                "characters": _frame_character_allowlist(sc.get("characters"), character_catalog),
             }
 
     if not items:
@@ -1786,8 +1823,13 @@ def shots_prompt_qa_tool(
     }
     character_index_by_name = {
         character["name"].strip().lower(): character
-        for character in (_read_json(f"{base}/20_bible/characters.json") or [])
+        for character in character_catalog
     }
+    for entity in [*character_index_by_name.values(), *location_index_by_name.values()]:
+        name = str(entity.get("name") or "").strip()
+        path = str(entity.get("reference_image_path") or "").strip()
+        if name and path:
+            available_references[(name, path)] = {"name": name, "reference_image_path": path}
     for item in items:
         if _item_in_requested_scope(item):
             _refresh_item_reference_roles(item, location_index_by_name, character_index_by_name)
@@ -1808,24 +1850,20 @@ def shots_prompt_qa_tool(
                 if name and path:
                     available_references[(name, path)] = {"name": name, "reference_image_path": path}
 
-    system_prompt = """You are a strict validator and repair tool for STORYBOARD SHOT PROMPTS.
+    system_prompt = _PHASE_SOURCE_RULES + """You are a strict validator and repair tool for STORYBOARD SHOT PROMPTS.
 
 ## Layer A: Role + scope + source of truth
 
 You receive ONE SCENE from the screenplay + all GENERATED SHOTS (start/end) for that scene.
 Task: detect contradictions between generated prompts and the screenplay, then REPAIR prompts to match.
 Perform all three audits independently, in this order:
-1. Compare the full shot_frame_specs against the original source sequence and retained object states from preceding storyboard descriptions; repair a conflicting derived spec.
+1. First derive each phase's source-visible canonical identities using available_references, including recognizable characters inside screens, photographs or reflections. INPUT.characters is scene roster context, not an exhaustive visible cast. Framing determines visibility; mentioning an offscreen actor does not show them. A carrier registered as a prop and the choice of primary_subject or scene_mode do not erase a depicted identity. Repair a missing canonical phase cast with the full _shot_frame_spec, putting carrier placement in character_pose_signatures instead of adding physical bodies to the room. Then compare the full shot_frame_specs against the original source sequence and registered phase boundaries; repair conflicting initial/final object states as well as the visible cast.
 2. Inspect EVERY START and END english_prompt and negative_prompt against the source and that item's phase_state_spec: visible states, pose/contact geometry, exclusions and explicitly required optics. Emit image/negative repairs for contradictions even when video repairs are also required.
 3. Inspect video_prompt, including the detected formal video violations. Those violations are a minimum list, not the complete scope of this task.
 Canonical identity is unchanged by a silhouette, back view or occlusion: use the canonical name in the phase cast, describe hidden features in pose/occlusion, and do not turn a ban on recognizable facial details into a ban on the character.
 Use each frame's style_id and INPUT.image_styles to distinguish artistic rendering texture from material features inside the scene. Do not erase the bound medium's grain or brushwork merely because a depicted material disappears.
 
-Source of truth hierarchy (highest to lowest):
-0. INPUT.source_brief, when provided, contains the original user material. Preserve its required facts; derived screenplay elaborations must not override it. Do not treat incidental ambiguous details as new requirements absent from that source.
-1. Original storyboard descriptions and camera plans: the current shot determines its action/framing, while earlier explicit object/part states persist until the source changes them. Silence about a part is not its destruction or removal.
-2. shot_frame_spec (derived data, authoritative only when compatible with that complete source continuity)
-3. scene.action + scene_continuity_facts (broader context, NOT a license to inject extra props into every shot)
+Original storyboard descriptions and camera plans determine the current shot action and framing. Registered START/END states are in scene_continuity_facts.continuity. INPUT.source_brief is the original user material and takes priority over derived screenplay elaborations. Preserve its required facts; do not promote ambiguous incidental details into requirements. Earlier explicit object/part states persist until the source changes them; silence is not removal. scene.action is broader context, not a license to add props to every shot. Preserve the first causal event and final result, rather than selecting an intermediate boundary.
 
 ## Layer B: Validation algorithm
 
@@ -1845,10 +1883,10 @@ If shot_frame_spec exists for a shot, validate against it only when it agrees wi
 - primary_subject defines the visual focus. Do NOT swap subjects.
 - Visual focus does not determine physical depth: a primary subject may remain farther from the camera than a secondary character. Preserve the route order and camera-relative foreground/background relationship rather than moving the focal subject to the front.
   Foreground means physically nearer to the camera, not merely the main compositional accent. Audit the written prompts of copied START frames too; copying valid pixels does not excuse a contradictory saved prompt.
-- must_show = mandatory visible facts; repair if missing from prompts.
-- must_not_show = forbidden facts; repair if present in prompts.
-- visible_characters = allowed visible cast.
-- Each generated item's phase_state_spec is its own START or END state; validate its image and negative prompt separately. Full start_state_spec/end_state_spec/transition_spec are in shot_frame_specs; transition_spec applies to START video_prompt.
+- must_show = mandatory visible facts of that image phase; repair if missing from its image prompt.
+- must_not_show = forbidden facts in that still-image phase and its negative prompt, not a ban on the shot's own later events in video.
+- visible_characters = allowed visible cast, including characters depicted on visible screens, photographs or in reflections. Preserve their identity references and their placement within that carrier, not as extra physical figures in the scene.
+- If phase_state_spec is omitted from a generated item, use shot_frame_specs[shot_number][shot_type + "_state_spec"], or that full spec when the phase field is absent. An explicit item phase_state_spec overrides this default; validate each image and negative prompt against its own phase. Source descriptions and camera plans are in INPUT.storyboard, keyed by shot_number. The complete video transition is the START item's video_prompt; END does not duplicate it. transition_spec applies to that full START-to-END video.
 - Shared must_show/must_not_show constraints must hold in both phases. An END result required by the source must not remain forbidden globally or in END; move a START-only restriction into start_state_spec. Repair a conflicting shared restriction instead of weakening the required completed result. Check consistency across phase lists, pose and world_physics as well as the image prompt.
 - A START with copy_from_previous_end=true reuses the previous END pixels instead of rendering its written prompt. Compare that previous END with the new START's subject, framing, camera and physical state. If they differ, emit set.english_prompt with the full correct START prompt (preserve it verbatim if already correct); this switches the existing full-copy link to reference-based generation. Do not force a copy just because the two shots share a location or a broad shot-size label.
 - facial_expression / gaze_direction / pose_signature / character_pose_signatures: treat as authoritative. Do NOT reset to neutral or "looking at camera" unless spec says so.
@@ -1878,13 +1916,15 @@ For a view across a physical barrier, separate camera side, actor side and the v
    Describe locomotion phases by visible configuration from this camera: stride width, limbs ahead of or behind the body, push-off, flight or landing, with near/far limbs where useful. Swapping anatomical left/right labels alone does not change the silhouette. A cyclic action may return to the same phase; do not force a different pose or prop position just to distinguish START/END. If derived intermediate poses obscure the source action, repair their phase facts together with the prompts while preserving source-assigned grips, supports and actions. Evaluate actual travel and background projection against the source camera movement.
 4. Language: english_prompt and negative_prompt use INPUT.language when provided, otherwise the language of storyboard.description; preserve technical terms and reference labels. video_prompt uses English instructions; preserve source-visible text verbatim in its original script.
 For a change of character visibility, distinguish source-required physical exits/entrances from revealing an already-present actor through framing or occlusion; preserve established positions and source order. Do not reduce a causal sequence to two actions or interpolate one identity into another. For quiet observation by a living subject, preserve the staged position while describing subtle breathing and source-consistent gaze/facial response; a wardrobe inventory and moving particles alone are insufficient.
-5. For IMAGE prompts only: START = one T=0 frame according to start_state_spec.t0_mode (frozen before action, early_motion or mid_action); END = T=final stop-frame. An ongoing START pose is not a completed END result. START.video_prompt covers the whole shot from START to END, including its complete action sequence; required end results must be explicitly achieved by END, not merely approached or intended. END.video_prompt is intentionally empty and must not be filled or repaired.
+5. For IMAGE prompts only: START = one T=0 frame according to start_state_spec.t0_mode (frozen before action, early_motion or mid_action); END = T=final stop-frame. An ongoing START pose is not a completed END result.
+5a. For VIDEO prompts: START.video_prompt covers the whole shot from START to END, including its complete source-authored action sequence and reactions within the clip. Image phase restrictions and t0_mode do not freeze the full video. Shortening prose preserves every required event; holding the pre-event state throughout the clip or putting events after the clip is a contradiction. END.video_prompt is intentionally empty and must not be filled or repaired.
 6. Continuity: preserve unchanged object/part states and character posture, support and wardrobe from earlier source shots, including in negative exclusions. Do not force those parts into a crop where they are not visible; do not erase or prohibit them merely because the current description does not repeat them. When a visible character remains on a specific support, state that relation rather than leaving a generic static figure that could be placed on a different support.
    For cumulative actions, preserve already completed parts in place and add the missing parts of the same result; do not replace earlier marks with a shifted redraw unless the source explicitly erases or transforms them.
    Inspect adjacent END-to-START boundaries in the whole-scene render sheet, not only each pair in isolation. Follow physical sides of boundaries and actor order along the same path; a change of shot size or camera side does not relocate actors. Distinguish camera viewpoint from actor location, and apply clothing/prop states only to their own real or imagined episode.
    Where the source names a posture, "remains on the support" is insufficient: preserve that posture as well as the support location.
 7. Multi-view location sheets: output ONE continuous frame (no collage/grid/multi-panel) unless storyboard explicitly requires split-screen.
 8. reference_image_paths: change only when strictly necessary. For END shots, continuity start frame reference (img_final_start_*.png) MUST remain.
+   If a source-visible character is depicted inside a screen, photograph or reflection but missing from visible_characters, repair the full _shot_frame_spec, item characters and reference_image_paths together, preserving that carrier placement and the ban on adding a physical figure to the room. Never replace canonical identity with a generic figure, creature or species label.
    When a source-required entity is missing, use its exact name/path descriptor from available_references for characters/locations and update the reference paths; do not guess file names. A listed previous END may be selected only for its specified START and only for object identity; current camera, pose and physical phase follow the current source.
 9. Historical appearance comes from canonical references. Remove historical-period labels, historical-accuracy demands and era-based object ban lists from english_prompt and negative_prompt; preserve current-frame weather, season, states and camera/light details.
 10. START is the beginning of this shot and END is the end of this same shot. Do not reject the shot's own later action as a neighboring event.
@@ -1949,21 +1989,11 @@ Apply these violation checks in order. Each is a HARD CONTRADICTION requiring re
 | MOVING PROP | Match the source-defined final position; a cyclic movement may return to the same position. |
 | CONTINUITY PROPS | Do NOT introduce new props/furniture not in Image 1 continuity reference. |
 
-### Translation note
-- video_prompt uses English instructions. Translate anchor nouns from Russian correctly, but preserve source-visible text verbatim in its original script.
-
-### Video_prompt repair structure (semantic, not rigid)
-When repairing START video_prompt:
-1. camera clause (static/track/dolly/zoom)
-2. framing token from camera_plan (close-up/extreme close-up/split-screen)
-3. primary subject phrase (from storyboard.description, no placeholders like "SUBJECT FACE")
-4. key action/timing (match storyboard exactly)
-5. optional ONE short generic blur-hint for environment
-6. tempo/micro-dynamics
+### Video_prompt repair rules
+""" + VIDEO_PROMPT_RULES + """
 
 ### Detected violations (authoritative)
-- If INPUT.detected_violations is non-empty, you MUST provide repairs for those entries.
-- Do NOT return {"repairs": [], "notes": "ok"} when detected_violations is non-empty.
+- Cover every INPUT.detected_violations entry with its full corrected set.video_prompt.
 
 ## Output schema
 {
@@ -1992,7 +2022,7 @@ When repairing START video_prompt:
 }
 
 If there are no issues, return {"repairs": [], "notes": "ok"}.
-Each repair has only scene_number, shot_number, shot_type, reasons and set at the top level. Put every changed field, including video_prompt, inside that same set object, never after it. Combine image and video changes for the same frame into one repair.
+Keep reasons brief. Each repair has only scene_number, shot_number, shot_type, reasons and set at the top level. Put every changed field, including video_prompt, inside that same set object, never after it. Combine image and video changes for the same frame into one repair.
 For one logical shot, a full `_shot_frame_spec` repair is sufficient once; the code applies it to both START and END items. Do not invent a partial spec.
 A prompt-only repair is insufficient when the derived spec still contradicts the source: include the full corrected `_shot_frame_spec`, and resolve ambiguous whole-object exclusions in its global, phase and transition fields before repairing the prompts.
 """
@@ -2066,7 +2096,6 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                     "timing": sh.get("timing"),
                     "camera_plan": sh.get("camera_plan"),
                     "description": sh.get("description"),
-                    "characters": list(scene.get("characters") or []),
                 }
             )
 
@@ -2110,7 +2139,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                 shot_number=shot_num_i,
                 shot_description=str(sh.get("description", "") or ""),
                 camera_plan=str(sh.get("camera_plan", "") or ""),
-                scene_characters=list(scene.get("characters") or []),
+                scene_characters=_frame_character_allowlist(scene.get("characters"), character_catalog),
                 location_time=str(scene.get("location_time", "") or ""),
                 location_canon_name=str((sh.get("location_canon_name") or scene.get("location_canon_name") or "")).strip(),
                 scene_action=_previous_shot_actions(scene.get("storyboard", []), shot_num_i),
@@ -2172,7 +2201,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                         cp = ""
                         desc_i = ""
                     vp = str(it.get("video_prompt", "") or "")
-                    issues = _detect_closeup_video_prompt_violations(vp, cp, desc_i) + video_prompt_violations(vp)
+                    issues = _detect_closeup_video_prompt_violations(vp, cp, desc_i) + video_prompt_violations(vp, it.get("duration_s"))
                     if issues:
                         detected_violations.append(
                             {
@@ -2195,6 +2224,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                                 storyboard_camera_plan=cp,
                                 model_override=model_obj,
                                 frame_spec=it.get("_shot_frame_spec") or {},
+                                duration_s=it.get("duration_s"),
                             )
                             if verdict.get("contradiction_before") is True:
                                 reason = str(verdict.get("reason") or "").strip()
@@ -2282,6 +2312,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                     "phase_state_spec": phase_state_spec,
                     "transition_video_prompt": transition_vp,
                     "timing": it.get("timing"),
+                    "duration_s": it.get("duration_s"),
                     "english_prompt": image_prompt,
                     "video_prompt": it.get("video_prompt"),
                     "negative_prompt": it.get("negative_prompt"),
@@ -2329,6 +2360,20 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                         "scene_number": scene_number, "shot_number": shot_number,
                         "shot_type": label, "output_path": reference_path,
                     })
+            canonical_characters = []
+            seen_character_paths = set()
+            for item in pair_items:
+                for character in item.get("characters") or []:
+                    if not isinstance(character, dict):
+                        continue
+                    reference_path = existing_reference_path(Path(base), str(character.get("reference_image_path") or ""))
+                    if reference_path in seen_character_paths or not os.path.isfile(reference_path):
+                        continue
+                    seen_character_paths.add(reference_path)
+                    label = f"CANONICAL_CHARACTER_{len(canonical_characters) + 1}"
+                    canonical_characters.append({"label": label, "name": character.get("name", "")})
+                    review_items.append({"scene_number": scene_number, "shot_number": shot_number,
+                                         "shot_type": label, "output_path": reference_path})
             pair_render_review_image = _scene_render_review_image(review_items)
             from .continuity import frame_continuity
             continuity_contexts = {item.get('shot_type', 'start'): frame_continuity(
@@ -2348,6 +2393,9 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                 "scene_number": scene_number,
                 "scene_continuity_facts": scene_continuity_facts,
                 "canonical_locations": canonical_locations,
+                "canonical_characters": canonical_characters,
+                "canonical_character_names": [character["name"] for character in character_catalog
+                                              if character.get("reference_image_path")],
                 "continuity": continuity_contexts,
                 "image_styles": {
                     shot["style_id"]: bound_image_styles[shot["style_id"]]
@@ -2370,12 +2418,14 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
             )
             visual_audit_response = call_openai_api(
                 prompt="AUDIT_INPUT:\n" + json.dumps(visual_audit_input, ensure_ascii=False),
-                system_prompt=(
+                system_prompt=_PHASE_SOURCE_RULES + (
                     "You are a rendered-frame visual audit. Inspect actual labeled pixels before written promises. "
                     "PREVIOUS_END_IDENTITY is only for object identity; current camera, pose and physical phase follow the current source. "
                     "Continuity identifies shared physical objects across scenes. SHARED_LANDMARK_GEOMETRY and its "
                     "fixed geometry override conflicting legacy CANONICAL_LOCATION designs. Current phase states "
                     "govern damage, support, possession and visibility; an offscreen prop must not follow the actor. "
+                    "CANONICAL_CHARACTER images identify canonical appearance, including actors depicted inside screens, photographs or reflections. Preserve their identity inside the carrier, not as new physical figures in the room. "
+                    "When the source visibly depicts a name from canonical_character_names inside a carrier but its identity reference is absent from CANONICAL_CHARACTER, a missing canonical identity reference is a violation. Generic species resemblance does not establish that identity. Apply this only to the phase showing the depiction, not to hidden or offscreen contents. "
                     "CANONICAL_LOCATION images identify the architecture and parts of the same place. Compare required visible surviving parts with those references; do not accept an unrelated landmark as their substitute. The current source defines damage, transformations, framing and occlusion: do not copy the canonical state or require its whole inventory in the shot. "
                     "Use each frame's style_id and the saved image_styles to distinguish rendering medium from in-scene materials. Paper grain, brushwork or film grain belonging to that style is not itself a surviving story object; require identifiable object geometry or features before flagging a failed material transformation. "
                     "Compare START/END background landmark positions and scales where visible against camera travel; "
@@ -2432,6 +2482,29 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
             with _report_lock:
                 report.setdefault("rendered_image_findings", []).extend(rendered_image_findings)
 
+        shots_with_duration = {
+            _safe_int(shot.get("shot_number")) for shot in generated_shots
+            if isinstance(shot.get("duration_s"), (int, float))
+            and not isinstance(shot["duration_s"], bool)
+            and math.isfinite(shot["duration_s"]) and shot["duration_s"] > 0
+        }
+        for shot in storyboard:
+            if _safe_int(shot.get("shot_number")) in shots_with_duration:
+                shot.pop("timing", None)
+
+        request_shots = []
+        for shot in generated_shots:
+            request_shot = {key: value for key, value in shot.items()
+                            if key not in {"storyboard_description", "storyboard_camera_plan", "transition_video_prompt", "camera_plan"}}
+            if _safe_int(shot.get("shot_number")) in shots_with_duration:
+                request_shot.pop("timing", None)
+            if str(shot.get("shot_type") or "").strip().lower() == "end" and not shot.get("video_prompt"):
+                request_shot.pop("video_prompt", None)
+            full_spec = shot_frame_specs.get(shot["shot_number"], {})
+            if request_shot.get("phase_state_spec") == full_spec.get(f"{shot['shot_type']}_state_spec", full_spec):
+                request_shot.pop("phase_state_spec", None)
+            request_shots.append(request_shot)
+
         payload = {
             "scene_number": scene_number,
             "language": project_language,
@@ -2450,38 +2523,33 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
             "scene_continuity_facts": scene_continuity_facts,
             "shot_frame_specs": shot_frame_specs,
             "storyboard": storyboard,
-            "generated_shots": generated_shots,
+            "generated_shots": request_shots,
             "image_styles": bound_image_styles,
             "detected_violations": detected_violations,
             "rendered_image_findings": rendered_image_findings,
         }
-        payload_str = json.dumps(payload, ensure_ascii=False)
+        payload_str = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         logger.info(f"🧪 shots_prompt_qa_tool: scene {scene_number} payload_chars={len(payload_str)}")
 
         violations_note = ""
         if detected_violations or rendered_image_findings:
             violations_note = (
-                "IMPORTANT: INPUT.detected_violations is authoritative.\n"
-                "- If detected_violations is non-empty, you MUST return repairs entries for those shots.\n"
-                "- You are NOT allowed to return repairs=[] / notes='ok' while detected_violations is non-empty.\n"
-                "- For each detected_violations entry, you MUST output set.video_prompt with the FULL corrected final single-line English video_prompt.\n"
-                "- For every INPUT.rendered_image_findings entry, provide a matching FULL set.english_prompt repair for that shot (or a full set._shot_frame_spec repair when the derived spec conflicts with the primary source). Unrelated or video-only repairs do not close a rendered image finding.\n"
+                "Cover every INPUT.detected_violations entry with the FULL corrected final single-line English set.video_prompt.\n"
+                "- For every INPUT.rendered_image_findings entry, provide a matching FULL set.english_prompt repair for that phase (preserve it verbatim if already correct). When the derived phase state or visible cast also contradicts the primary source, also include the full set._shot_frame_spec in the same repair. A prompt-only patch cannot close a contradictory spec or missing canonical cast/reference; generic appearance prose does not replace canonical identity. Unrelated or video-only repairs do not close a rendered image finding.\n"
                 "\n"
             )
         user_prompt = (
             "Validate and repair generated shots prompts for this scene.\n"
             "Return JSON patches ONLY where contradictions exist.\n\n"
             f"{violations_note}"
-            "Audit every image and negative prompt independently before video prompts. "
-            "The detected_violations list covers video checks only and does not replace the image/spec audit.\n\n"
             f"INPUT:\n{payload_str}"
         )
 
         obj = None
         last_resp_preview = ""
 
-        def _rendered_findings_covered(repairs: List[Dict[str, Any]]) -> bool:
-            for finding in rendered_image_findings:
+        def _rendered_findings_covered(repairs: List[Dict[str, Any]], findings: List[Dict[str, Any]]) -> bool:
+            for finding in findings:
                 covered = False
                 for repair in repairs:
                     if not isinstance(repair, dict):
@@ -2506,8 +2574,15 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
             return True
 
         for attempt in range(1, 4):
-            missing_video_keys = []
+            missing_video_keys = sorted({
+                (_safe_int(violation.get("shot_number")), str(violation.get("shot_type") or "").lower())
+                for violation in detected_violations
+            })
             unsupported_set_fields = []
+            missing_rendered_keys = [
+                (finding["shot_number"], finding["shot_type"]) for finding in rendered_image_findings
+            ]
+            format_error = ""
             resp = call_openai_api(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
@@ -2519,6 +2594,8 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
             )
             last_resp_preview = _safe_preview(resp, limit=600)
             obj = _extract_json_object(resp)
+            if obj is None:
+                format_error = "Response is not a JSON object."
             if obj is not None:
                 candidate_repairs = obj.get("repairs")
                 if isinstance(candidate_repairs, list):
@@ -2536,6 +2613,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                     or set(repair["set"]) - _QA_REPAIR_ITEM_FIELDS
                     for repair in candidate_repairs
                 ):
+                    format_error = "repairs must be a list of objects with a nonempty supported set and no fields outside the schema."
                     obj = None
             if obj:
                 # If we provided detected_violations but model returned no repairs, force a retry with stricter wording.
@@ -2551,9 +2629,12 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                     and repair["set"]["video_prompt"].strip()
                 }
                 missing_video_keys = sorted(required_video_keys - repaired_video_keys)
-                required_repairs_missing = rendered_image_findings and (
-                    not isinstance(repairs_try, list) or not _rendered_findings_covered(repairs_try)
-                )
+                missing_rendered_keys = [
+                    (finding["shot_number"], finding["shot_type"])
+                    for finding in rendered_image_findings
+                    if not _rendered_findings_covered(repairs_try, [finding])
+                ]
+                required_repairs_missing = bool(missing_rendered_keys)
                 if (
                     missing_video_keys
                     or required_repairs_missing
@@ -2568,19 +2649,14 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                 f"🧪 shots_prompt_qa_tool: scene {scene_number} invalid QA response on attempt {attempt}/3; "
                 f"resp_preview='{last_resp_preview}'"
             )
-            # tighten prompt for retries
+            # Keep the complete input and identify only the unresolved requirements.
             user_prompt = (
-                "Return STRICT JSON ONLY (no markdown, no prose). "
-                "All strings must be single-line (no raw newlines). "
-                "Every repairs entry must be an object with a nonempty supported set; no placeholders or mutation fields outside set. "
-                "If you need a line break, use \\n.\n\n"
-                "CRITICAL: If INPUT.detected_violations is non-empty, you MUST return repairs for those shots. "
-                "Cover EVERY detected entry with its full set.video_prompt; partial coverage and repairs=[] / ok are invalid.\n\n"
-                f"Unresolved required video repairs: {json.dumps(missing_video_keys)}. Return the COMPLETE repair list, including previously covered entries.\n\n"
-                f"Unsupported set fields: {json.dumps(unsupported_set_fields)}. Phase specs belong inside set._shot_frame_spec, not directly inside set.\n\n"
-                "CRITICAL: Every INPUT.rendered_image_findings entry must have a matching FULL set.english_prompt repair for that shot, or a full set._shot_frame_spec repair when the derived spec conflicts with the source. Unrelated/video-only repairs do not close the finding.\n\n"
+                "Return STRICT JSON with the COMPLETE repair list, including previously covered entries.\n"
+                f"Format error: {format_error}\n"
+                f"Unresolved required video repairs: {json.dumps(missing_video_keys)}.\n"
+                f"Unresolved rendered image findings: {json.dumps(missing_rendered_keys)}.\n"
+                f"Unsupported set fields: {json.dumps(unsupported_set_fields)}. Phase specs belong inside set._shot_frame_spec.\n\n"
                 f"{violations_note}"
-                "Audit every image and negative prompt independently before video prompts; detected video violations do not replace that audit.\n\n"
                 f"INPUT:\n{payload_str}"
             )
 
@@ -2649,7 +2725,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                     logger.error(f"🧪 shots_prompt_qa_tool: scene {sn} failed: {e}")
 
     unprocessed_scenes = set(scene_numbers_all) - _processed_scenes
-    if unprocessed_scenes:
+    if unprocessed_scenes and not _processed_scenes:
         raise RuntimeError(f"QA not completed for scenes: {sorted(unprocessed_scenes)}")
 
     # ------------------------------------------------------------
@@ -2661,7 +2737,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
     except Exception:
         max_repairs = 25
 
-    if max_repairs > 0 and report.get("scenes_processed", 0) > 0 and requested_shot_pairs is None:
+    if max_repairs > 0 and report.get("scenes_processed", 0) > 0 and requested_shot_pairs is None and not unprocessed_scenes:
         logger.info(f"🧪 shots_prompt_qa_tool: global screenplay pass start (max_repairs={max_repairs})")
         global_repairs = _global_screenplay_repair_pass(
             screenplay_scenes=screenplay_scenes,
@@ -2849,6 +2925,9 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
 
     # NOTE: We intentionally do NOT validate reference_image_paths against the filesystem here.
     # At this stage there may be zero generated images on disk; existence-based filtering is invalid and destructive.
+
+    if unprocessed_scenes:
+        raise RuntimeError(f"QA not completed for scenes: {sorted(unprocessed_scenes)}")
 
     logger.info(
         f"🧪 shots_prompt_qa_tool: scenes={report['scenes_processed']}, "

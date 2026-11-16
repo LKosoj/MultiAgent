@@ -66,6 +66,38 @@ def test_aitunnel_reference_submit_poll_download_and_reuse(tmp_path, monkeypatch
     assert job['provider'] == 'aitunnel' and job['status'] == 'downloaded'
 
 
+def test_gateway_wan_disables_expansion_without_resubmitting_accepted_clip(tmp_path, monkeypatch):
+    from PIL import Image
+    monkeypatch.setenv('ROUTERAI_API_BASE', 'https://gateway.example/v1')
+    ref = tmp_path / 'reference.png'
+    Image.new('RGB', (32, 32)).save(ref)
+    model = 'llmgateway/wan3.0'
+    item = dict(scene_number=1, shot_number=1, video_mode='references', duration_s=4,
+                video_prompt='Turn in place', reference_image_paths=[str(ref)], video_path=str(tmp_path / 'video.mp4'))
+    store = _ProviderJobStore(str(tmp_path / 'jobs.json'), provider_name='routerai')
+    catalog = {model: dict(supports_image_references=True, supported_durations=[4])}
+    posts = []
+    def post(url, **kwargs):
+        posts.append(kwargs['json'])
+        response = requests.Response()
+        response.status_code = 202
+        response._content = json.dumps({'id': f'job-{len(posts)}'}).encode()
+        return response
+    monkeypatch.setattr(vp.requests, 'post', post)
+    monkeypatch.setattr(generator, '_wait_for_video_completion_aitunnel',
+                        lambda *a, **k: {'unsigned_urls': ['https://cdn.example/result.mp4']})
+    monkeypatch.setattr(generator, '_download_video_aitunnel',
+                        lambda url, path, headers: Path(path).write_bytes(b'video'))
+    params = dict(session_id='test', api_key='test', model_catalog=catalog, configured_model=model,
+                  seed=None, language='en', job_store=store, provider_name='routerai')
+    assert generator._generate_single_video_aitunnel(item=item, **params)['success']
+    assert generator._generate_single_video_aitunnel(item=item, skip_prompt_enhancement=True, **params)['success']
+    assert len(posts) == 1
+    item['video_prompt'] = 'Remain on the original platform and turn in place'
+    assert generator._generate_single_video_aitunnel(item=item, skip_prompt_enhancement=True, **params)['success']
+    assert posts[-1]['provider_options'] == {'alibaba': {'prompt_extend': False}}
+
+
 def test_reference_submission_sends_original_speech_fragment(tmp_path, monkeypatch):
     import base64
     import io

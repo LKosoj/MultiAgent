@@ -428,7 +428,7 @@ def _prepare(project_id, shot_keys, what, steps_to_run, abandon, image_parts, su
     if what in ("images", "both"):
         doc, frames = image_frames(project_id)
         linked = linked_closure(frames, keys, image_parts)
-        step_outputs = {"background_references": build_items(doc, frames, keys, linked, image_parts)}
+        step_outputs = {"storybook_video_plan": build_items(doc, frames, keys, linked, image_parts)}
     if what in ("video", "both"):
         expanded = expand_video_keys(project_id, keys)
         pending = pending_paid_jobs(root, expanded)

@@ -305,6 +305,27 @@ def test_publish_records_publication_sources_before_interrupted_write(tmp_path, 
     assert ct._repair_candidate(base, source, candidate, fingerprint) is candidate
 
 
+@pytest.mark.parametrize('shot_number,update', [
+    (None, {'action': 'Герой оставляет чемодан у арки.'}),
+    (1, {'description': 'Чемодан стоит у арки.'}),
+])
+def test_changed_staging_discards_old_scene_facts_only_in_changed_scene(shot_number, update):
+    screenplay = _screenplay()
+    for scene in screenplay['screenplay']:
+        scene['scene_continuity_facts'] = {'state_changes_by_shot': {'shot_1': 'Чемодан на платформе.'}}
+    source = {'screenplay': screenplay, 'characters': []}
+    plan = _plan() | {'repairs': [dict(scene_number=1, shot_number=shot_number,
+                                     set=update, reason='Согласование места чемодана.')]}
+    corrected = ct._apply_repairs(source, plan)
+    assert 'scene_continuity_facts' not in corrected['screenplay']['screenplay'][0]
+    assert corrected['screenplay']['screenplay'][1:] == screenplay['screenplay'][1:]
+    ct._attach_scene_facts(corrected['screenplay'], plan)
+    facts = corrected['screenplay']['screenplay'][0]['scene_continuity_facts']
+    assert set(facts) == {'continuity'}
+    assert ct._apply_repairs(corrected, plan) == corrected
+    assert screenplay['screenplay'][0]['scene_continuity_facts']['state_changes_by_shot']
+
+
 def test_grouped_scene_repair_is_normalized_and_preserves_shot_fields():
     screenplay = _screenplay()
     screenplay['screenplay'][0].update(voiceover='Голос автора', timing='00:03')

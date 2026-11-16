@@ -84,6 +84,9 @@ def test_pp06_start_and_end_keep_english_prompt_english_for_ru_and_en(monkeypatc
         assert len(captured) == 2
         for request in captured:
             text = request["system_prompt"] + request["prompt"]
+            assert "авторитетный source of truth" not in text
+            assert "— это source of truth" not in text
+            assert "— source of truth" not in text
             assert "`english_prompt`: ALWAYS in English" in text or "english_prompt" in text and "English" in text
             assert "Пиши `english_prompt` и `negative_prompt` строго на" not in text
             assert "только в `negative_prompt` допустимы" not in text
@@ -168,3 +171,33 @@ def test_pp09_start_examples_keep_frozen_environment_before_change(monkeypatch):
     assert "first hairline crack at edges" not in system
     assert "door barely ajar" not in system
     assert "сохраняй заданные начальные целостность и опору" in system
+
+
+@pytest.mark.parametrize('stage', ['start', 'end', 'sanitize_start', 'sanitize_end'])
+def test_phase_rules_and_sources_reach_each_technical_stage(monkeypatch, stage):
+    captured, fake_api = _capture({'characters': ['Hero'], 'location': 'Hall'})
+    monkeypatch.setattr(technical, 'call_openai_api', fake_api)
+    context = _context(
+        shot_description='Hero picks the parcel up from the table.',
+        scene_continuity_facts={'continuity': {'frames': {
+            '1:1:start': {'state': 'parcel_on_table'},
+            '1:1:end': {'state': 'parcel_held'},
+        }}},
+    )
+    context['shot_frame_spec']['start_state_spec'] = {'state': 'derived-held-START'}
+    raw = {'characters': ['Hero'], 'location': 'Hall'}
+    if stage == 'start':
+        technical._analyze_shot_technical(context)
+    elif stage == 'end':
+        technical._analyze_end_shot_technical(raw, context)
+    elif stage == 'sanitize_start':
+        technical._sanitize_start_via_llm(raw, context)
+    else:
+        technical._sanitize_end_via_llm(raw, raw, 'Hero lifts the parcel.', context)
+    request = captured[0]
+    assert 'SOURCE PRIORITY (highest to lowest)' in request['system_prompt']
+    assert 'shot_frame_spec > shot_description' not in request['system_prompt']
+    assert context['shot_description'] in request['prompt']
+    assert 'parcel_on_table' in request['prompt'] and 'parcel_held' in request['prompt']
+    assert 'derived-held-START' in request['prompt']
+    assert 'авторитетный source of truth' not in request['prompt']

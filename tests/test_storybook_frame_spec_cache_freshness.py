@@ -128,6 +128,8 @@ def test_frame_spec_exclusions_do_not_expand_partial_changes(tmp_path, monkeypat
     )
     assert result['primary_subject'] == 'cabinet'
     assert 'partial change does not imply complete absence' in calls[0]['system_prompt']
+    assert 'SOURCE PRIORITY (highest to lowest)' in calls[0]['system_prompt']
+    assert 'visible=false does not forbid' in calls[0]['system_prompt']
 
 
 def test_unkeyed_existing_shot_is_not_reused(tmp_path, monkeypatch):

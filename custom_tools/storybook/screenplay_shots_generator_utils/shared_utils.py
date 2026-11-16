@@ -12,6 +12,7 @@ import re
 from agent_command import model_code, model_hard, model_ultimate, model_lite
 from utils import call_openai_api, parse_llm_json
 from custom_tools.storybook.project_paths import safe_storybook_project_dir
+from custom_tools.storybook.continuity import _PHASE_SOURCE_RULES
 from custom_tools.storybook.domain_glossary_config import (
     continuity_token_rules as _domain_continuity_token_rules,
 )
@@ -26,7 +27,7 @@ _locations_file_lock = threading.Lock()
 
 _shot_frame_spec_lock = threading.Lock()
 # Increment when extraction rules change so persisted phase states are rebuilt.
-_SHOT_FRAME_SPEC_VERSION = 8
+_SHOT_FRAME_SPEC_VERSION = 9
 _SHOT_FRAME_SPEC_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -530,6 +531,14 @@ def _load_shot_frame_spec_from_existing_shots(
     return {}
 
 
+def _frame_character_allowlist(scene_characters, characters_data):
+    """Canonical names are eligible; the source and phase spec decide visibility."""
+    return list(dict.fromkeys([*(scene_characters or []), *[
+        character['name'] for character in characters_data
+        if character.get('name') and character.get('type') != 'continuity'
+    ]]))
+
+
 def _normalize_shot_frame_spec(
     raw_spec: Dict[str, Any],
     scene_characters: List[str],
@@ -804,10 +813,10 @@ def _extract_shot_frame_spec_llm(
         )
         return cached
 
-    system_prompt = """
+    system_prompt = _PHASE_SOURCE_RULES + """
 Ты — shot frame spec planner для storyboard-шотов.
 Выбери один конкретный внутренний frame spec для ОДНОГО шота, без narrative summary и без выдумывания новых объектов.
-Единственный источник событий и видимого состава текущего шота — shot_description. scene_action содержит только предшествующие шоты и задаёт уже достигнутые состояния; текущие события берутся только из shot_description. scene_characters задаёт допустимые канонические имена, а не обязательное присутствие всех героев. Не добавляй вход, выход, жест или реакцию, которых нет в shot_description, даже если они есть в общем действии сцены.
+Источник новых событий текущего шота — shot_description; зарегистрированные состояния START/END из scene_continuity_facts.continuity задают его физические границы и сохраняющийся реквизит. scene_action содержит только предшествующие шоты и не заменяет эти границы. scene_characters задаёт допустимые канонические имена, а не обязательное присутствие всех героев. Не добавляй вход, выход, жест или реакцию, которых нет в shot_description, даже если они есть в общем действии сцены.
 Для каждой фазы разделяй положение камеры и персонажей по сторонам преград. В world_physics фиксируй видимую область проёма, сохранённые части поверхности и естественное перекрытие тела; не увеличивай проём ради показа всех перечисленных деталей. При смене видимости персонажей различай физический выход/вход и раскрытие уже присутствующего героя ракурсом или перекрытием. Вход задавай только если его требует shot_description; сохраняй положение и идентичность остальных героев.
 
 Верни СТРОГО JSON-объект такого вида:
@@ -893,12 +902,13 @@ def _extract_shot_frame_spec_llm(
 - Верхний уровень задаёт общие значения, а состояния START/END — точный состав своих фаз. Поздний объект собственного шота может быть запрещён в START, но не в общих must_not_show, END или transition_spec.
 - camera_plan = framing anchor, а не повод подменить содержание.
 - location_time/location_canon_name = только контекст локации и не повод тащить в кадр новые объекты.
-- Не тащи в spec конкретные дисплеи, экраны, подиумы, микрофоны, вывески, реквизит или персонажей, если их нет в shot_description этого шота.
+- Не тащи в spec конкретные дисплеи, экраны, подиумы, микрофоны, вывески, реквизит или персонажей, если их нет в shot_description или зарегистрированных состояниях этой фазы.
 - Не превращай соседние события сцены в содержимое текущего шота.
 - Охватывай собственный шот целиком: START — его начальное состояние, END — итог после последнего заданного действия, transition_spec — действия между ними. Не принимай позднее действие этого же shot_description за событие соседнего шота и не помещай его в must_not_introduce.
 - Персонаж или предмет, появляющийся позже внутри собственного шота, может отсутствовать в START, но не должен из-за этого запрещаться в END и переходе. Если герой явно выходит из кадра или источник переводит внимание на другой предмет, отрази эту смену в конечной фазе, не удерживай начальный субъект вопреки источнику.
 - Если шот про одного персонажа или один объект, не делай ensemble только потому, что в сцене есть ещё персонажи.
 - visible_characters можно брать только из scene_characters и только точными каноническими именами.
+- Включай также персонажей, видимых на изображениях внутри кадра: на экранах, фотографиях и в отражениях. Укажи носитель изображения в их позе; не переноси изображённого героя физически в помещение.
 - must_show должен перечислять только то, что можно одновременно увидеть в одном конкретном кадре.
 - must_not_show используй для явных запретов на чужие события/чужие объекты/чужие зоны сцены, которые часто галлюцинируются.
 - A partial change does not imply complete absence: do not expand a changed part into disappearance or prohibition of the whole object or its unchanged parts unless the source explicitly requires that result.
@@ -1546,6 +1556,7 @@ def _build_extended_context(
     # at scene level, reuse them for generation and downstream QA instead of recomputing later.
     scene_continuity_facts = dict(scene_continuity_facts or {})
 
+    allowed_character_names = _frame_character_allowlist(scene_characters, characters_data)
     shot_frame_spec = _extract_shot_frame_spec_llm(
         project_id=project_id,
         scene_number=int(scene.get("scene_number", 1) or 1),
@@ -1553,7 +1564,7 @@ def _build_extended_context(
         shot_description=shot_description or "",
         camera_plan=camera_plan or "",
         scene_action=scene_action or "",
-        scene_characters=scene_characters or [],
+        scene_characters=allowed_character_names,
         location_time=scene.get("location_time", "") or "",
         location_canon_name=effective_loc_canon,
         scene_continuity_facts=scene_continuity_facts,
@@ -1590,7 +1601,7 @@ def _build_extended_context(
             shot_number=int(shot_number or 1),
             shot_description=shot_description or "",
             camera_plan=camera_plan or "",
-            scene_characters=scene_characters or [],
+            scene_characters=allowed_character_names,
             location_time=scene.get("location_time", "") or "",
             location_canon_name=effective_loc_canon,
             scene_action=scene_action or "",

@@ -8,6 +8,88 @@ from custom_tools.storybook import continuity, reference_catalog, artist_batch_e
 from custom_tools import image_tools
 
 
+def test_landmark_creates_missing_location_source_first(tmp_path, monkeypatch):
+    base = tmp_path / 'project'
+    bible = base / '20_bible'
+    bible.mkdir(parents=True)
+    source = bible / 'references/locations/place.png'
+    (bible / 'locations.json').write_text(json.dumps([{'name': 'Place', 'reference_image_path': str(source)}]))
+    (bible / 'continuity_plan.json').write_text(json.dumps({'entities': [
+        {'id': 'gate', 'name': 'Gate', 'kind': 'landmark', 'world_id': 'world',
+         'locations': ['Place'], 'reference_location': 'Place', 'geometry': 'Two posts'}]}))
+    requested = []
+    def prepare(session_id, project_id, items, *args, **kwargs):
+        requested.append((project_id, items))
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b'location source')
+    monkeypatch.setattr(artist_batch_edit, '_ensure_references_exist', prepare)
+    monkeypatch.setattr(image_tools, 'edit_image_vse_tool', lambda **k: Path(k['output_path']).write_bytes(b'landmark'))
+    monkeypatch.setattr(artist_batch_edit, '_reference_requirements_met', lambda *a: True)
+
+    continuity.ensure_landmark_references(base, 's', 0)
+
+    assert requested == [('project', [{'reference_image_paths': [str(source)]}])]
+
+
+@pytest.mark.parametrize('cached_source', [False, True])
+def test_unchanged_landmark_edit_keeps_source_reference(tmp_path, monkeypatch, cached_source):
+    (tmp_path / 'project.json').write_text('{"format":"storybook-series-v1"}')
+    source = tmp_path / 'source.png'
+    source.write_bytes(b'source')
+    source = Path(reference_catalog.store_reference(tmp_path, source, 'location', 'location:place'))
+    bible = tmp_path / '20_bible'
+    bible.mkdir()
+    (bible / 'locations.json').write_text(json.dumps([{'name': 'Place', 'reference_image_path': str(source)}]))
+    (bible / 'continuity_plan.json').write_text(json.dumps({'entities': [
+        {'id': 'gate', 'name': 'Gate', 'kind': 'landmark', 'world_id': 'world',
+         'locations': ['Place'], 'reference_location': 'Place', 'geometry': 'Two posts'}]}))
+    monkeypatch.setattr(reference_catalog, 'reuse_reference', lambda *a, **k: str(source) if cached_source else None)
+    monkeypatch.setattr(reference_catalog, 'reference_review_current', lambda *a: False)
+    monkeypatch.setattr(artist_batch_edit, '_reference_requirements_met', lambda *a: False)
+    monkeypatch.setattr(continuity, 'existing_reference_path', lambda base, value: str(source))
+    monkeypatch.setattr(image_tools, 'edit_image_vse_tool', lambda **k: Path(k['output_path']).write_bytes(b'source'))
+
+    with pytest.raises(RuntimeError, match='unchanged source'):
+        continuity.ensure_landmark_references(tmp_path, 's', 0)
+
+    assert source.read_bytes() == b'source'
+    records = reference_catalog._read(tmp_path)['references']
+    assert len(records) == 1
+    assert records[hashlib.sha256(b'source').hexdigest()]['selectable']
+    assert records[hashlib.sha256(b'source').hexdigest()]['kinds'] == ['location']
+
+
+def test_landmark_keeps_fixed_parts_and_excludes_movable_props(tmp_path, monkeypatch):
+    bible = tmp_path / '20_bible'
+    bible.mkdir()
+    source = tmp_path / 'source.png'
+    source.write_bytes(b'source')
+    entity = {'id': 'gate', 'name': 'Gate', 'kind': 'landmark', 'world_id': 'world',
+              'geometry': 'Gate with a fixed panel', 'locations': ['Place'], 'reference_location': 'Place'}
+    props = [dict(id=name, name=name, kind='prop', world_id='world', locations=['Place'], states=states)
+             for name, states in [
+                 ('Panel', [{'support': 'wall', 'holder': None, 'motion': 'stationary'}]),
+                 ('Tool', [{'support': 'hand', 'holder': 'Worker', 'motion': 'stationary'}]),
+                 ('Card', [{'support': 'tray', 'holder': None, 'motion': 'stationary'},
+                           {'support': 'wall', 'holder': None, 'motion': 'stationary'}])]]
+    (bible / 'continuity_plan.json').write_text(json.dumps({'entities': [entity, *props]}))
+    (bible / 'locations.json').write_text(json.dumps([{'name': 'Place', 'reference_image_path': str(source)}]))
+    generated, reviews = [], []
+    def generate(**kwargs):
+        generated.append(kwargs)
+        Path(kwargs['output_path']).write_bytes(b'new landmark')
+    monkeypatch.setattr(image_tools, 'edit_image_vse_tool', generate)
+    monkeypatch.setattr(artist_batch_edit, '_reference_requirements_met', lambda path, data: reviews.append(data) or True)
+
+    continuity.ensure_landmark_references(tmp_path, 's', 0)
+
+    assert 'Panel' not in generated[0]['negative_prompt']
+    assert all('Panel' not in requirement for requirement in reviews[0]['reference_requirements'])
+    for name in ('Tool', 'Card'):
+        assert name in generated[0]['negative_prompt']
+        assert name in reviews[0]['reference_requirements'][-1]
+
+
 @pytest.mark.parametrize('cached_content', [b'valid', b'invalid', None])
 def test_landmark_requirements_checked_before_reuse_or_publication(tmp_path, monkeypatch, cached_content):
     (tmp_path / '20_bible').mkdir()

@@ -54,20 +54,16 @@ class TestStorybookPipelineDag(unittest.TestCase):
 
         self.assertEqual(missing, set())
 
-    def test_background_cards_are_prepared_before_shot_images(self):
+    def test_shot_images_use_video_plan_without_an_extra_background_catalog(self):
         steps = {step.id: step for step in self._load_storybook().steps}
-        self.assertIn("shots_prompt_qa", steps["background_reference_plan"].depends_on)
-        self.assertIn("character_reference_states", steps["background_reference_plan"].depends_on)
-        self.assertEqual(steps["background_reference_plan"].tool_params["shots_data"], "{storybook_video_plan}")
+        self.assertNotIn("background_reference_plan", steps)
+        self.assertNotIn("background_references", steps)
         self.assertEqual(steps["storybook_video_plan"].tool_params["shots_data"], "{character_reference_states}")
         self.assertIn("character_reference_states", steps["storybook_video_plan"].depends_on)
-        self.assertIn("storybook_video_plan", steps["background_reference_plan"].depends_on)
         self.assertNotIn("artist_batch_shots", steps["storybook_video_plan"].depends_on)
-        self.assertEqual(steps["background_references"].tool_params["shots_data"], "{background_reference_plan}")
-        self.assertIn("background_reference_plan", steps["background_references"].depends_on)
         self.assertIn("shots_prompt_qa", steps["character_reference_states"].depends_on)
-        self.assertIn("background_references", steps["artist_batch_shots"].depends_on)
-        self.assertEqual(steps["artist_batch_shots"].tool_params["items"], "{background_references}")
+        self.assertIn("storybook_video_plan", steps["artist_batch_shots"].depends_on)
+        self.assertEqual(steps["artist_batch_shots"].tool_params["items"], "{storybook_video_plan}")
 
     def test_reference_tools_resolve_through_pipeline_registry(self):
         from agent_factory import ToolRegistry

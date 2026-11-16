@@ -13,7 +13,20 @@ from utils import call_openai_api, parse_llm_json
 from .project_paths import existing_reference_path, safe_storybook_project_dir, reference_project_dir
 
 _PLAN_VERSION = 5
-_BOUNDARY_INSTRUCTION = (
+_PHASE_SOURCE_RULES = (
+    'SOURCE PRIORITY (highest to lowest): original user material and storyboard > registered START/END continuity > derived shot_frame_spec > generated prompts.\n'
+    'Registered physical states define the boundaries of each shot, including holder, support and completed changes. '
+    'Derived phase descriptions and prompts must preserve those boundaries; an early-motion pose must not skip the first authored causal event or import an END result into START. '
+    'If the original source contradicts the plan, correct the derived plan, never rewrite the source or justify an incorrect render. '
+    'Broader scene summaries and reference images do not override the current source and registered phase states. '
+    'visible=true requires the object to be shown; visible=false does not forbid an object from appearing. '
+    'Require absence only when the original source or registered physical state explicitly requires absence or occlusion. '
+    'An object that appears retains its registered physical state regardless of whether its depiction was required.\n'
+    'Image phase restrictions and t0_mode govern the corresponding still image only; video_prompt spans the full START-to-END transition, including all source-required events and reactions within the clip. Never hold a pre-event START for the entire video or move its own required events beyond the clip. '
+    'Characters depicted on screens, photographs or in reflections retain canonical names and identity references inside that carrier, without adding their physical bodies to the room. '
+    'visible_characters contains exact canonical names only, without carrier qualifiers or descriptions; put carrier placement in character_pose_signatures.\n'
+)
+_BOUNDARY_INSTRUCTION = _PHASE_SOURCE_RULES + (
     'START отражает начало шота, END — последнее состояние после всех заданных в нём событий, не промежуточную фазу. '
     'На один предмет в одной фазе допустим один переход: обобщи START → итоговый END; промежуточным фазам не нужны отдельные ключи или два перехода на одной границе. '
     'Явное превращение или изменение состояния представь итоговым состоянием и одним переходом с точной цитатой из description. '
@@ -200,6 +213,8 @@ def _apply_repairs(source, plan):
         allowed = {'action'} if target is scene else {'description'}
         if not repair.get('reason') or not repair.get('set') or not set(repair['set']).issubset(allowed):
             raise ValueError('Continuity repair may only reconcile staging descriptions')
+        if any(target.get(field) != value for field, value in repair['set'].items()):
+            scene.pop('scene_continuity_facts', None)
         target.update(repair['set'])
     characters = {character['name']: character for character in result['characters']}
     for name, identity in plan.get('character_identity', {}).items():
@@ -540,12 +555,18 @@ def ensure_landmark_references(base, session_id, seed):
     from .background_references import _reference_path
     from .reference_catalog import (reuse_reference, store_reference, reject_reference,
                                     reference_review_current, accept_reference_review)
-    from .artist_batch_edit import _reference_requirements_met
+    from .artist_batch_edit import _ensure_references_exist, _reference_requirements_met
 
     plan = load_continuity_plan(base)
     if not plan:
         return
     locations = {entry['name']: entry for entry in json.loads((base / '20_bible/locations.json').read_text())}
+    required_locations = {entity['reference_location'] for entity in plan['entities'] if entity['kind'] == 'landmark'}
+    missing = [str(path) for name in sorted(required_locations)
+               if not (path := _reference_path(base, locations[name]['reference_image_path'])).is_file()]
+    if missing:
+        _ensure_references_exist(session_id, reference_project_dir(base).name,
+                                 [{'reference_image_paths': missing}], [], 'workflow', seed)
 
     def keep_or_set_path(entity, resolved):
         # хеши кадров берут строку пути: прежнюю не меняем, если она указывает на тот же файл
@@ -560,6 +581,7 @@ def ensure_landmark_references(base, session_id, seed):
 
     def render(entity):
         source = _reference_path(base, locations[entity['reference_location']]['reference_image_path'])
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
         orientation_rule = (
             'Если в устройстве явно не задана другая система отсчёта, слева/справа означают стороны '
             'изображения для зрителя в первом опорном виде, а не собственные стороны объекта. '
@@ -590,7 +612,9 @@ def ensure_landmark_references(base, session_id, seed):
                    and other['world_id'] == entity['world_id']
                    and set(other.get('locations', [])) & set(entity.get('locations', []))]
         other_landmarks = [other['name'] for other in related if other['kind'] == 'landmark']
-        props = [other['name'] for other in related if other['kind'] == 'prop']
+        props = [other['name'] for other in related if other['kind'] == 'prop' and (
+            any(state.get('holder') or state.get('motion') == 'moving' for state in other['states'])
+            or len({(state.get('space'), state.get('support')) for state in other['states']}) > 1)]
         if other_landmarks:
             prompt += ('. Редактируй исходное изображение: полностью УДАЛИ из этого эталона следующие '
                        'посторонние ориентиры, включая любые их фрагменты по краям: '
@@ -604,7 +628,7 @@ def ensure_landmark_references(base, session_id, seed):
             prompt += '. Эпоха: ' + str(locations[entity['reference_location']]['historical_period'])
             prompt += '. Согласуй все детали с указанной эпохой, даже если старый референс содержит анахронизмы.'
         negative = ', '.join(['персонажи', 'люди', *other_landmarks, *props])
-        digest = _digest([prompt, negative, hashlib.sha256(source.read_bytes()).hexdigest(), seed,
+        digest = _digest([prompt, negative, source_hash, seed,
                           os.getenv('IMG2IMG_MODEL') or os.getenv('VSEGPT_IMG2IMG_MODEL')])
         target = reference_project_dir(base) / '20_bible/references/landmarks' / f"{entity['id']}_{digest[:12]}.png"
         review_data = {'name': entity['name'], 'reference_requirements': [
@@ -622,18 +646,19 @@ def ensure_landmark_references(base, session_id, seed):
                 'Нет следующих посторонних объектов, включая фрагменты: ' + ', '.join(other_landmarks + props))
         review = {'name': entity['name'], 'requirements': review_data['reference_requirements']}
         cached = reuse_reference(base, 'landmark', digest, description=prompt,
-                                 metadata={'entity': entity['name'], 'source_hashes': [hashlib.sha256(source.read_bytes()).hexdigest()]})
+                                 metadata={'entity': entity['name'], 'source_hashes': [source_hash]})
         if cached:
             if reference_review_current(base, cached, review) or _reference_requirements_met(cached, review_data):
                 accept_reference_review(base, cached, review)
                 keep_or_set_path(entity, cached)
                 return
-            reject_reference(base, cached, 'Landmark reference failed declared geometry requirements')
+            if Path(cached).resolve() != source.resolve():
+                reject_reference(base, cached, 'Landmark reference failed declared geometry requirements')
             target.unlink(missing_ok=True)
             prompt += ('. Повторная генерация: строго следуй текстовому устройству объекта. '
                        'Несовместимые детали исходной картинки не копируй. Устройство: ' + entity['geometry'])
         moved = existing_reference_path(base, str(target))
-        if moved != str(target):
+        if moved != str(target) and Path(moved).resolve() != source.resolve():
             target = Path(moved)  # файл уже перенесён в общий каталог
         if not target.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -643,15 +668,19 @@ def ensure_landmark_references(base, session_id, seed):
             if not target.is_file():
                 raise RuntimeError(f'Landmark reference missing: {target}')
         if not _reference_requirements_met(str(target), review_data):
+            if hashlib.sha256(target.read_bytes()).hexdigest() == source_hash:
+                if target.resolve() != source.resolve():
+                    target.unlink()
+                raise RuntimeError(f"Landmark edit returned unchanged source: {entity['name']}")
             rejected = store_reference(base, target, 'landmark', digest, description=prompt,
-                                       metadata={'entity': entity['name'], 'source_hashes': [hashlib.sha256(source.read_bytes()).hexdigest()]},
+                                       metadata={'entity': entity['name'], 'source_hashes': [source_hash]},
                                        sources=[source])
             reject_reference(base, rejected, 'Landmark reference failed declared geometry requirements')
             target.unlink(missing_ok=True)
             raise RuntimeError(f"Landmark reference failed requirements: {entity['name']}")
         candidate = store_reference(base, target, 'landmark', digest,
                                                    description=prompt,
-                                                   metadata={'entity': entity['name'], 'source_hashes': [hashlib.sha256(source.read_bytes()).hexdigest()]},
+                                                   metadata={'entity': entity['name'], 'source_hashes': [source_hash]},
                                                    sources=[source])
         accept_reference_review(base, candidate, review)
         keep_or_set_path(entity, candidate)

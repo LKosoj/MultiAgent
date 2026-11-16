@@ -61,7 +61,6 @@ STAGES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
                                               "storybook_speech", "screenplay_shots_generator", "shots_prompt_qa")),
     ("blockout", "Болванка", ("blockout_scene_builder", "blockout_renderer", "blockout_preview")),
     ("images", "Картинки", ("character_reference_states", "storybook_video_plan",
-                            "background_reference_plan", "background_references",
                             "artist_batch_shots", "storybook_continuity_images_review")),
     ("video", "Видео", ("storybook_video_preflight", "storybook_video_delivery_promise",
                         "video_generator", "storybook_continuity_videos_review")),

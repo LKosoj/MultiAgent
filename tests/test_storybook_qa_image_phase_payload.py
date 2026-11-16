@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import custom_tools.storybook.shots_prompt_qa as sq
 from custom_tools.storybook.screenplay_shots_generator_utils import shared_utils
 
@@ -11,7 +13,9 @@ def _phase_spec(name: str, end_state: str = "end"):
     return {
         "primary_subject": name,
         "visible_readable_texts": [],
-        "start_state_spec": {"visible_readable_texts": [], "state": "start"},
+        "start_state_spec": {"visible_readable_texts": ["ТОЧНАЯ НАДПИСЬ"], "state": "start",
+                             "t0_mode": "frozen", "holder": None, "visible": False,
+                             "character_pose_signatures": {name: "inside screen"}},
         "end_state_spec": {"visible_readable_texts": [], "state": end_state},
     }
 
@@ -28,7 +32,14 @@ def _current_key(scene_number: int, character: str):
     )
 
 
-def test_qa_payload_keeps_scene_characters_and_phase_specs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("start_duration,end_duration,has_duration", [
+    (None, None, False), (0, None, False), (-1, None, False), ("", None, False),
+    ("invalid", None, False), ("2.75", None, False), (float("nan"), None, False),
+    (float("inf"), None, False), (float("-inf"), None, False),
+    (True, None, False), (False, None, False),
+    (2.75, None, True), (None, 2.75, True),
+])
+def test_qa_payload_keeps_scene_characters_and_phase_specs(tmp_path, monkeypatch, start_duration, end_duration, has_duration):
     project_id = "qa_phase_payload"
     screenplay_dir = tmp_path / project_id / "91_screenplay"
     screenplay_dir.mkdir(parents=True)
@@ -52,7 +63,9 @@ def test_qa_payload_keeps_scene_characters_and_phase_specs(tmp_path, monkeypatch
         json.dumps({"screenplay": scenes}), encoding="utf-8"
     )
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
+    monkeypatch.setattr(sq, "video_prompt_violations", lambda *_args: [])
     captured = []
+    systems = []
 
     def fake_call_openai_api(**kwargs):
         prompt = str(kwargs.get("prompt") or "")
@@ -61,6 +74,7 @@ def test_qa_payload_keeps_scene_characters_and_phase_specs(tmp_path, monkeypatch
                 payload = json.loads(prompt.split("INPUT:\n", 1)[1])
                 if "generated_shots" in payload:
                     captured.append(payload)
+                    systems.append(kwargs["system_prompt"])
             except (ValueError, json.JSONDecodeError):
                 pass
         return json.dumps({"repairs": [], "notes": "ok"})
@@ -71,10 +85,10 @@ def test_qa_payload_keeps_scene_characters_and_phase_specs(tmp_path, monkeypatch
         project_id=project_id,
         shots_data={
             "items": [
-                {"scene_number": 1, "shot_number": 1, "shot_type": "start", "camera_plan": "MEDIUM SHOT", "english_prompt": "alpha", "video_prompt": "", "_shot_frame_spec": _phase_spec("Alpha"), "_shot_frame_spec_cache_key": _current_key(1, "Alpha")},
-                {"scene_number": 1, "shot_number": 1, "shot_type": "end", "camera_plan": "MEDIUM SHOT", "english_prompt": "alpha end", "video_prompt": "", "_shot_frame_spec": _phase_spec("Alpha", "alpha-end"), "_shot_frame_spec_cache_key": _current_key(1, "Alpha")},
-                {"scene_number": 2, "shot_number": 1, "shot_type": "start", "camera_plan": "MEDIUM SHOT", "english_prompt": "beta", "video_prompt": "", "_shot_frame_spec": _phase_spec("Beta"), "_shot_frame_spec_cache_key": _current_key(2, "Beta")},
-                {"scene_number": 2, "shot_number": 1, "shot_type": "end", "camera_plan": "MEDIUM SHOT", "english_prompt": "beta end", "video_prompt": "", "_shot_frame_spec": _phase_spec("Beta", "beta-end"), "_shot_frame_spec_cache_key": _current_key(2, "Beta")},
+                {"scene_number": 1, "shot_number": 1, "shot_type": "start", "duration_s": start_duration, "timing": "0-8", "camera_plan": "STALE CLOSE UP", "english_prompt": "alpha", "video_prompt": "", "_shot_frame_spec": _phase_spec("Alpha"), "_shot_frame_spec_cache_key": _current_key(1, "Alpha")},
+                {"scene_number": 1, "shot_number": 1, "shot_type": "end", "duration_s": end_duration, "timing": "0-8", "camera_plan": "MEDIUM SHOT", "english_prompt": "alpha end", "video_prompt": "", "_shot_frame_spec": _phase_spec("Alpha", "alpha-end"), "_shot_frame_spec_cache_key": _current_key(1, "Alpha")},
+                {"scene_number": 2, "shot_number": 1, "shot_type": "start", "camera_plan": "MEDIUM SHOT", "timing": "1-2", "english_prompt": "beta", "video_prompt": "", "_shot_frame_spec": _phase_spec("Beta"), "_shot_frame_spec_cache_key": _current_key(2, "Beta")},
+                {"scene_number": 2, "shot_number": 1, "shot_type": "end", "camera_plan": "MEDIUM SHOT", "english_prompt": "beta end", "video_prompt": "unexpected existing END video", "_shot_frame_spec": _phase_spec("Beta", "beta-end"), "_shot_frame_spec_cache_key": _current_key(2, "Beta")},
             ],
             "consistency_rules": [],
         },
@@ -84,15 +98,44 @@ def test_qa_payload_keeps_scene_characters_and_phase_specs(tmp_path, monkeypatch
     )
 
     assert len(captured) == 2
+    assert all("SOURCE PRIORITY (highest to lowest)" in system for system in systems)
+    assert all("visible=false does not forbid" in system for system in systems)
+    assert all("If phase_state_spec is omitted" in system for system in systems)
+    assert all("not an exhaustive visible cast" in system for system in systems)
+    assert all(sq.VIDEO_PROMPT_RULES in system for system in systems)
+    assert all(system.index("First derive each phase") < system.index("Inspect EVERY START") for system in systems)
     by_scene = {payload["scene_number"]: payload for payload in captured}
-    assert by_scene[1]["storyboard"][0]["characters"] == ["Alpha"]
-    assert by_scene[2]["storyboard"][0]["characters"] == ["Beta"]
+    assert by_scene[1]["characters"] == ["Alpha"]
+    assert by_scene[2]["characters"] == ["Beta"]
     for scene_number, character in ((1, "Alpha"), (2, "Beta")):
         payload = by_scene[scene_number]
-        assert payload["storyboard"][0]["characters"] == [character]
+        assert payload["characters"] == [character]
+        assert "characters" not in payload["storyboard"][0]
         shots_by_type = {shot["shot_type"]: shot for shot in payload["generated_shots"]}
+        assert payload["storyboard"][0]["camera_plan"] == "MEDIUM SHOT"
+        assert all("camera_plan" not in shot for shot in shots_by_type.values())
+        if scene_number == 1:
+            if has_duration:
+                assert "timing" not in payload["storyboard"][0]
+                assert all("timing" not in shot for shot in shots_by_type.values())
+            else:
+                assert payload["storyboard"][0]["timing"] == "0-1"
+                assert all(shot["timing"] == "0-8" for shot in shots_by_type.values())
+            assert "video_prompt" not in shots_by_type["end"]
+        else:
+            assert payload["storyboard"][0]["timing"] == "0-1"
+            assert shots_by_type["start"]["timing"] == "1-2"
+            assert shots_by_type["end"]["video_prompt"] == "unexpected existing END video"
         full_spec = payload["shot_frame_specs"].get("1", payload["shot_frame_specs"].get(1))
-        assert shots_by_type["start"]["phase_state_spec"] == full_spec["start_state_spec"]
+        assert "phase_state_spec" not in shots_by_type["start"]
+        assert full_spec["start_state_spec"]["state"] == "start"
+        assert full_spec["start_state_spec"]["holder"] is None
+        assert full_spec["start_state_spec"]["visible"] is False
+        assert full_spec["start_state_spec"]["t0_mode"] == "frozen"
+        assert full_spec["start_state_spec"]["visible_readable_texts"] == ["ТОЧНАЯ НАДПИСЬ"]
+        assert full_spec["start_state_spec"]["character_pose_signatures"][character] == "inside screen"
+        assert all("storyboard_description" not in shot and "storyboard_camera_plan" not in shot
+                   and "transition_video_prompt" not in shot for shot in shots_by_type.values())
         assert shots_by_type["end"]["phase_state_spec"]["state"] == f"{'alpha' if scene_number == 1 else 'beta'}-end"
         assert shots_by_type["end"]["phase_state_spec"] != full_spec["end_state_spec"]
         assert "shot_frame_spec" not in shots_by_type["start"]

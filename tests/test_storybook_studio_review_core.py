@@ -58,6 +58,13 @@ def project(tmp_path, monkeypatch):
         yield root
 
 
+def test_image_regeneration_seeds_the_shot_input_without_background_steps(project):
+    result = prep(["1-1"])
+    assert set(result['step_outputs']) == {'storybook_video_plan'}
+    assert result['step_outputs']['storybook_video_plan']['items']
+    fin(result['regen_id'])
+
+
 def test_registered_admin_only():
     reg = caps.registry()
     want = {"review_get": "read", "review_set_status": "write", "review_set_note": "write", "versions_list": "read",

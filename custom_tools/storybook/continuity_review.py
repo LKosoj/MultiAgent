@@ -12,13 +12,13 @@ from fractions import Fraction
 
 from agent_command import model_ultimate
 from utils import call_openai_api, parse_llm_json
-from .continuity import (_digest, _source, _PLAN_VERSION, _write, bind_continuity_to_items,
+from .continuity import (_digest, _source, _PLAN_VERSION, _PHASE_SOURCE_RULES, _write, bind_continuity_to_items,
                          load_continuity_plan, unit_continuity_hash, validate_continuity_plan)
 from .project_paths import existing_reference_path, safe_storybook_project_dir
 
 logger = logging.getLogger(__name__)
 
-_REVIEW_VERSION = 9
+_REVIEW_VERSION = 15
 _AUTO_ACCEPT_ROUNDS = 2
 _AUDIT_IMAGE_MAX_SIDE = 1280
 _AUDIT_VIDEO_MAX_SIDE = 640
@@ -64,9 +64,14 @@ def _project_id(base):
     return Path(base).name
 
 
-def _tasks(base, kind):
+def _tasks(base, kind, shot_keys=None):
     plan = validate_current_continuity(base)
     if not plan:
+        if shot_keys is not None:
+            items = json.loads((base / '97_shots/shots.json').read_text())['items']
+            known = {f"{item['scene_number']}-{item['shot_number']}" for item in items}
+            if not shot_keys or not set(shot_keys) <= known:
+                raise ValueError('Unknown or empty continuity shot scope')
         return []
     screenplay = _source(base)['screenplay']
     source_shots = {(scene['scene_number'], shot['shot_number']): shot
@@ -80,7 +85,33 @@ def _tasks(base, kind):
     if kind == 'images':
         selected = [item for item in render_items if item['_continuity'].get(item.get('shot_type', 'start'))]
         selected.sort(key=lambda i: (i['scene_number'], i['shot_number'], i.get('shot_type') != 'start'))
-        groups = [selected[index:index + 6] for index in range(0, len(selected), 6)]
+        pairs = {}
+        for item in selected:
+            key = f"{item['scene_number']}-{item['shot_number']}"
+            pairs.setdefault(key, []).append(item)
+        if shot_keys is not None:
+            scope = set(shot_keys)
+            known = {f"{item['scene_number']}-{item['shot_number']}" for item in source}
+            if not scope or not scope <= known:
+                raise ValueError('Unknown or empty continuity shot scope')
+            from .video_plan import apply_video_plan
+            starts = [item for item in items if item.get('shot_type', 'start') == 'start']
+            for unit in apply_video_plan(_project_id(base), starts):
+                covered = set(unit.get('covered_shot_keys') or [f"{unit['scene_number']}-{unit['shot_number']}"])
+                if covered & scope:
+                    scope.update(covered)
+            by_path = {str(Path(item['output_path']).resolve()): key
+                       for key, pair in pairs.items() for item in pair}
+            while True:
+                dependencies = {by_path[str(Path(item['source_end_path']).resolve())]
+                                for key in scope for item in pairs.get(key, [])
+                                if item.get('copy_from_previous_end') and item.get('source_end_path')
+                                and str(Path(item['source_end_path']).resolve()) in by_path}
+                if dependencies <= scope:
+                    break
+                scope.update(dependencies)
+            pairs = {key: pair for key, pair in pairs.items() if key in scope}
+        groups = list(pairs.values())
     else:
         from .video_plan import apply_video_plan
         starts = [item for item in items if item.get('shot_type', 'start') == 'start']
@@ -109,6 +140,7 @@ def _tasks(base, kind):
             spec = (item.get('_shot_frame_spec') or {}).get(f'{phase}_state_spec') or {}
             contexts.append(dict(scene_number=item['scene_number'], shot_number=item['shot_number'], phase=phase,
                 continuity=item['_continuity'].get(phase), visible_characters=spec.get('visible_characters'),
+                phase_state_spec={key: spec[key] for key in ('t0_mode',) if key in spec},
                 source_shot={key: source_shots[(item['scene_number'], item['shot_number'])].get(key)
                              for key in ('description', 'camera_plan')}))
             if offsets:
@@ -119,7 +151,19 @@ def _tasks(base, kind):
         scenes = {item['scene_number'] for item in frames}
         character_frames = [item for item in items if item['scene_number'] in scenes] if kind == 'images' else frames
         character_masters = _character_masters(base, character_frames)
-        hashes = {path: _file_hash(existing_reference_path(base, path)) for path in set(media) | anchors | masters | set(character_masters)}
+        dependencies = set()
+        if kind == 'images':
+            by_path = {str(Path(item['output_path']).resolve()): item for item in render_items}
+            pending = list(group)
+            while pending:
+                item = pending.pop()
+                if item.get('copy_from_previous_end') and item.get('source_end_path'):
+                    path = str(Path(item['source_end_path']).resolve())
+                    if path not in dependencies:
+                        dependencies.add(path)
+                        if path in by_path:
+                            pending.append(by_path[path])
+        hashes = {path: _file_hash(existing_reference_path(base, path)) for path in set(media) | anchors | masters | set(character_masters) | dependencies}
         events = []
         if offsets:
             events = sorted({offsets[f'{scene}-{shot}'][phase == 'end']
@@ -130,12 +174,20 @@ def _tasks(base, kind):
         signature_parts = [_REVIEW_VERSION, kind, contexts, hashes,
                            [item.get('video_prompt') for item in group] if kind == 'videos' else
                            [item.get('english_prompt') for item in group]]
+        if kind == 'images':
+            master_roles = {entity['reference_path']: entity['id'] for item in frames
+                            for context in item['_continuity'].values()
+                            for entity in context.get('entities', []) if entity.get('reference_path')}
+            signature_parts.extend(['image_pair_v1', character_masters,
+                                    [(item.get('copy_from_previous_end'), item.get('source_end_path')) for item in group]])
+            if master_roles:
+                signature_parts.append(master_roles)
         if character_masters:
             signature_parts.append('character_identity_v1')
         if events:
             signature_parts.append(events)
         if kind == 'videos':
-            signature_parts.append('video_sampling_v2')
+            signature_parts.append('video_sampling_v3')
         signature = _digest(signature_parts)
         tasks.append({'id': '|'.join(sorted(keys)), 'input_hash': signature, 'group': group, 'kind': kind,
                       'state_hash': unit_continuity_hash(base, sorted(keys)),
@@ -145,10 +197,10 @@ def _tasks(base, kind):
     return tasks
 
 
-def continuity_acceptance(base, kind):
+def continuity_acceptance(base, kind, shot_keys=None):
     """Require accepted reviews for the actual current bytes, without a model call."""
     try:
-        tasks = _tasks(base, kind)
+        tasks = _tasks(base, kind, shot_keys) if shot_keys is not None else _tasks(base, kind)
         if not tasks:
             return {'passed': True, 'status': 'not_required'}
         path = base / f'97_shots/continuity_{kind}_review.json'
@@ -156,13 +208,13 @@ def continuity_acceptance(base, kind):
         records = report.get('tasks', {})
         missing = [task['id'] for task in tasks if not records.get(task['input_hash'], {}).get('passed')]
         return {'passed': not missing, 'status': 'accepted' if not missing else 'review_required',
-                'unaccepted': missing}
+                'unaccepted': missing, **({'shot_keys': list(shot_keys)} if shot_keys is not None else {})}
     except (ValueError, KeyError, FileNotFoundError) as exc:
         return {'passed': False, 'status': 'invalid_inputs', 'error': str(exc)}
 
 
-def require_continuity_acceptance(base, kind):
-    check = continuity_acceptance(base, kind)
+def require_continuity_acceptance(base, kind, shot_keys=None):
+    check = continuity_acceptance(base, kind, shot_keys) if shot_keys is not None else continuity_acceptance(base, kind)
     if not check['passed']:
         raise ValueError(f'Continuity {kind} acceptance required: {check}')
     return check
@@ -207,13 +259,16 @@ def _audit(task, pictures, chunk_number):
     request = {'prompt': json.dumps({'kind': task['kind'], 'expected_frames': task['contexts'], 'chunk': chunk_number,
                            'prior_findings': [dict(index=index, finding=finding)
                                               for index, finding in enumerate(task.get('prior_findings', []))],
+                           **({'prior_uncertain': [dict(index=index + len(task.get('prior_findings', [])), uncertainty=uncertainty)
+                                                   for index, uncertainty in enumerate(task['prior_uncertain'])]}
+                              if task.get('prior_uncertain') else {}),
                            **({'video_mode': task['group'][0].get('video_mode'),
                                'video_prompt': task['group'][0].get('video_prompt'),
                                'video_duration_s': task.get('video_duration_s'),
                                'final_sample_time_s': task.get('final_sample_time_s')}
                               if task['kind'] == 'videos' else {})}, ensure_ascii=False)}
     content = [{'type': 'text', 'text': request['prompt']}]
-    for picture in master_images + character_images + pictures:
+    for picture in pictures + master_images + character_images:
         if not Path(picture['output_path']).is_file():
             continue
         with Image.open(picture['output_path']) as source:
@@ -229,9 +284,17 @@ def _audit(task, pictures, chunk_number):
         model=model_ultimate, max_tokens=32768, temperature=0.1, response_format={'type': 'json_object'},
         **request,
         system_prompt=(
+            _PHASE_SOURCE_RULES +
             'Inspect actual labeled pixels against their own phase and the shared object identities. Compare character identity with the labeled CHARACTER references; the current scene determines clothing changes and framing. '
             'CHARACTER references include the scene cast for comparison, not required on-screen presence; the current source and visible_characters determine who must appear. '
             'source_shot describes the whole source action; registered continuity defines physical START/END states. '
+            'Authored framing overrides incompatible inherited visibility flags: do not widen a close-up to include an off-camera scene landmark. '
+            'Identify a physical display by its carrier and placement, not merely its displayed text; do not move authored console content to another screen because it shares a catalog state. '
+            'phase_state_spec.t0_mode is the saved START mode; it only sets how far the first source action may have begun. '
+            'Do not require later source events or reactions in START. A frozen t0 shows the initial conditions before the first action; '
+            'an early-motion START may begin that first action, but must not skip to a later event or reaction. END shows the final resulting state, not every transient pose at once. '
+            'A still image shows one instant: check only the state visible at its boundary; do not require or doubt speed, gradual development or motion in it; those belong to video review. '
+            'A violation must identify a visible contradiction with the required boundary state. If the observation matches the required state, omit it; compliant states are neither violations nor uncertainties. '
             'Re-evaluate every prior finding against current source_shot, registered continuity and pixels. '
             'Prior findings marked source=video are hypotheses from a generated clip, not observations of this source image; '
             'verify them on this image and explicitly dismiss video-only or transient defects absent here. '
@@ -242,7 +305,7 @@ def _audit(task, pictures, chunk_number):
             'When a prior defect remains but its wording is replaced by a clearer actionable finding, dismiss its old wording '
             'with the reason that it was replaced and return the confirmed defect as a new violation. '
             'Scope: physical and narrative continuity only. Reject changes to registered object construction, '
-            'identity, location, support, holder, motion, visibility or required causal state changes. '
+            'identity, location, support, holder, motion, explicitly required visibility or required causal state changes. '
             'Also enforce explicitly required character presence, relative spatial order and concealed identity. '
             'Facial features on generic background figures do not by themselves reveal a concealed identity; blur and graphic simplification are visual treatment, not narrative anonymity. '
             'For a deliberately flat shadow or silhouette, enforce its registered broad position and direction, but do not fail on a fine facial-profile contour that is not visually readable in the source image. '
@@ -255,7 +318,7 @@ def _audit(task, pictures, chunk_number):
             'lighting or incidental decor unless they actually violate those continuity requirements. '
             'Camera information only explains the viewpoint; it is not a framing checklist. '
             'Only unresolved doubts about these continuity requirements belong in uncertain. '
-            'For physical object states, continuity overrides incompatible legacy phase descriptions or prompts. '
+            'Dismissed and out-of-scope observations must not also appear in uncertain; unregistered incidental details without an explicit narrative requirement are not continuity doubts. '
             'Each LANDMARK master shows the visual identity and overall registered geometry of its labeled entity, '
             'not current damage, staging or other objects in its background. Current states determine changeable contents and fuel. '
             'Hard requirements for part counts and arrangement must be supported by registered continuity.geometry or primary source; '
@@ -278,6 +341,8 @@ def _audit(task, pictures, chunk_number):
                 'only when their times fall within this chunk; other chunks check the remaining times. '
                 'The sample at final_sample_time_s represents END, even though it precedes video_duration_s. '
                 'Do not report uncertainty because an opening, ending or event lies outside this chunk. '
+                'Do not infer that a brief event is absent between sampled frames; retain uncertainty when the images do not resolve it. '
+                'Resolve each prior_uncertain with its indexed dismissal and a reason when the current evidence resolves it; otherwise retain it in uncertain. '
                 'the top-level video_prompt describes the combined video only. Do not restore an older transient gesture '
                 'from inherited phase descriptions when it conflicts with that direction. Physical object '
                 'states and recorded continuity events remain mandatory. '
@@ -286,6 +351,7 @@ def _audit(task, pictures, chunk_number):
             'An offscreen object must not follow the actor; movement of the camera does not imply movement of a '
             'stationary prop. Check unauthorized contacts, kicks, transfers, extra copies and teleportation. '
             'Extra copies means duplication of the tracked object, not unrelated incidental objects of the same category. '
+            'Shared displayed content alone does not establish that distinct displays are the same physical object. '
             'A singular object description in geometry does not prohibit such incidental objects unless the primary source explicitly limits their number or presence. '
             'The same object retains its state after other scenes unless a source transition changes it. '
             'START/END world states apply only to their corresponding boundaries; incidental pose details are not mandatory. '
@@ -296,13 +362,16 @@ def _audit(task, pictures, chunk_number):
             'do not assume an exact collision instant or require the old state immediately before END. '
             'Do not demand the same limb pose throughout a moving clip. Distinguish uncertainty from clear defects. '
             'For images, audit each expected frame separately and never transfer observations from another frame. '
-            'CONTINUITY_REFERENCE is context only, never an expected frame; source and LANDMARK masters take priority. '
             'For images, identify each violation with the exact frame_key scene:shot:start or end from expected_frames. '
             'Write required as a concise actionable edit: identify what to move or replace and what nearby elements to preserve; '
+            'Describe the visible result inside this frame. For removal, name what to erase; do not require a whole '
+            'figure merely to establish ownership of a cropped body part. '
             'do not correct a target by changing an unrelated object. Use screen positions relative to visible landmarks '
             'in the current view only when supported by source and registered geometry; do not guess an ambiguous direction. '
             'Identify named parts by visible features or their supported screen positions and limit the edit to the affected area. '
-            'For videos, frame_key may identify the sample time. '
+            'For videos, frame_key may identify the sample time. If a finding specifically claims a defect '
+            'in a source boundary image, include source_frame_key as its exact scene:shot:start or end; '
+            'omit it for movement, uncertain attribution, or a defect only seen in video. '
             'Return JSON {passed:bool, violations:[{frame_key:string, entity_id:string, observed:string, required:string}], '
             'uncertain:[string], dismissed:[{index:int, reason:string}]}. Pass only if there are no clear violations or unresolved critical identity/state doubts. '
             'Write findings in the language of the supplied descriptions.'),
@@ -321,22 +390,29 @@ def _audit(task, pictures, chunk_number):
                  and isinstance(entry.get('reason'), str) and entry['reason'].strip()}
     for index, finding in enumerate(task.get('prior_findings', [])):
         if index not in dismissed and finding not in result['violations']:
-            result['violations'].append(finding)
+            if finding.get('source') == 'video':
+                if not any(v.get('frame_key') == finding.get('frame_key') and
+                           (not finding.get('entity_id') or v.get('entity_id') == finding.get('entity_id'))
+                           for v in result['violations']):
+                    result['uncertain'].append('Source image hypothesis was not resolved')
+            else:
+                result['violations'].append(finding)
+    for index, uncertainty in enumerate(task.get('prior_uncertain', []), len(task.get('prior_findings', []))):
+        if index not in dismissed and uncertainty not in result['uncertain']:
+            result['uncertain'].append(uncertainty)
     result['passed'] = result['passed'] and not result['violations'] and not result['uncertain']
     return result
 
 
-def _repair_media(base, tasks, kind, session_id):
+def _repair_media(base, tasks, kind, session_id, on_attempt=None):
     """One bounded corrective pass through the existing prompt and media tools."""
     keys = sorted({key for task in tasks for key in task['id'].split('|')})
     brief_path = base / '00_brief.json'
     brief = json.loads(brief_path.read_text()) if brief_path.is_file() else {}
     language = brief.get('language') or 'ru'
     if kind == 'images':
-        from .shots_prompt_qa import shots_prompt_qa_tool
         from .artist_batch_edit import artist_agent_batch_edit_tool
         from .video_plan import select_image_items
-        from .background_references import storybook_background_plan_tool, storybook_background_references_tool
         report = json.loads((base / '97_shots/continuity_images_review.json').read_text())
         affected = set()
         frame_findings = {}
@@ -358,8 +434,10 @@ def _repair_media(base, tasks, kind, session_id):
                         if key in task['id'].split('|'):
                             located.add(key)
                             if finding.get('observed') and finding.get('required'):
-                                frame_findings.setdefault(finding['frame_key'], []).append(
-                                    {'observed': finding['observed'], 'required': finding['required']})
+                                edits = frame_findings.setdefault(finding['frame_key'], [])
+                                if not any(edit['required'] == finding['required']
+                                           and edit.get('entity_id') == finding.get('entity_id') for edit in edits):
+                                    edits.append({key: finding[key] for key in ('observed', 'required', 'entity_id') if key in finding})
                                 if finding.get('entity_id'):
                                     frame_entities.setdefault(finding['frame_key'], set()).add(finding['entity_id'])
                                 valid_finding = True
@@ -367,7 +445,7 @@ def _repair_media(base, tasks, kind, session_id):
                         fully_localized = False
             affected.update(task['id'].split('|') if not located or any(v['uncertain'] for v in verdicts) else located)
         shots = json.loads((base / '97_shots/shots.json').read_text())
-        frames = select_image_items(_project_id(base), shots['items'])
+        frames = bind_continuity_to_items(base, select_image_items(_project_id(base), shots['items']))
         while True:
             changed = {str(Path(item['output_path']).resolve()) for item in frames
                        if f"{item['scene_number']}-{item['shot_number']}" in affected}
@@ -417,18 +495,7 @@ def _repair_media(base, tasks, kind, session_id):
                     refs = [refs]
                 item['reference_image_paths'] = masters + [path for path in refs if path not in masters]
         else:
-            for task in tasks:
-                for item in task['group']:
-                    if f"{item['scene_number']}-{item['shot_number']}" in affected:
-                        Path(item['output_path']).with_suffix('.continuity.json').unlink(missing_ok=True)
-            shots_prompt_qa_tool(session_id=session_id, project_id=_project_id(base), shot_keys=keys,
-                                 enable=True, force=True, global_max_repairs=0)
-            shots = json.loads((base / '97_shots/shots.json').read_text())
-            selected = [item for item in select_image_items(_project_id(base), shots['items'])
-                        if f"{item['scene_number']}-{item['shot_number']}" in keys]
-            incoming = dict(shots, items=selected, scope_shot_keys=keys)
-            planned = storybook_background_plan_tool(session_id, _project_id(base), incoming, language=language)
-            rendered = storybook_background_references_tool(session_id, _project_id(base), planned, language=language)
+            return
         locked_by_frame = {}
         for item in rendered['items']:
             frame_key = f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
@@ -454,6 +521,8 @@ def _repair_media(base, tasks, kind, session_id):
             f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}": item
             for item in rendered['items']
         }
+        reviewed_keys = {f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
+                         for task in tasks for item in task['group']}
         for frame_key, findings in frame_findings.items():
             item = by_frame_key.get(frame_key)
             if item is None or item.get('copy_from_previous_end'):
@@ -463,9 +532,9 @@ def _repair_media(base, tasks, kind, session_id):
                                       _continuity_edit_findings=[finding],
                                       _continuity_locked_entities=locked_by_frame.get(frame_key, []))
                 entity_id = str(finding.get('entity_id') or '')
+                entity_refs = [path for path, name in _character_masters(base, [item]).items() if name == entity_id]
                 if entity_id:
-                    entity_refs = []
-                    entity_kind = None
+                    entity_kind = 'character' if entity_refs else None
                     for context in (item.get('_continuity') or {}).values():
                         for entity in context.get('entities', []):
                             if str(entity.get('id') or '') == entity_id and entity.get('reference_path'):
@@ -477,8 +546,17 @@ def _repair_media(base, tasks, kind, session_id):
                             if entity_kind == 'landmark'
                             else [item['output_path'], *dict.fromkeys(entity_refs)]
                         )
+                other_phase = 'end' if item.get('shot_type', 'start') == 'start' else 'start'
+                companion_key = f"{item['scene_number']}:{item['shot_number']}:{other_phase}"
+                companion = by_frame.get(companion_key)
+                if (direct_edit and companion_key in reviewed_keys and companion_key not in frame_findings
+                        and companion and Path(companion['output_path']).is_file()):
+                    details = [path for path in operation_item.get('reference_image_paths', []) if path in entity_refs]
+                    operation_item['reference_image_paths'] = [item['output_path'], companion['output_path'], *details]
                 operation = dict(rendered, items=[dict(
                     operation_item)])
+                if on_attempt:
+                    on_attempt({f"{item['scene_number']}-{item['shot_number']}"})
                 result = artist_agent_batch_edit_tool(
                     session_id=session_id, items=operation, enable=True,
                     language=language, max_concurrency=1,
@@ -491,19 +569,22 @@ def _repair_media(base, tasks, kind, session_id):
             str(Path(by_frame[key]['output_path']).resolve())
             for key in frame_findings if key in by_frame
         }
-        for item in rendered['items']:
-            if not item.get('copy_from_previous_end') or not item.get('source_end_path'):
-                continue
-            source = Path(item['source_end_path'])
-            target = Path(item['output_path'])
-            if str(source.resolve()) in edited_paths and source.is_file():
-                target.write_bytes(source.read_bytes())
+        while True:
+            copied = set()
+            for item in rendered['items']:
+                if not item.get('copy_from_previous_end') or not item.get('source_end_path'):
+                    continue
+                source = Path(item['source_end_path'])
+                target = Path(item['output_path'])
+                if str(source.resolve()) in edited_paths and str(target.resolve()) not in edited_paths and source.is_file():
+                    target.write_bytes(source.read_bytes())
+                    copied.add(str(target.resolve()))
+            if not copied:
+                break
+            edited_paths.update(copied)
         # Restore frames without a finding so an accepted neighbouring phase
         # cannot be changed as a side effect of a scoped operation.
-        editable = {
-            str(Path(by_frame[key]['output_path']).resolve())
-            for key in frame_findings if key in by_frame
-        }
+        editable = edited_paths
         for item in rendered['items']:
             path = Path(item['output_path'])
             if str(path.resolve()) in editable or not path.is_file():
@@ -546,17 +627,22 @@ def _repair_media(base, tasks, kind, session_id):
     _write(shots_path, shots)
     if plan_path.is_file():
         _write(plan_path, plan)
+    if on_attempt:
+        on_attempt({task['id'] for task in tasks})
     generate(session_id=session_id, project_id=_project_id(base), shot_keys=generation_keys, enable=True,
              max_concurrency=4, seed=shots.get('seed'), language=language, skip_prompt_enhancement=True)
 
 
 def _video_sample_indices(events, planned_duration, duration, fps, frame_count):
-    del events, planned_duration
     last = frame_count - 1
     interior_count = min(max(0, math.ceil(duration) - 1), _AUDIT_VIDEO_MAX_SAMPLES - 2)
     indices = {0, last}
     for position in range(1, interior_count + 1):
         indices.add(min(last, max(0, round(position * duration / (interior_count + 1) * fps))))
+    if duration <= 4:
+        indices.update(min(last, round(position * 0.5 * fps)) for position in range(1, math.ceil(duration * 2)))
+    if planned_duration > 0:
+        indices.update(min(last, max(0, round(event * duration / planned_duration * fps))) for event in events)
     return sorted(indices)
 
 
@@ -583,11 +669,54 @@ def _append_video_repair_requirements(existing_prompt, findings):
     return existing_prompt.rstrip() + suffix
 
 
-def _review(session_id, project_id, kind, enable, repair=True, review_findings=None):
+def _count_failed_repairs(base, kind, result, shot_keys=None):
+    attempted = set(result.pop('attempted_repairs', []))
+    unaccepted = set(result.get('acceptance', {}).get('unaccepted') or [])
+    failed = attempted & unaccepted
+    if not failed:
+        return result, bool(attempted)
+    path = base / f'97_shots/continuity_{kind}_review.json'
+    report = json.loads(path.read_text())
+    rounds = report.setdefault('failed_rounds', {})
+    for task_id in failed:
+        rounds[task_id] = rounds.get(task_id, 0) + 1
+    tasks = _tasks(base, kind, shot_keys) if kind == 'images' and shot_keys is not None else _tasks(base, kind)
+    exhausted = [task for task in tasks if task['id'] in failed
+                 and rounds.get(task['id'], 0) >= _AUTO_ACCEPT_ROUNDS
+                 and task['input_hash'] in report['tasks']]
+    for task in exhausted:
+        report['tasks'][task['input_hash']].update(passed=True, auto_accepted={
+            'failed_rounds': rounds.pop(task['id']), 'at': datetime.now().isoformat(timespec='seconds')})
+    _write(path, report)
+    if kind == 'images' and exhausted:
+        from .continuity import record_continuity_image
+        for task in exhausted:
+            for item in task['group']:
+                record_continuity_image(item, basis='auto_accepted')
+    if exhausted:
+        if shot_keys is None:
+            check = continuity_acceptance(base, kind)
+        else:
+            scoped = tasks if kind == 'images' else [task for task in tasks if set(task['id'].split('|')) & set(shot_keys)]
+            missing = [task['id'] for task in scoped if not report['tasks'].get(task['input_hash'], {}).get('passed')]
+            check = {'passed': not missing, 'status': 'accepted' if not missing else 'review_required',
+                     'unaccepted': missing, 'shot_keys': list(shot_keys)}
+        result.update(status='success' if check['passed'] else 'error', acceptance=check,
+                      auto_accepted=[task['id'] for task in exhausted])
+    return result, bool(attempted)
+
+
+def _review(session_id, project_id, kind, enable, repair=True, review_findings=None, shot_keys=None):
     if not enable:
         return {'status': 'skipped'}
     base = safe_storybook_project_dir(project_id)
-    tasks = _tasks(base, kind)
+    tasks = _tasks(base, kind, shot_keys) if kind == 'images' and shot_keys is not None else _tasks(base, kind)
+    if shot_keys is not None and kind != 'images':
+        tasks = [task for task in tasks if set(task['id'].split('|')) & set(shot_keys)]
+    if shot_keys is not None and not tasks:
+        if kind == 'images':
+            return {'status': 'success', 'acceptance': {'passed': True, 'status': 'not_required'}}
+        raise ValueError('No continuity tasks for shot scope')
     findings_by_task = {}
     if kind == 'images':
         frame_tasks = {f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}": task['input_hash']
@@ -633,8 +762,7 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                 for item in task['group']:
                     pairs.setdefault((item['scene_number'], item['shot_number']), []).append(item)
                 verdicts = []
-                previous_pair = None
-                for pair_key, pair in pairs.items():
+                for pair in pairs.values():
                     pair_keys = {f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
                                  for item in pair}
                     contexts = [context for context in task['contexts']
@@ -645,16 +773,8 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                     pair_task = dict(task, group=pair, frames=pair, contexts=contexts, masters=masters,
                                      prior_findings=[finding for finding in prior if finding.get('frame_key') in pair_keys])
                     pictures = list(pair)
-                    worlds = {context.get('continuity', {}).get('world_id') for context in contexts
-                              if context.get('continuity')}
-                    if previous_pair and previous_pair[0][0] == pair_key[0] and previous_pair[1]['passed']:
-                        end = next((item for item in previous_pair[2] if item.get('shot_type', 'start') == 'end'), None)
-                        end_world = ((end or {}).get('_continuity', {}).get('end') or {}).get('world_id')
-                        if end and end_world and worlds == {end_world}:
-                            pictures.append(dict(end, shot_type='CONTINUITY_REFERENCE'))
                     verdict = _audit(pair_task, pictures, len(verdicts))
                     verdicts.append(verdict)
-                    previous_pair = (pair_key, verdict, pair)
         else:
             with tempfile.TemporaryDirectory(prefix='storybook_continuity_') as temporary:
                 probe = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
@@ -665,23 +785,42 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                 if not rate or rate in ('0/0', '0/1'):
                     rate = stream['r_frame_rate']
                 fps = float(Fraction(rate))
-                frame_count = int(stream['nb_frames']) if str(stream.get('nb_frames', '')).isdigit() else round(duration * fps)
+                if str(stream.get('nb_frames', '')).isdigit():
+                    frame_count = int(stream['nb_frames'])
+                else:
+                    counted = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                        '-count_frames', '-show_entries', 'stream=nb_read_frames', '-of', 'json', task['media'][0]], text=True))
+                    frame_count = int(counted['streams'][0]['nb_read_frames'])
                 indices = _video_sample_indices(task.get('events', []), task['planned_duration'], duration, fps, frame_count)
-                expression = '+'.join(f'eq(n\\,{index})' for index in indices)
-                subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', task['media'][0], '-vf',
-                                f'select={expression},scale={_AUDIT_VIDEO_MAX_SIDE}:-1', '-vsync', '0', str(Path(temporary) / '%03d.jpg')],
-                               capture_output=True, check=True)
-                images = sorted(Path(temporary).glob('*.jpg'))
-                if len(images) != len(indices):
-                    raise ValueError('Video samples missing')
+                def extract(indices, directory):
+                    directory.mkdir()
+                    expression = '+'.join(f'eq(n\\,{index})' for index in indices)
+                    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', task['media'][0], '-vf',
+                                    f'select={expression},scale={_AUDIT_VIDEO_MAX_SIDE}:-1', '-vsync', '0', str(directory / '%04d.jpg')],
+                                   capture_output=True, check=True)
+                    images = sorted(directory.glob('*.jpg'))
+                    if len(images) != len(indices):
+                        raise ValueError('Video samples missing')
+                    return [{'scene_number': 'VIDEO', 'shot_number': frame,
+                             'shot_type': f't={frame / fps:.2f}s', 'output_path': str(path)}
+                            for frame, path in zip(indices, images)]
                 audit_task = dict(task, video_duration_s=duration, final_sample_time_s=indices[-1] / fps,
                                   contexts=[dict(context, time_s=context['time_s'] * duration / task['planned_duration'])
                                                   for context in task['contexts']])
-                samples = [{'scene_number': 'VIDEO', 'shot_number': index,
-                            'shot_type': f't={frame / fps:.2f}s', 'output_path': str(path)}
-                           for index, (frame, path) in enumerate(zip(indices, images))]
+                samples = extract(indices, Path(temporary) / 'initial')
                 verdicts = [_audit(audit_task, samples[index:index + 6], index // 6)
                             for index in range(0, len(samples), 6)]
+                if not all(verdict['passed'] for verdict in verdicts):
+                    prior = [finding for verdict in verdicts for finding in verdict['violations']]
+                    uncertain = [item for verdict in verdicts for item in verdict['uncertain']]
+                    if duration <= 4:
+                        extra = {min(frame_count - 1, round(position * 0.25 * fps))
+                                 for position in range(1, math.ceil(duration * 4))}
+                    else:
+                        extra = {(left + right) // 2 for left, right in zip(indices, indices[1:])}
+                    refined = sorted(set(indices) | extra)
+                    pictures = extract(refined, Path(temporary) / 'refined')
+                    verdicts = [_audit(dict(audit_task, prior_findings=prior, prior_uncertain=uncertain), pictures, 0)]
         return task['input_hash'], {'id': task['id'], 'passed': all(v['passed'] for v in verdicts),
                                     'review_version': _REVIEW_VERSION,
                                     'state_hash': task['state_hash'],
@@ -691,105 +830,193 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
     with ThreadPoolExecutor(max_workers=4) as executor:
         for signature, record in (future.result() for future in [executor.submit(contextvars.copy_context().run, inspect, task) for task in tasks]):
             report['tasks'][signature] = record
+            if record.get('passed') and not record.get('auto_accepted'):
+                report.get('failed_rounds', {}).pop(record['id'], None)
             _write(path, report)
     if kind == 'images':
         from .continuity import record_continuity_image
         for task in tasks:
             if report['tasks'][task['input_hash']]['passed']:
                 for item in task['group']:
-                    record_continuity_image(item, basis='visual_review')
-    check = continuity_acceptance(base, kind)
+                    basis = 'auto_accepted' if report['tasks'][task['input_hash']].get('auto_accepted') else 'visual_review'
+                    record_continuity_image(item, basis=basis)
+    if shot_keys is None:
+        check = continuity_acceptance(base, kind)
+    else:
+        missing = [task['id'] for task in tasks if not report['tasks'][task['input_hash']]['passed']]
+        check = {'passed': not missing, 'status': 'accepted' if not missing else 'review_required',
+                 'unaccepted': missing, 'shot_keys': list(shot_keys)}
     if not check['passed'] and repair:
         if findings_by_task:
-            return _repair_round(session_id, project_id, kind, enable, base, tasks, report, findings_by_task)
+            result = _repair_round(session_id, project_id, kind, enable, base, tasks, report, findings_by_task, shot_keys)
+            return _count_failed_repairs(base, kind, result, shot_keys)[0]
         # Аудитор может отвергать любой вариант ремонта: после _AUTO_ACCEPT_ROUNDS неудачных
         # раундов группа принимается с сохранёнными замечаниями, чтобы не блокировать видео.
         while True:
-            result = _repair_round(session_id, project_id, kind, enable, base, tasks, report, {})
+            result = _repair_round(session_id, project_id, kind, enable, base, tasks, report, {}, shot_keys)
             unaccepted = result.get('acceptance', {}).get('unaccepted')
             if result.get('acceptance', {}).get('passed') or not unaccepted:
                 return result
+            result, attempted = _count_failed_repairs(base, kind, result, shot_keys)
+            if result.get('acceptance', {}).get('passed') or not attempted:
+                return result
+            tasks = _tasks(base, kind, shot_keys) if kind == 'images' and shot_keys is not None else _tasks(base, kind)
+            if kind != 'images' and shot_keys is not None:
+                tasks = [task for task in tasks if set(task['id'].split('|')) & set(shot_keys)]
             report = json.loads(path.read_text())
-            rounds = {task_id: count for task_id, count in report.get('failed_rounds', {}).items()
-                      if task_id in unaccepted}
-            for task_id in unaccepted:
-                rounds[task_id] = rounds.get(task_id, 0) + 1
-            report['failed_rounds'] = rounds
-            tasks = _tasks(base, kind)
-            exhausted = [task for task in tasks if rounds.get(task['id'], 0) >= _AUTO_ACCEPT_ROUNDS
-                         and task['input_hash'] in report['tasks']]
-            for task in exhausted:
-                logger.warning('Continuity %s group %s auto-accepted after %d failed repair rounds',
-                               kind, task['id'], rounds[task['id']])
-                report['tasks'][task['input_hash']].update(passed=True, auto_accepted={
-                    'failed_rounds': rounds.pop(task['id']),
-                    'at': datetime.now().isoformat(timespec='seconds')})
-            _write(path, report)
-            if kind == 'images':
-                from .continuity import record_continuity_image
-                for task in exhausted:
-                    for item in task['group']:
-                        record_continuity_image(item, basis='visual_review')
-            if len(exhausted) == len(unaccepted):
-                check = continuity_acceptance(base, kind)
-                return {'status': 'success' if check['passed'] else 'error', 'review_path': str(path),
-                        'acceptance': check, 'auto_accepted': [task['id'] for task in exhausted]}
     return {'status': 'success' if check['passed'] else 'error', 'review_path': str(path), 'acceptance': check}
 
 
-def _repair_round(session_id, project_id, kind, enable, base, tasks, report, findings_by_task):
+def _repair_round(session_id, project_id, kind, enable, base, tasks, report, findings_by_task, shot_keys=None):
     rejected = [task for task in tasks
                 if not report['tasks'][task['input_hash']]['passed']
                 and (not findings_by_task or task['input_hash'] in findings_by_task)]
+    def repairable(task):
+        verdicts = report['tasks'][task['input_hash']]['verdicts']
+        findings = [finding for verdict in verdicts for finding in verdict.get('violations', [])]
+        if not findings or any(verdict.get('uncertain') for verdict in verdicts):
+            return False
+        if kind == 'images':
+            frame_keys = {f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
+                          for item in task['group'] if not item.get('copy_from_previous_end')}
+            return all(finding.get('frame_key') in frame_keys and finding.get('observed') and finding.get('required')
+                       for finding in findings)
+        return all(finding.get('observed') and finding.get('required') for finding in findings)
+    rejected = [task for task in rejected if repairable(task)]
+    attempted = set()
+    def mark_attempt(keys):
+        attempted.update(keys)
+    def finish(result):
+        result['attempted_repairs'] = sorted(attempted)
+        return result
+    if not rejected:
+        return finish({'status': 'error', 'acceptance': {'passed': False, 'unaccepted': [task['id'] for task in tasks
+                       if not report['tasks'][task['input_hash']]['passed']]}})
     rollback = {}
+    rollback_paths = {}
+    rollback_metadata = {}
+    rejected_ids = {task['id'] for task in rejected}
+    previous_records = {key: value for key, value in report['tasks'].items() if value.get('id') in rejected_ids}
+    rollback_ids = set(rejected_ids)
     if kind == 'images':
-        rollback = {
-            str(Path(item['output_path']).resolve()): Path(item['output_path']).read_bytes()
-            for task in rejected for item in task['group']
-            if Path(item['output_path']).is_file()
-        }
+        from .video_plan import select_image_items
+        shots = json.loads((base / '97_shots/shots.json').read_text())
+        frames = select_image_items(_project_id(base), shots['items'])
+        for task in rejected:
+            paths = {str(Path(item['output_path']).resolve()) for item in task['group']}
+            while True:
+                copies = {str(Path(item['output_path']).resolve()) for item in frames
+                          if item.get('copy_from_previous_end') and item.get('source_end_path')
+                          and str(Path(item['source_end_path']).resolve()) in paths}
+                if copies <= paths:
+                    break
+                paths.update(copies)
+            rollback_paths[task['id']] = paths
+            rollback.update({path: Path(path).read_bytes() for path in paths if Path(path).is_file()})
+            for path in paths:
+                metadata = Path(path).with_suffix('.continuity.json')
+                rollback_metadata[metadata] = metadata.read_bytes() if metadata.is_file() else None
+        rollback_ids.update(f"{item['scene_number']}-{item['shot_number']}" for item in frames
+                            if str(Path(item['output_path']).resolve()) in rollback)
+    previous_rounds = {key: value for key, value in report.get('failed_rounds', {}).items() if key in rollback_ids}
     try:
         if kind == 'videos':
             image_keys = {str(Path(item['output_path']).resolve()):
                           f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
                           for image_task in _tasks(base, 'images') for item in image_task['group']}
             hypotheses = [dict(finding, source='video', video_frame_key=finding.get('frame_key'),
-                               frame_key=image_keys[anchor])
-                          for task in rejected for anchor in task['anchors'] if anchor in image_keys
+                               frame_key=finding['source_frame_key'])
+                          for task in rejected
                           for verdict in report['tasks'][task['input_hash']]['verdicts']
-                          for finding in verdict['violations']]
+                          for finding in verdict['violations']
+                          if finding.get('source_frame_key') in {image_keys[anchor] for anchor in task['anchors']
+                                                                 if anchor in image_keys}]
             if hypotheses:
-                source_review = _review(session_id, project_id, 'images', True, review_findings=hypotheses)
+                scope = sorted({'-'.join(finding['frame_key'].split(':')[:2]) for finding in hypotheses})
+                source_review = _review(session_id, project_id, 'images', True, repair=False,
+                                        review_findings=hypotheses, shot_keys=scope)
                 if source_review['status'] != 'success':
-                    raise RuntimeError('Source image continuity repair failed; video generation was not started')
+                    image_tasks = _tasks(base, 'images', scope)
+                    image_report = json.loads((base / '97_shots/continuity_images_review.json').read_text())
+                    source_review = _repair_round(session_id, project_id, 'images', True, base, image_tasks,
+                                                  image_report, {}, scope)
+                    source_review, _ = _count_failed_repairs(base, 'images', source_review, scope)
+                    if source_review['status'] != 'success':
+                        return finish({'status': 'error', 'acceptance': {'passed': False,
+                                       'unaccepted': [task['id'] for task in rejected]}})
                 current = {task['id']: task['input_hash'] for task in _tasks(base, 'videos')}
                 rejected_ids = {task['id'] for task in rejected}
                 rejected.extend(task for task in tasks if task['id'] not in rejected_ids
                                 and current[task['id']] != task['input_hash'])
-        _repair_media(base, rejected, kind, session_id)
-    except Exception as exc:
-        if findings_by_task:
-            raise
-        # Сбой ремонта — неудачный раунд: картинки возвращаются к проверенным байтам.
-        logger.warning('Continuity %s repair round failed: %s', kind, exc)
+        _repair_media(base, rejected, kind, session_id, mark_attempt)
+        post = _review(session_id, project_id, kind, enable, repair=False, shot_keys=shot_keys)
+        if post.get('acceptance', {}).get('passed') or not rollback:
+            return finish(post)
+        # Откатываются только группы, не принятые после ремонта: иначе успешный ремонт
+        # теряется и каждый запуск начинает с тех же замечаний.
+        unaccepted = post.get('acceptance', {}).get('unaccepted')
+        restore = None if unaccepted is None else {
+            path for task in rejected if task['id'] in unaccepted for path in rollback_paths[task['id']]}
+        restored_paths = set()
+        for path, content in rollback.items():
+            if restore is None or path in restore:
+                Path(path).write_bytes(content)
+                restored_paths.add(path)
+                metadata = Path(path).with_suffix('.continuity.json')
+                saved = rollback_metadata[metadata]
+                if saved is None:
+                    metadata.unlink(missing_ok=True)
+                else:
+                    metadata.write_bytes(saved)
+        restored_ids = {f"{item['scene_number']}-{item['shot_number']}" for item in frames
+                        if str(Path(item['output_path']).resolve()) in restored_paths}
+        if restored_ids:
+            path = base / f'97_shots/continuity_{kind}_review.json'
+            current = json.loads(path.read_text())
+            rounds = current.setdefault('failed_rounds', {})
+            for task_id in restored_ids:
+                rounds.pop(task_id, None)
+                if task_id in previous_rounds:
+                    rounds[task_id] = previous_rounds[task_id]
+            _write(path, current)
+        return finish(_review(session_id, project_id, kind, enable, repair=False, shot_keys=shot_keys))
+    except Exception:
         for path, content in rollback.items():
             Path(path).write_bytes(content)
-        return _review(session_id, project_id, kind, enable, repair=False)
-    post = _review(session_id, project_id, kind, enable, repair=False)
-    if post.get('acceptance', {}).get('passed') or not rollback:
-        return post
-    # Откатываются только группы, не принятые после ремонта: иначе успешный ремонт
-    # теряется и каждый запуск начинает с тех же замечаний.
-    unaccepted = post.get('acceptance', {}).get('unaccepted')
-    restore = None if unaccepted is None else {
-        str(Path(item['output_path']).resolve()) for task in rejected if task['id'] in unaccepted
-        for item in task['group']}
-    for path, content in rollback.items():
-        if restore is None or path in restore:
-            Path(path).write_bytes(content)
-    # Rebuild the report against the previous bytes. This makes a failed
-    # repair a no-op for continuity state and leaves the accepted baseline.
-    return _review(session_id, project_id, kind, enable, repair=False)
+        for path, content in rollback_metadata.items():
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(content)
+        if attempted or rollback:
+            path = base / f'97_shots/continuity_{kind}_review.json'
+            current = json.loads(path.read_text())
+            confirmed = set()
+            if kind == 'videos':
+                try:
+                    for task in _tasks(base, kind):
+                        record = current['tasks'].get(task['input_hash'], {})
+                        if (task['id'] in rejected_ids and record.get('id') == task['id']
+                                and record.get('passed') and not record.get('auto_accepted')
+                                and record.get('verdicts') and all(v.get('passed') for v in record['verdicts'])):
+                            confirmed.add(task['id'])
+                except Exception:
+                    pass
+            current['tasks'] = {key: value for key, value in current['tasks'].items()
+                                if value.get('id') not in rejected_ids - confirmed}
+            current['tasks'].update({key: value for key, value in previous_records.items()
+                                     if value.get('id') not in confirmed})
+            if rollback:
+                rounds = current.setdefault('failed_rounds', {})
+                for task_id in rollback_ids:
+                    rounds.pop(task_id, None)
+                rounds.update(previous_rounds)
+            if attempted:
+                rounds = current.setdefault('failed_rounds', {})
+                for task_id in attempted - confirmed:
+                    rounds[task_id] = rounds.get(task_id, 0) + 1
+            _write(path, current)
+        raise
 
 
 def storybook_continuity_images_review_tool(session_id: str, project_id: str, enable: bool = True, review_findings: list = None) -> dict:

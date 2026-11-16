@@ -109,7 +109,11 @@ def test_rendered_visual_finding_blocks_unrelated_success_until_repaired(tmp_pat
             }]})
         payload = json.loads(str(kwargs["prompt"]).split("INPUT:\n", 1)[1])
         qa_calls.append(kwargs)
+        assert "also include the full set._shot_frame_spec in the same repair" in kwargs["prompt"]
+        assert "or a full set._shot_frame_spec repair" not in kwargs["prompt"]
         main_payloads.append(payload)
+        if len(qa_calls) > 1:
+            assert 'Unresolved rendered image findings: [[1, "end"]]' in kwargs["prompt"]
         if len(qa_calls) == 1:
             return json.dumps({"repairs": [{
                 "scene_number": 1,

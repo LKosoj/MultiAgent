@@ -100,6 +100,16 @@ def test_single_step_needs_checkpoint_and_clears_dependencies(env):
     assert definition.steps[0].depends_on == [] and definition.steps[0].condition is None
 
 
+@pytest.mark.parametrize('seed', [None, 731])
+def test_partial_video_uses_saved_optional_seed_without_brief_step(env, seed):
+    project, engine = env
+    put(project, '00_brief.json', json.dumps({} if seed is None else {'seed': seed}))
+    engine.state_manager.store.add('sbm_p_aaaaaaaa', 'failed')
+    plan = run_plan.build_plan('p', 'single_step', step_id='video_generator', engine=engine)
+    definition = run_plan.build_definition(plan)
+    assert definition.steps[0].tool_params['seed'] == seed
+
+
 def test_single_video_step_sets_provider_env(env):
     _, engine = env
     engine.state_manager.store.add("sbm_p_aaaaaaaa", "failed")
@@ -138,7 +148,7 @@ def test_regenerate_shots_scope_and_provider_check(env, monkeypatch):
     plan = run_plan.build_plan("p", "regenerate_shots", shot_keys=["s01_sh01"], kinds=["video"],
                                rebuild_film=True, engine=engine)
     assert plan["steps_to_run"] == ["video_generator", "montage_assembler"]
-    assert plan["step_params"]["video_generator"] == {"shot_keys": ["s01_sh01"]}
+    assert plan["step_params"]["video_generator"] == {"shot_keys": ["s01_sh01"], "seed": None}
     assert plan["scope"] == {"shot_keys": ["s01_sh01"], "kinds": ["video"]}
     assert plan["prepare"]["hook"] == "review.prepare_regeneration"
     both = run_plan.build_plan("p", "regenerate_shots", shot_keys=["s01_sh01"], kinds=["images", "video"],

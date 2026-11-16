@@ -1,6 +1,6 @@
 """Общие правила видеопромпта: длина, одно событие, камера, темп и якоря формы предметов."""
 import re
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 # Длинные промпты (250+ слов) провоцируют модель добавлять лишние предметы и события.
 VIDEO_PROMPT_MAX_WORDS = 150
@@ -10,8 +10,13 @@ NATURAL_TEMPO = "real-time, natural speed"
 VIDEO_PROMPT_RULES = (
     f"- Length: 80-{VIDEO_PROMPT_MAX_WORDS} words; a simple static insert may be shorter. "
     f"Never exceed {VIDEO_PROMPT_MAX_WORDS} words.\n"
-    "- One clip shows one main event. Do not add a second event, extra objects or extra characters.\n"
+    "- Write instructions in English and character names with Latin letters. Preserve source-visible writing verbatim; "
+    "spoken dialogue is not visible writing, so describe the speech action in English instead of quoting its source-language line.\n"
+    "- One clip shows the complete source-authored causal sequence of this shot, including its required reactions. Do not add unrelated events, objects or characters.\n"
+    "- START image restrictions and t0_mode apply only at T=0. The video must reach the required END state within the clip; shortening prose must preserve all authored events.\n"
     "- Give the timeline in seconds within the clip duration, e.g. \"0-2s: ...; 2-4s: ...\".\n"
+    "- Supplied duration_s is the actual clip duration; nominal screenplay timing and stale timestamps do not extend it. "
+    "Achieve every authored event and the required END state within that duration.\n"
     f"- State the speed in words: \"{NATURAL_TEMPO}\", unless slow motion or a time-lapse is required.\n"
     f"- The first sentence is the camera. For a stationary camera write exactly \"{STATIC_CAMERA_SENTENCE}\" "
     "(in English) as the first sentence. Describe the camera positively: never as a negation "
@@ -31,7 +36,7 @@ def video_prompt_word_count(prompt: str) -> int:
     return len(str(prompt or "").split())
 
 
-def video_prompt_violations(prompt: str) -> List[str]:
+def video_prompt_violations(prompt: str, duration_s: Optional[float] = None) -> List[str]:
     """Формальные нарушения правил видеопромпта для ремонта в QA."""
     issues = []
     words = video_prompt_word_count(prompt)
@@ -39,6 +44,13 @@ def video_prompt_violations(prompt: str) -> List[str]:
         issues.append(f"video_prompt_too_long:{words}_words_max_{VIDEO_PROMPT_MAX_WORDS}")
     if _NEGATED_CAMERA.search(str(prompt or "")):
         issues.append("camera_phrased_as_negation")
+    if duration_s is not None:
+        ends = re.findall(r"\b\d+(?:\.\d+)?\s*[-–]\s*(\d+(?:\.\d+)?)\s*(?:s|seconds?)\b",
+                          str(prompt or ""), re.IGNORECASE)
+        last_mark = max((float(value) for value in ends), default=0.0)
+        # Rounding a timestamp to hundredths can add up to half a centisecond.
+        if last_mark > duration_s + 0.005:
+            issues.append(f"video_prompt_time_exceeds_duration:{last_mark:g}s_max_{duration_s:g}s")
     return issues
 
 

@@ -293,10 +293,11 @@ def _build_state_to_image_common_core(
     START и END должны пользоваться одной и той же логикой literal/frame-first описания,
     различаясь только source-of-truth для своей фазы.
     """
-    return f"""
+    from .continuity import _PHASE_SOURCE_RULES
+    return _PHASE_SOURCE_RULES + f"""
 **[P1 CRITICAL] UNIVERSAL STATE-TO-IMAGE CORE ({phase_name}):**
 - Генерируй literal image-edit prompt для одного видимого кадра, а не литературный пересказ или интерпретацию сцены.
-- Source of truth для этой фазы: `shot_frame_spec` + `{state_spec_name}` + `world_physics` + текущие structured fields.
+- Производное описание этой фазы: `shot_frame_spec` + `{state_spec_name}` + `world_physics` + текущие structured fields; оно обязано совпадать с исходником и зарегистрированным состоянием своей фазы.
 - Описывай только то, что действительно должно быть видно в этой фазе; не смешивай раннее и позднее состояния одного и того же шота.
 - Отделяй сторону камеры от стороны персонажа относительно преграды. Сохраняй масштаб и естественное перекрытие тела: непрозрачные части закрывают тело, целые прозрачные части сохраняются, повреждение относится только к указанной части. Не расширяй проём ради показа всех деталей одежды.
 - Не генерируй и не выбирай художественный стиль: код добавит готовое описание из каталога по сохранённой привязке кадра. Не копируй в `english_prompt` общую библию стиля, палитры других локаций, будущие события, звук, монтажные указания и название модели.
@@ -369,7 +370,7 @@ def _build_state_to_image_user_core(
     return f"""
 ОБЩИЕ ПРАВИЛА ДЛЯ {phase_name}:
 - Используй один и тот же универсальный подход literal state-to-image: опиши конкретный видимый кадр, а не интерпретацию или мини-рассказ.
-- `shot_frame_spec` и `{state_spec_name}` — source of truth; не смешивай факты из другой фазы этого же шота.
+- `shot_frame_spec` и `{state_spec_name}` — производное описание текущей фазы, подчинённое исходнику и зарегистрированным состояниям START/END; не смешивай факты разных фаз.
 - `english_prompt`, `{summary_field}`, `{composition_field}`, `{camera_position_field}` и `{orientation_field}` должны быть согласованы между собой.
 - Пиши визуально наблюдаемые факты: где субъект, на чём держится, что видно по краям кадра, куда направлен взгляд, как читается лицо, какая часть среды осталась в кадре.
 - Если `pose_signature` задан, явно переведи его в кадр: сохрани читаемый жест, наклон корпуса, положение головы, направление рук и отношение реквизита к телу.
@@ -1980,7 +1981,7 @@ Example (source=Russian): wooden sign nailed to door reads [in-image text: "Ос
 Example (source=English): wooden sign nailed to door reads [in-image text: "Beware of dog"]
 NEVER auto-translate signage/labels to English — source language wins for on-image text.
 
-**[P0 CRITICAL] SHOT_FRAME_SPEC = SOURCE OF TRUTH:**
+**[P0 CRITICAL] SHOT_FRAME_SPEC = DERIVED PHASE DESCRIPTION:**
 - `shot_frame_spec` — авторитетная спецификация шота. Поля `primary_subject`, `visible_characters`, `must_show`, `must_not_show`, `visible_readable_texts`, `hidden_readable_texts`, `world_physics` обязательны.
 - `facial_expression`, `gaze_direction`, `pose_signature` из `shot_frame_spec` (для START фазы это уже start_state_spec) обязательны и не могут быть сведены к нейтральной позе/лицу.
 - Нельзя добавлять объекты/персонажей, которых нет в `must_show` и `shot_description`. Нельзя удалять обязательные факты из `must_show`.
@@ -2218,7 +2219,7 @@ PER-SHOT CAST VISUAL CANON (ИСПОЛЬЗУЙ ТОЛЬКО ДЛЯ ВИЗУАЛ�
 ТЕХНИЧЕСКИЕ ПАРАМЕТРЫ КАДРА:
 {json.dumps(start_summary, ensure_ascii=False, indent=2)}
 
-SHOT FRAME SPEC (авторитетный source of truth для шота):
+SHOT FRAME SPEC (производное описание, подчинённое исходнику и зарегистрированным состояниям START/END):
 {json.dumps(extended_context.get('shot_frame_spec', {}), ensure_ascii=False, indent=2)}
 
 КРУПНОСТЬ КАДРА (ОБЯЗАТЕЛЬНО НАЧНИ ПРОМПТ С НЕЁ):
@@ -2234,7 +2235,7 @@ SHOT FRAME SPEC (авторитетный source of truth для шота):
 КОНТЕКСТ СЦЕНЫ И РЕШЕНИЙ:
 {json.dumps(context_for_decisions, ensure_ascii=False, indent=2)}
 
-scene_continuity_facts (устойчивые факты сцены из scene.action; применяй если уместно по camera_plan и не противоречит storyboard.description):
+scene_continuity_facts (continuity задаёт зарегистрированные состояния START/END; остальные факты — контекст сцены):
 {json.dumps(extended_context.get('scene_continuity_facts', {}), ensure_ascii=False, indent=2)}
 
 КОНТЕКСТ ПРЕЕМСТВЕННОСТИ:
@@ -2242,7 +2243,7 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
 Есть continuity reference: {"Да" if has_continuity else "Нет"}
 
     ОБЯЗАТЕЛЬНО:
-    - `shot_frame_spec` — это source of truth. Включи все факты из `must_show`, не добавляй того, чего нет в spec, и не делай главным субъектом никого, кроме `primary_subject`.
+    - Используй `shot_frame_spec` только в согласии с исходником и зарегистрированными состояниями START/END. Сохрани совместимые с ними `must_show` и `primary_subject`; не добавляй неподтверждённых деталей.
     - Если в `shot_frame_spec` или `start_state_spec` есть `world_physics`, переведи его в визуально читаемое состояние мира: опора, поверхность, устойчивость, контакты, зазоры, перекрытия. Не замещай это локальными edge-case описаниями.
     - **ВИЗУАЛИЗАЦИЯ**: Для персонажа с референсом укажи каноническое имя и видимые факты текущего шота: позу, мимику, взгляд и текущую одежду; не перечисляй повторно неизменную внешность из PER-SHOT CAST VISUAL CANON. Если референса нет, добавь только необходимые отличительные признаки. Базовая одежда и аксессуары не отменяют заданную смену или снятие. Не тащи в prompt роль, профессию, биографию, характер или речевые паттерны.
     - **MULTI-CHARACTER LOCK**: если в PER-SHOT CAST VISUAL CANON несколько персонажей, сохраняй их как отдельные визуальные сущности по `shot_role`; не смешивай одежду, лицо, аксессуары и силуэт между ними.
@@ -2855,6 +2856,7 @@ def _generate_transition_video_prompt(
     Генерирует video_prompt ПОСЛЕ того, как уже известны START и END image-prompts.
     Video prompt хранится только у START кадра.
     """
+    from .continuity import _PHASE_SOURCE_RULES
     shot_frame_spec = extended_context.get("shot_frame_spec", {}) or {}
     transition_spec = shot_frame_spec.get("transition_spec", {}) or extended_context.get("transition_spec", {}) or {}
 
@@ -2864,10 +2866,10 @@ def _generate_transition_video_prompt(
         extended_context.get("camera_plan", ""),
     )
 
-    system_prompt = """
+    system_prompt = _PHASE_SOURCE_RULES + """
 Ты создаешь ТОЛЬКО video_prompt для одного storyboard-shot. Верни строго JSON: {"video_prompt": "single-line video prompt"}
 
-SOURCE OF TRUTH: shot_description + camera_plan + transition_spec + готовые START/END image-prompts.
+Сохраняй зарегистрированные границы START/END; transition_spec и готовые image-prompts описывают переход только в пределах исходного шота.
 
 ОБЯЗАТЕЛЬНЫЙ ФОРМАТ OUTPUT (точно 4 сегмента через ";"):
 "[CAMERA clause]; [SUBJECT quality+action]; [ENVIRONMENT micro-dynamics]; [TEMPO]"
@@ -2933,6 +2935,7 @@ SELF-CHECK: 1) каждый noun phrase поддержан shot_description? 2) 
         "camera_plan": extended_context.get("camera_plan", ""),
         "shot_description": extended_context.get("shot_description", ""),
         "transition_spec": transition_spec,
+        "scene_continuity_facts": extended_context.get("scene_continuity_facts", {}),
         "start_visible_characters": shot_frame_spec.get("start_state_spec", {}).get("visible_characters", []),
         "end_visible_characters": shot_frame_spec.get("end_state_spec", {}).get("visible_characters", []),
         "start_world_physics": shot_frame_spec.get("start_state_spec", {}).get("world_physics", {}),
@@ -3068,7 +3071,7 @@ NEVER auto-translate signage/labels to English -- source language wins for on-im
 
 **ГЛОССАРИЙ:** shot_size = крупность плана; ratio = коэффициент масштабирования; english_prompt = ОДНА команда редактирования; linking = решение о преемственности.
 
-**[P0 CRITICAL] SHOT_FRAME_SPEC = SOURCE OF TRUTH:**
+**[P0 CRITICAL] SHOT_FRAME_SPEC = DERIVED PHASE DESCRIPTION:**
 - `shot_frame_spec` -- авторитетная спецификация шота. Поля `primary_subject`, `visible_characters`, `must_show`, `must_not_show`, `visible_readable_texts`, `hidden_readable_texts`, `world_physics` обязательны.
 - `facial_expression`, `gaze_direction`, `pose_signature` из `shot_frame_spec`/`end_state_spec` обязательны; не сводить к нейтральной позе/лицу.
 - Нельзя добавлять объекты/персонажей вне `must_show` и `shot_description`. Все structured fields непустые и согласованы.
@@ -3158,7 +3161,7 @@ NEVER auto-translate signage/labels to English -- source language wins for on-im
 | OBJECT-CHARACTER | Если взаимодействие объекта с персонажем -- включи видимые части персонажа в кадр (затылок/шея/лицо) |
 | THROW/RELEASE LOCK | Throw verbs -- END = post-release: объект НЕ в руке, по умолчанию OUT OF FRAME. Не выдумывай приземление |
 | FALLING PROP LANDING | "Падает на рог/голову" -- END = post-contact, prop resting on body part. Не заменяй на environment upgrades |
-| CONTINUITY FACTS | scene_continuity_facts: применяй если не противоречит shot_description и уместно по крупности |
+| CONTINUITY FACTS | scene_continuity_facts.continuity: сохраняй зарегистрированное состояние своей фазы; прочие факты — контекст |
 | HALLUCINATION | Не добавляй unrequested objects (stands, furniture). Только props из START или prop_continuity.added |
 
 **ПРИМЕРЫ КОМАНД:**
@@ -3337,7 +3340,7 @@ NEVER auto-translate signage/labels to English -- source language wins for on-im
 {json.dumps(location_ctx, ensure_ascii=False, indent=2)}
 </location_context>
 
-SHOT FRAME SPEC (авторитетный source of truth для шота; transition_spec.environment_delta дополняется при движении субъекта/камеры):
+SHOT FRAME SPEC (производное описание, подчинённое исходнику и зарегистрированным состояниям START/END; transition_spec.environment_delta дополняется при движении субъекта/камеры):
 {json.dumps(shot_frame_spec_payload, ensure_ascii=False, indent=2)}
 
 PER-SHOT CAST VISUAL CANON (ИСПОЛЬЗУЙ ТОЛЬКО ДЛЯ ВИЗУАЛИЗАЦИИ ЭТОГО КАДРА):
@@ -3373,7 +3376,7 @@ TRANSITION HINT (optional video_prompt; may be empty):
 ЗАДАЧА:
 1. Создай english_prompt КАК ОДНУ КОМАНДУ РЕДАКТИРОВАНИЯ ИЗОБРАЖЕНИЯ:
    - Пиши `english_prompt` на {prompt_language_label}. `negative_prompt` — на {prompt_language_label}. Если язык `negative_prompt` не английский, не добавляй в него английские слова, кроме стандартных camera/lens терминов и авторизованных readable texts.
-   - `shot_frame_spec` — это source of truth. Сохрани все факты из `must_show`, не добавляй ничего вне spec и не подменяй `primary_subject`.
+   - Используй `shot_frame_spec` только в согласии с исходником и зарегистрированными состояниями START/END. Сохрани совместимые с ними `must_show` и `primary_subject`; не добавляй неподтверждённых деталей.
    - **НАЧНИ С ИНСТРУКЦИИ**: "{edit_prefix} {final_size_label}: [Zoom/Shift command if ratio/yaw changed]. [Action result]. [Atmosphere/Lighting from location_context]."
    - **КРИТИЧНО - ZOOM/SHIFT**: Если ratio ≠ 1.0, используй "Zoom in (scale Xx)" или "Pull back (scale Xx)". Если yaw ≠ 0, используй "Shift perspective [direction] by [degrees]°".
    - lighting, color_palette и atmosphere из производного location_context используй только в согласии с исходником и конечной фазой.

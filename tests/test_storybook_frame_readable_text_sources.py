@@ -85,3 +85,20 @@ def test_phase_text_descriptor_binds_quoted_literal(monkeypatch, entry):
     result = artist._collect_visible_text_bindings(item, "Closed door", "ru")
     assert captured["candidate_texts"] == ["ВХОД"]
     assert result[0]["text"] == "ВХОД"
+
+
+def test_unquoted_descriptor_is_accounted_for_without_rendering_carrier_prose(monkeypatch):
+    item = _item('end')
+    descriptor = 'EXIT on the door sign'
+    item['_shot_frame_spec']['end_state_spec']['visible_readable_texts'] = [descriptor]
+
+    def fake_call(**kwargs):
+        assert 'descriptive entries' in kwargs['system_prompt']
+        assert 'bind only the literal inscription' in kwargs['system_prompt']
+        return json.dumps({'bindings': [{'text': 'EXIT', 'carrier': 'door sign', 'visibility': 'fully readable'}],
+                           'rejected_candidates': [{'text': descriptor, 'reason': 'Carrier prose is not inscription text'}]})
+
+    monkeypatch.setattr(utils, 'call_openai_api', fake_call)
+    monkeypatch.setattr(artist, '_normalize_visible_text_bindings_language', lambda bindings: bindings)
+    result = artist._collect_visible_text_bindings(item, 'A closed door.', 'en')
+    assert [binding['text'] for binding in result] == ['EXIT']

@@ -309,8 +309,12 @@ def test_grok_reference_rejection_overrides_advertised_support(monkeypatch):
     assert common._get_routerai_video_models()[record["id"]]["supports_image_references"] is False
 
 
-def test_prepared_video_prompt_skips_image_analysis(project, monkeypatch):
+@pytest.mark.parametrize('gateway_wan', [False, True])
+def test_prepared_video_prompt_skips_image_analysis(project, monkeypatch, gateway_wan):
     shots, item, record = project
+    if gateway_wan:
+        record['id'] = 'llmgateway/wan3.0'
+        monkeypatch.setenv('ROUTERAI_VIDEO_MODEL', record['id'])
     payloads = []
     monkeypatch.setattr(generator, "update_shots_with_descriptions", lambda *args, **kwargs: pytest.fail("Prepared prompts must not re-analyze images"))
     monkeypatch.setattr(generator.requests, "get", lambda url, **kwargs: Response({"data": [record]}) if url.endswith("/models") else Response({"status": "completed"}))
@@ -324,6 +328,7 @@ def test_prepared_video_prompt_skips_image_analysis(project, monkeypatch):
     assert result["status"] == "success"
     assert len(payloads) == 1
     assert payloads[0]["prompt"] == item["video_prompt"]
+    assert payloads[0].get('provider_options') == ({'alibaba': {'prompt_extend': False}} if gateway_wan else None)
 
 
 def test_wan_documented_capabilities_are_stored_in_code(monkeypatch):

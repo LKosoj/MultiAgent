@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import contextvars
 import threading
@@ -225,7 +226,10 @@ def video_generator_aitunnel_tool(
         speech = _load_speech_for_planning(project_id, project_dir)
         _require_current_video_plan(project_id, project_dir, speech, items_list, shot_keys)
         from .continuity_review import require_continuity_acceptance
-        require_continuity_acceptance(project_dir, 'images')
+        if shot_keys is None:
+            require_continuity_acceptance(project_dir, 'images')
+        else:
+            require_continuity_acceptance(project_dir, 'images', shot_keys=shot_keys)
 
     if shots_file_path and project_id and (force_update_prompts or not skip_prompt_enhancement):
         description_items = items_list
@@ -392,7 +396,7 @@ def video_generator_aitunnel_tool(
                 generate_blockout=generate_blockout, use_blockout_reference=use_blockout_reference,
                 deadline=deadline, video_step_started_at=video_step_started_at,
                 remaining_new_output_items=remaining_new_output_items, worker_count=worker_count,
-                provider_name=_provider_name)
+                provider_name=_provider_name, skip_prompt_enhancement=skip_prompt_enhancement)
             future_to_item = {
                 executor.submit(
                     contextvars.copy_context().run, generate_with_model_fallback,
@@ -527,7 +531,7 @@ def trusted_aitunnel_output_for_item(
         if source_hash is None and stored_hashes.get(name):
             source_hashes[name] = stored_hashes[name]
 
-    requested_duration = _parse_duration_from_timing(item.get("timing", "00:00 - 00:06"))
+    requested_duration = _requested_shot_duration(item)
     requested_width, requested_height = _requested_frame_dimensions(item)
     duration = requested_duration
     size_params: Dict[str, str] = {}
@@ -591,7 +595,7 @@ def resumable_aitunnel_job_for_item(
     for name, source_hash in source_hashes.items():
         if source_hash is None and stored_hashes.get(name):
             source_hashes[name] = stored_hashes[name]
-    requested_duration = _parse_duration_from_timing(item.get("timing", "00:00 - 00:06"))
+    requested_duration = _requested_shot_duration(item)
     requested_width, requested_height = _requested_frame_dimensions(item)
     duration, size_params = requested_duration, {}
     if use_blockout_reference and generate_blockout and model_catalog is None:
@@ -650,7 +654,7 @@ def confirm_legacy_aitunnel_output_for_item(
     for name, source_hash in source_hashes.items():
         if source_hash is None and (job.get("source_image_hashes") or {}).get(name):
             source_hashes[name] = job["source_image_hashes"][name]
-    duration = _parse_duration_from_timing(item.get("timing", "00:00 - 00:06"))
+    duration = _requested_shot_duration(item)
     size_params: Dict[str, str] = {}
     if use_blockout_reference and generate_blockout and model_catalog is None:
         return False
@@ -670,7 +674,7 @@ def confirm_legacy_aitunnel_output_for_item(
     requested_width, requested_height = _requested_frame_dimensions(item)
     original_hash = _build_input_hash(
         model_name=configured_model, prompt_hash=_hash_text(raw_prompt), source_image_hashes=source_hashes,
-        requested_duration=_parse_duration_from_timing(item.get("timing", "00:00 - 00:06")),
+        requested_duration=_requested_shot_duration(item),
         requested_width=requested_width, requested_height=requested_height, seed=seed,
         frame_types=["first_frame"] + (["last_frame"] if source_hashes["end_image"] else []),
         reference_video_hash=_hash_source_image(reference) if attached else None,
@@ -954,6 +958,7 @@ def _generate_single_video_aitunnel(
     remaining_new_output_items: int = 1,
     worker_count: int = 1,
     provider_name: str = "aitunnel",
+    skip_prompt_enhancement: bool = False,
 ) -> Dict[str, Any]:
     del session_id
     if item.get("video_mode") == "references":
@@ -961,7 +966,7 @@ def _generate_single_video_aitunnel(
         try:
             return generate_reference_video(item, api_key, configured_model, seed, job_store, model_catalog,
                                             deadline, video_step_started_at, remaining_new_output_items, worker_count,
-                                            provider_name=provider_name)
+                                            provider_name=provider_name, skip_prompt_enhancement=skip_prompt_enhancement)
         except BudgetExceededError as exc:
             # остановка по бюджету — не сбой провайдера: шот помечается кодом, ретраи не платят
             return {"success": False, "error": str(exc), "error_code": exc.code,
@@ -1030,7 +1035,7 @@ def _generate_single_video_aitunnel(
         for name, source_hash in source_image_hashes.items():
             if source_hash is None and (trusted_source_hashes or {}).get(name):
                 source_image_hashes[name] = trusted_source_hashes[name]
-        requested_duration = _parse_duration_from_timing(item.get("timing", "00:00 - 00:06"))
+        requested_duration = _requested_shot_duration(item)
         requested_width, requested_height = _requested_frame_dimensions(item)
         frame_types = ["first_frame"] + (["last_frame"] if source_image_hashes["end_image"] else [])
         model_name = configured_model
@@ -1065,10 +1070,10 @@ def _generate_single_video_aitunnel(
 
         # M-6: hash user inputs only; the catalog-resolved model/size/duration are
         # stored as job metadata below, never fed into input_hash.
-        # Note: duration normalization in 97_shots rewrites `timing`/`duration_s` before
-        # requested_duration is derived, so it still flows in via user input and does not
-        # violate M-6. A model-catalog change can still trigger regeneration for affected
-        # shots — now with an explicit P16 warning + shot list instead of silently.
+        # Speech-bound duration_s is the current user input; legacy timing is only
+        # a fallback when no measured duration is available. A model-catalog change
+        # can still trigger regeneration for affected shots — now with an explicit
+        # P16 warning + shot list instead of silently.
         # Э8 (раздел 11.3): reference_video_hash входит в словарь только когда референс
         # действительно подан — иначе состав словаря и хеш остаются прежними (A31/A37).
         if confirmed_resume_job:
@@ -1273,6 +1278,8 @@ def _generate_single_video_aitunnel(
                     "generate_audio": False,
                 }
                 payload.update(size_params)
+                if skip_prompt_enhancement and provider_name == "routerai" and model_name.startswith("llmgateway/wan"):
+                    payload["provider_options"] = {"alibaba": {"prompt_extend": False}}
                 if seed is not None:
                     payload["seed"] = seed
                 if reference_video_path:
@@ -1310,6 +1317,7 @@ def _generate_single_video_aitunnel(
                                 "source_image_hashes": source_image_hashes,
                                 "output_path": str(video_path),
                                 "error": None,
+                                **({"provider_options": payload["provider_options"]} if "provider_options" in payload else {}),
                                 **reservation,
                             },
                             "submitting_at",
@@ -1639,6 +1647,12 @@ def _stored_video_url_requires_auth(job: Dict[str, Any], video_url: str, base_ur
     if stored is not None:
         return bool(stored)
     return str(video_url or "").startswith(base_url.rstrip("/") + "/")
+
+
+def _requested_shot_duration(item: Dict[str, Any]) -> int:
+    if item.get("duration_s") is not None:
+        return max(1, math.ceil(float(item["duration_s"])))
+    return _parse_duration_from_timing(item.get("timing", "00:00 - 00:06"))
 
 
 def _parse_duration_from_timing(timing: str) -> int:

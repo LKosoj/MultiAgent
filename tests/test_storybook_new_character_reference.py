@@ -23,6 +23,28 @@ def test_new_character_is_not_created_by_editing_another_character(tmp_path, mon
     assert calls[0][1]['entity_data']['age'] == '20'
 
 
+def test_repeated_new_character_is_not_created_by_editing_another_character(tmp_path, monkeypatch):
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    base = tmp_path / 'p' / '20_bible' / 'references' / 'characters'
+    base.mkdir(parents=True)
+    source = base / 'first.png'
+    source.write_bytes(b'existing portrait')
+    target = base / 'second.png'
+    character = {'name': 'Second', 'age': '20', 'reference_image_path': '/references/characters/second.png'}
+    items = [{'project_id': 'p', 'reference_image_paths': [str(target)], 'characters': [character]}] * 2
+    calls = []
+    monkeypatch.setattr(artist, '_collect_project_references', lambda *a, **k: [str(source)])
+    monkeypatch.setattr(artist, '_smart_select_references_for_generation', lambda *a, **k: a[2])
+    monkeypatch.setattr(artist, '_create_canon_reference', lambda **k: calls.append(('edit', k)) or True)
+    monkeypatch.setattr(artist, '_generate_canon_reference_from_scratch', lambda **k: calls.append(('generate', k)) or True)
+
+    results = artist._preprocess_canon_references(items, [], 's', 1)
+
+    assert len(results) == 1 and results[0]['success']
+    assert [kind for kind, _ in calls] == ['generate']
+    assert calls[0][1]['entity_data'] == character
+
+
 def test_reuse_episode_image_requires_matching_existing_inputs(tmp_path, monkeypatch):
     from custom_tools.storybook import project_paths, continuity
     monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))

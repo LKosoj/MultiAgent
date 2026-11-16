@@ -377,35 +377,6 @@ steps:
     enable: '{generate_screenplay}'
   depends_on:
   - character_reference_states
-- id: background_reference_plan
-  step_type: tool
-  task: Plan linked background views and frame bindings
-  timeout: 86400
-  tool_name: storybook_background_plan_tool
-  tool_params:
-    session_id: '{session_id}'
-    project_id: '{project_id}'
-    shots_data: '{storybook_video_plan}'
-    language: '{language}'
-    enable: '{generate_screenplay}'
-  depends_on:
-  - storybook_video_plan
-  - character_reference_states
-  - shots_prompt_qa
-  - artist_batch
-- id: background_references
-  step_type: tool
-  task: Render planned background-card sheets before generating shot images
-  timeout: 86400
-  tool_name: storybook_background_references_tool
-  tool_params:
-    session_id: '{session_id}'
-    project_id: '{project_id}'
-    shots_data: '{background_reference_plan}'
-    language: '{language}'
-    enable: '{generate_screenplay}'
-  depends_on:
-  - background_reference_plan
 - id: artist_batch_shots
   step_type: tool
   task: Parallel artist edits with references for final shots images
@@ -413,7 +384,7 @@ steps:
   tool_name: artist_agent_batch_edit_tool
   tool_params:
     session_id: '{session_id}'
-    items: '{background_references}'
+    items: '{storybook_video_plan}'
     language: '{language}'
     enable: '{generate_screenplay}'
     #enable: false
@@ -421,7 +392,7 @@ steps:
     generate_blockout: '{generate_blockout}'
   depends_on:
   - shots_prompt_qa
-  - background_references
+  - storybook_video_plan
   - artist_batch
   - blockout_renderer
 - id: storybook_continuity_images_review

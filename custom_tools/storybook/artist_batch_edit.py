@@ -385,7 +385,8 @@ def _collect_visible_text_bindings(
         "- Decide binding at the LLM level from scene, bible, story, and beat context. Do not rely on a fixed carrier taxonomy.\n"
         "- Infer the carrier from the provided context itself, not from a predefined list of supported surface types.\n"
         "- Exact literal texts must come from character/location source texts or `frame_spec.visible_readable_texts` of this current phase. The latter may be a result of an action and need not exist in the location's initial state. Bind it to the carrier specified by the current frame, never to a different surface.\n"
-        "- Use `rejected_candidates` only when a quoted fragment from source text is not actually an in-scene readable inscription/slogan/label/badge/sign text source.\n"
+        "- Candidates may include descriptive entries from frame_spec. If an entry mixes an inscription with carrier prose, account for the full original entry in rejected_candidates and bind only the literal inscription grounded in the authoritative source.\n"
+        "- Use `rejected_candidates` for candidates that are not literal in-scene inscriptions, including quoted dialogue and descriptive prose; explain the rejection and preserve any actual inscription as a binding.\n"
         "- Use `story_context` only to decide current-frame visibility, prominence, and which of the authoritative texts should be readable now.\n"
         "- Exclude dialogue and narration unless the same literal text is explicitly authorized as in-scene text by character/location source data or current `frame_spec.visible_readable_texts`.\n"
         "- `carrier` must be a precise English description of the exact surface that owns the text in this frame.\n"
@@ -1090,6 +1091,14 @@ def _build_image_generation_prompts(
 ) -> Tuple[str, str]:
     from utils import needs_translation_to_english, translate_prompts_in_items
 
+    current = (item.get('_continuity') or {}).get(item.get('shot_type', 'start')) or {}
+    if current.get('states'):
+        scene_prompt += (
+            '\n\nRegistered state for this frame only; it overrides obsolete contents in references. '
+            'visible=true requires depiction; visible=false neither requires nor forbids depiction. '
+            'If depicted, preserve its current state without forcing offscreen objects into view.\n'
+            + json.dumps(current['states'], ensure_ascii=False)
+        )
     base_negative_prompt = item.get("negative_prompt") or (
         "watermark, text, logo, nsfw, distorted hands, extra fingers, extra limbs, lowres, deformed face"
     )
@@ -1486,14 +1495,14 @@ def _build_edit_instruction(
     if edit_findings:
         if str(language or "").lower().startswith("ru"):
             english_prompt = ("Исправь на изображении 1 только перечисленные нарушения непрерывности. Требуемые исправления имеют приоритет: "
-                              "перемести или измени затронутые объекты и части композиции как указано. Сохрани только незатронутые "
+                              "перемести, убери или измени затронутые объекты и части композиции как указано. Сохрани только незатронутые "
                               "композицию, камеру, стиль, фон и другие элементы. Другие изображения используй только "
                               "как референсы для исправляемого элемента. Если требуется направление силуэта или профиля, "
                               "сделай его читаемым по контуру головы и носа, а не округлым анфасным пятном. " + " ".join(
                                   f"Требуется: {finding['required']}"
                                   for finding in edit_findings))
         else:
-            english_prompt = ("Edit image 1 to correct only these continuity findings. Required corrections take priority: move or change affected "
+            english_prompt = ("Edit image 1 to correct only these continuity findings. Required corrections take priority: move, remove or change affected "
                               "objects and parts of the composition as specified. Preserve only unaffected composition, camera, "
                               "style, background and other elements. Use other images only as references for "
                               "the corrected element. If a silhouette or profile direction is required, make it readable in the head and nose contour, not a round frontal blob. " + " ".join(
@@ -1507,11 +1516,21 @@ def _build_edit_instruction(
             ) + "."
             english_prompt += locked_text
         english_prompt += (
-            " Image 1 is the current target frame and is the only source of composition, camera, "
-            "facade, window placement and character placement. Images 2 and later are reference "
-            "details only; never replace the target composition with a reference image. "
-            "When a hand is named, use the character's anatomical right hand, not screen-right."
+            " Image 1 is the current target frame: preserve its unaffected composition, camera, "
+            "background and character placement. Explicit required removals, moves and changes take priority. "
+            "Images 2 and later supply reference details only; do not copy their composition or add a "
+            "whole character merely because a reference shows one. Preserve the required crop. "
+            "For named body parts, follow the specified anatomical left or right side; "
+            "directions for moving an object within the frame remain screen directions."
         )
+        current = (item.get('_continuity') or {}).get(item.get('shot_type', 'start')) or {}
+        if current.get('states'):
+            english_prompt += (
+                '\n\nRegistered state for this frame only; it overrides obsolete contents in references. '
+                'visible=true requires depiction; visible=false neither requires nor forbids depiction. '
+                'If depicted, preserve its current state without forcing offscreen objects into view.\n'
+                + json.dumps(current['states'], ensure_ascii=False)
+            )
         scene_negative = ""
     else:
         prompt_item = item
@@ -2173,15 +2192,18 @@ def _preprocess_canon_references(
     
     def _canon_worker(task: Dict[str, Any]) -> Dict[str, Any]:
         """Воркер для создания одного канонического референса."""
-        success = _create_canon_reference(
+        generator = (_generate_canon_reference_from_scratch
+                     if task["entity_type"] == "character" else _create_canon_reference)
+        references = {} if task["entity_type"] == "character" else {"reference_paths": task["reference_paths"]}
+        success = generator(
             session_id=session_id,
             entity_type=task["entity_type"],
             entity_data=task["entity_data"],
-            reference_paths=task["reference_paths"],
             output_path=task["output_path"],
             consistency_rules=consistency_rules,
             pipeline_type=pipeline_type,
-            seed=seed
+            seed=seed,
+            **references,
         )
         
         return {
@@ -2508,6 +2530,9 @@ def artist_agent_batch_edit_tool(
     if not items_data:
         raise ValueError("items_data не может быть пустым")
 
+    for item in items_data:
+        item.pop('background_reference', None)
+
     blockout_cache = (
         _load_blockout_ref_image_cache(items_data)
         if use_blockout_reference and generate_blockout
@@ -2740,6 +2765,8 @@ def artist_agent_batch_edit_tool(
 
             # Механизм повторных попыток (до 3 раз)
             max_attempts = 3
+            edit_base = Path(item['output_path']) if item.get('_continuity_edit_findings') else None
+            edit_base_bytes = edit_base.read_bytes() if edit_base and edit_base.is_file() else None
             for attempt in range(1, max_attempts + 1):
                 try:
                     task, paths_list, scene_negative, english_prompt = _build_edit_instruction(session_id=session_id, item=item, seed=seed, language=language)
@@ -2795,6 +2822,13 @@ def artist_agent_batch_edit_tool(
                     
                     # Проверяем, что файл действительно создан
                     if file_path and os.path.exists(file_path) and os.stat(file_path).st_mtime_ns != prior_mtime:
+                        canon_paths = [Path(path) for path in paths_list
+                                       if {'references', 'scene_character_references'}.intersection(Path(path).parts)]
+                        if canon_paths:
+                            image_hash = hashlib.sha256(Path(file_path).read_bytes()).digest()
+                            if any(hashlib.sha256(path.read_bytes()).digest() == image_hash for path in canon_paths):
+                                os.remove(file_path)
+                                raise ValueError('Image generation returned an unchanged canonical reference instead of a scene')
                         logger.info(f"✅ Файл успешно создан на попытке {attempt}: {file_path}")
                         record_continuity_image(continuity_cache_item)
                         return {
@@ -2821,6 +2855,8 @@ def artist_agent_batch_edit_tool(
                             }
 
                 except Exception as e:
+                    if edit_base_bytes is not None:
+                        edit_base.write_bytes(edit_base_bytes)
                     logger.error(f"❌ Ошибка на попытке {attempt}/{max_attempts} для элемента {index}: {e}")
                     if attempt < max_attempts:
                         continue  # Повторяем попытку
