@@ -13,6 +13,7 @@ from .files import build_files, read_chapters, write_json
 
 
 RULES_PATH = Path(__file__).resolve().parents[2] / 'config/book_summary/prompts.yaml'
+MAX_CORRECTIONS = 3
 
 
 def _digest(value) -> str:
@@ -53,16 +54,26 @@ def _ask(stage: str, payload: dict, rules: dict) -> dict:
     data = result if isinstance(result, dict) else json.loads(extract_json_from_markdown(result or ''))
     if not isinstance(data, dict):
         raise ValueError(f'{stage}: нужен JSON-объект')
-    if stage in {'write', 'size', 'review', 'flow', 'clarity'}:
+    if stage in {'write', 'size', 'review', 'flow', 'clarity', 'repair'}:
         if not isinstance(data.get('text'), str) or not data['text'].strip():
             raise ValueError(f'{stage}: отсутствует текст')
     if stage == 'review' and data.get('flow') not in {'low', 'good'}:
         raise ValueError('review: не указана связность low/good')
     if stage == 'glossary' and not isinstance(data.get('terms'), list):
         raise ValueError('glossary: отсутствует список terms')
+    if stage == 'verify' and (
+        not isinstance(data.get('issues'), list)
+        or any(not isinstance(issue, str) or not issue.strip() for issue in data['issues'])
+    ):
+        raise ValueError('verify: нужен список конкретных замечаний issues')
     if stage == 'book':
         if not isinstance(data.get('issues'), list) or any(not isinstance(data.get(k), str) for k in ('introduction', 'conclusion')):
             raise ValueError('book: неполный результат общей проверки')
+        chapter_ids = {chapter['id'] for chapter in payload['chapters']}
+        for issue in data['issues']:
+            if (not isinstance(issue, dict) or issue.get('chapter_id') not in chapter_ids
+                    or not isinstance(issue.get('message'), str) or not issue['message'].strip()):
+                raise ValueError('book: замечание должно содержать chapter_id и message')
     return data
 
 
@@ -118,34 +129,55 @@ def book_prepare_tool(session_id: str, source_path: str, output_dir: str) -> str
     return json.dumps({'plan_path': str(plan_path), 'output_dir': str(base)})
 
 
-def _chapter(base: Path, chapter: dict, glossary: list, rules: dict) -> dict:
+def _chapter_payload(base: Path, chapter: dict, glossary: list) -> dict:
     source = (base / chapter['source_path']).read_text(encoding='utf-8')
     if not word_count(source):
         raise ValueError(f'Пустая глава: {chapter["id"]}')
+    return {'source': source, 'chapter_id': chapter['id'], 'title': chapter['title'],
+            'glossary': glossary, 'min_words': math.ceil(word_count(source) * .2),
+            'max_words': math.floor(word_count(source) * .4)}
+
+
+def _correct_chapter(folder: Path, payload: dict, rules: dict, issues: list = None) -> str:
+    payload = dict(payload)
+    for attempt in range(MAX_CORRECTIONS + 1):
+        checks = check_text(payload['source'], payload['text'])
+        findings = list(issues or []) if attempt == 0 else []
+        findings.extend(checks['issues'])
+        if not checks['size_ok']:
+            findings.append(f'Объём {checks["words"]} слов: нужен диапазон 20–40%, '
+                            f'от {payload["min_words"]} до {payload["max_words"]} слов')
+        if not findings:
+            verdict = _cached(folder / f'verify-{attempt}.json', 'verify', payload, rules)
+            findings.extend(verdict['issues'])
+        findings = list(dict.fromkeys(findings))
+        write_json(folder / 'checks.json', {**checks, 'issues': findings, 'corrections': attempt})
+        if not findings:
+            return payload['text']
+        if attempt == MAX_CORRECTIONS:
+            raise ValueError(f'{payload["chapter_id"]}: после {MAX_CORRECTIONS} исправлений '
+                             + '; '.join(findings))
+        result = _cached(folder / f'repair-{attempt + 1}.json', 'repair',
+                         {**payload, 'issues': findings}, rules)
+        payload['text'] = result['text']
+
+
+def _chapter(base: Path, chapter: dict, glossary: list, rules: dict) -> dict:
     folder = base / 'chapters' / chapter['id']
-    payload = {'source': source, 'title': chapter['title'], 'glossary': glossary,
-               'min_words': math.ceil(word_count(source) * .2),
-               'max_words': math.floor(word_count(source) * .4)}
+    payload = _chapter_payload(base, chapter, glossary)
     result = _cached(folder / 'write.json', 'write', payload, rules)
     payload['text'] = result['text']
-    if not check_text(source, payload['text'])['size_ok']:
+    if not check_text(payload['source'], payload['text'])['size_ok']:
         result = _cached(folder / 'size.json', 'size', payload, rules)
         payload['text'] = result['text']
-        if not check_text(source, payload['text'])['size_ok']:
-            (folder / 'size.json').unlink()
-            raise ValueError(f'{chapter["id"]}: Size не достиг объёма 20–40%')
     result = _cached(folder / 'review.json', 'review', payload, rules)
     payload['text'] = result['text']
     if result['flow'] == 'low':
         result = _cached(folder / 'flow.json', 'flow', payload, rules)
         payload['text'] = result['text']
     result = _cached(folder / 'clarity.json', 'clarity', payload, rules)
-    text = result['text']
-    checks = check_text(source, text)
-    write_json(folder / 'checks.json', checks)
-    if not checks['size_ok'] or checks['issues']:
-        (folder / 'clarity.json').unlink()
-        raise ValueError(f'{chapter["id"]}: итоговые проверки не пройдены: {checks}')
+    payload['text'] = result['text']
+    text = _correct_chapter(folder, payload, rules)
     return {'id': chapter['id'], 'title': chapter['title'], 'text': text}
 
 
@@ -189,11 +221,22 @@ def book_summary_tool(session_id: str, output_dir: str, plan_approved: bool = Fa
     signature = _inputs_digest(base, plan, rules)
     with ThreadPoolExecutor(max_workers=3) as pool:
         chapters = list(pool.map(lambda c: _chapter(base, c, plan['glossary'], rules), plan['chapters']))
-    review = _cached(base / 'book-review.json', 'book',
-                     {'title': plan['title'], 'chapters': chapters, 'glossary': plan['glossary']}, rules)
-    if review['issues']:
-        (base / 'book-review.json').unlink()
-        raise ValueError('Общая проверка книги: ' + '; '.join(review['issues']))
+    for attempt in range(MAX_CORRECTIONS + 1):
+        review = _cached(base / f'book-review-{attempt}.json', 'book',
+                         {'title': plan['title'], 'chapters': chapters, 'glossary': plan['glossary']}, rules)
+        if not review['issues']:
+            break
+        if attempt == MAX_CORRECTIONS:
+            raise ValueError(f'Общая проверка книги после {MAX_CORRECTIONS} исправлений: '
+                             + '; '.join(f'{issue["chapter_id"]}: {issue["message"]}' for issue in review['issues']))
+        for index, chapter in enumerate(chapters):
+            findings = [issue['message'] for issue in review['issues'] if issue['chapter_id'] == chapter['id']]
+            if findings:
+                payload = _chapter_payload(base, plan['chapters'][index], plan['glossary'])
+                payload['text'] = chapter['text']
+                folder = base / 'chapters' / chapter['id'] / f'book-repair-{attempt + 1}'
+                text = _correct_chapter(folder, payload, rules, findings)
+                chapters[index] = {**chapter, 'text': text}
     book_path = base / 'book.json'
     write_json(book_path, {'signature': signature, 'title': plan['title'], 'chapters': chapters,
                           'introduction': review['introduction'], 'conclusion': review['conclusion']})

@@ -35,6 +35,8 @@ def calls(monkeypatch):
         calls.append(stage)
         if stage == 'glossary':
             return {'terms': []}
+        if stage == 'verify':
+            return {'issues': []}
         if stage == 'book':
             return {'introduction': 'Введение.', 'conclusion': 'Заключение.', 'issues': []}
         return {'text': TEXT, 'flow': 'good'}
@@ -68,14 +70,14 @@ def test_default_runs_without_user_review(project, calls):
     result = json.loads(p.book_summary_tool('test', str(project)))
     assert result['review_required'] is False
     assert result['ready_for_build'] is True
-    assert calls == ['write', 'review', 'clarity', 'book']
+    assert calls == ['write', 'review', 'clarity', 'verify', 'book']
 
 
 def test_enabled_review_continues_after_approval(project, calls):
     p.book_summary_tool('test', str(project), review_plan=True)
     result = json.loads(p.book_summary_tool('test', str(project), plan_approved=True, review_plan=True))
     assert result['ready_for_build'] is True
-    assert calls == ['write', 'review', 'clarity', 'book']
+    assert calls == ['write', 'review', 'clarity', 'verify', 'book']
 
 
 @pytest.mark.parametrize('review_plan,approved,skip_build', [
@@ -101,12 +103,12 @@ def test_workflow_build_condition_uses_review_result(project, calls, review_plan
         }
         assert calls == []
     else:
-        assert calls == ['write', 'review', 'clarity', 'book']
+        assert calls == ['write', 'review', 'clarity', 'verify', 'book']
 
 
 def test_skips_conditional_steps_and_resumes(project, calls):
     p.book_summary_tool('test', str(project), True)
-    assert calls == ['write', 'review', 'clarity', 'book']
+    assert calls == ['write', 'review', 'clarity', 'verify', 'book']
     calls.clear()
     p.book_summary_tool('test', str(project), True)
     assert calls == []
@@ -114,7 +116,7 @@ def test_skips_conditional_steps_and_resumes(project, calls):
     plan['glossary'] = [{'source': 'term', 'ru': 'термин', 'meaning': 'значение'}]
     write_json(project / 'plan.json', plan)
     p.book_summary_tool('test', str(project), True)
-    assert calls == ['write', 'review', 'clarity', 'book']
+    assert calls == ['write', 'review', 'clarity', 'verify', 'book']
 
 
 def test_size_and_flow_conditions(project, monkeypatch):
@@ -122,32 +124,38 @@ def test_size_and_flow_conditions(project, monkeypatch):
 
     def ask(stage, payload, rules):
         calls.append(stage)
+        if stage == 'verify':
+            return {'issues': []}
         if stage == 'book':
             return {'introduction': '', 'conclusion': '', 'issues': []}
         return {'text': 'коротко' if stage == 'write' else TEXT, 'flow': 'low'}
 
     monkeypatch.setattr(p, '_ask', ask)
     p.book_summary_tool('test', str(project), True)
-    assert calls == ['write', 'size', 'review', 'flow', 'clarity', 'book']
+    assert calls == ['write', 'size', 'review', 'flow', 'clarity', 'verify', 'book']
 
 
-def test_failed_stage_retries_without_rewriting(project, monkeypatch):
+def test_failed_correction_resumes_without_rewriting(project, monkeypatch):
     calls = []
 
     def ask(stage, payload, rules):
         calls.append(stage)
-        if stage == 'clarity' and calls.count(stage) == 1:
+        if stage == 'clarity':
             return {'text': 'слишком коротко'}
+        if stage == 'repair' and calls.count(stage) == 1:
+            raise RuntimeError('Временный сбой редактора')
+        if stage == 'verify':
+            return {'issues': []}
         if stage == 'book':
             return {'introduction': '', 'conclusion': '', 'issues': []}
         return {'text': TEXT, 'flow': 'good'}
 
     monkeypatch.setattr(p, '_ask', ask)
-    with pytest.raises(ValueError, match='итоговые проверки'):
+    with pytest.raises(RuntimeError, match='Временный сбой редактора'):
         p.book_summary_tool('test', str(project), True)
     assert not (project / 'book.json').exists()
     p.book_summary_tool('test', str(project), True)
-    assert calls == ['write', 'review', 'clarity', 'clarity', 'book']
+    assert calls == ['write', 'review', 'clarity', 'repair', 'repair', 'verify', 'book']
 
 
 def test_chapters_independent_and_book_waits(project, monkeypatch):
@@ -159,6 +167,8 @@ def test_chapters_independent_and_book_waits(project, monkeypatch):
     second_finished = threading.Event()
 
     def ask(stage, payload, rules):
+        if stage == 'verify':
+            return {'issues': []}
         if stage == 'book':
             assert first_finished.is_set() and second_finished.is_set()
             return {'introduction': '', 'conclusion': '', 'issues': []}
@@ -181,6 +191,171 @@ def test_stale_book_cannot_build(project, calls):
     (project / 'source.txt').write_text(SOURCE + ' изменено', encoding='utf-8')
     with pytest.raises(ValueError, match='изменились'):
         p.book_build_tool('test', str(project))
+
+
+@pytest.mark.parametrize('bad_text,issue', [
+    ('слишком коротко', '20–40%'),
+    (TEXT + ' «выдуманная цитата»', 'цитата'),
+    (TEXT + '\n```python\nprint(999)\n```', 'код'),
+])
+def test_failed_final_checks_are_corrected_in_same_run(project, monkeypatch, bad_text, issue):
+    calls = []
+
+    def ask(stage, payload, rules):
+        calls.append(stage)
+        if stage == 'clarity':
+            return {'text': bad_text}
+        if stage == 'repair':
+            assert issue in str(payload['issues'])
+            assert payload['source'] == SOURCE
+            assert payload['text'] == bad_text
+            return {'text': TEXT}
+        if stage == 'verify':
+            assert payload['text'] == TEXT
+            return {'issues': []}
+        if stage == 'book':
+            return {'introduction': '', 'conclusion': '', 'issues': []}
+        return {'text': TEXT, 'flow': 'good'}
+
+    monkeypatch.setattr(p, '_ask', ask)
+    p.book_summary_tool('test', str(project))
+    assert calls.count('repair') == 1
+    assert calls.index('repair') < calls.index('verify') < calls.index('book')
+    assert json.loads((project / 'book.json').read_text())['chapters'][0]['text'] == TEXT
+
+
+def test_quality_verdict_triggers_repair_and_fresh_verification(project, monkeypatch):
+    calls = []
+    corrected = TEXT + ' исправлено'
+
+    def ask(stage, payload, rules):
+        calls.append(stage)
+        if stage == 'verify':
+            return {'issues': ['Искажена мысль автора'] if payload['text'] == TEXT else []}
+        if stage == 'repair':
+            assert payload['issues'] == ['Искажена мысль автора']
+            return {'text': corrected}
+        if stage == 'book':
+            assert payload['chapters'][0]['text'] == corrected
+            return {'introduction': '', 'conclusion': '', 'issues': []}
+        return {'text': TEXT, 'flow': 'good'}
+
+    monkeypatch.setattr(p, '_ask', ask)
+    p.book_summary_tool('test', str(project))
+    assert calls[-4:] == ['verify', 'repair', 'verify', 'book']
+
+
+def test_book_findings_repair_only_affected_chapter_and_recheck_book(project, monkeypatch):
+    plan = json.loads((project / 'plan.json').read_text())
+    plan['chapters'].append({'id': '002', 'title': 'Вторая', 'source_path': 'source.txt'})
+    write_json(project / 'plan.json', plan)
+    repaired, book_calls = [], []
+
+    def ask(stage, payload, rules):
+        if stage == 'verify':
+            return {'issues': []}
+        if stage == 'repair':
+            repaired.append(payload['chapter_id'])
+            assert payload['source'] == SOURCE
+            assert payload['issues'] == ['Термин противоречит словарю']
+            return {'text': TEXT + ' исправлено'}
+        if stage == 'book':
+            book_calls.append(payload['chapters'])
+            return {'introduction': '', 'conclusion': '', 'issues': [
+                {'chapter_id': '001', 'message': 'Термин противоречит словарю'},
+            ] if len(book_calls) == 1 else []}
+        return {'text': TEXT, 'flow': 'good'}
+
+    monkeypatch.setattr(p, '_ask', ask)
+    p.book_summary_tool('test', str(project))
+    assert repaired == ['001']
+    assert len(book_calls) == 2
+    assert book_calls[1][0]['text'] == TEXT + ' исправлено'
+    assert book_calls[1][1]['text'] == TEXT
+    repaired.clear()
+    book_calls.clear()
+    p.book_summary_tool('test', str(project))
+    assert repaired == []
+    assert book_calls == []
+
+
+def test_persistent_findings_stop_after_three_repairs(project, monkeypatch):
+    calls = []
+
+    def ask(stage, payload, rules):
+        calls.append(stage)
+        if stage == 'verify':
+            return {'issues': ['Осталось искажение факта']}
+        return {'text': TEXT, 'flow': 'good'}
+
+    monkeypatch.setattr(p, '_ask', ask)
+    with pytest.raises(ValueError, match='Осталось искажение факта'):
+        p.book_summary_tool('test', str(project))
+    assert calls.count('repair') == 3
+    assert 'book' not in calls
+    assert not (project / 'book.json').exists()
+
+
+def test_failed_size_edit_is_corrected_instead_of_stopping(project, monkeypatch):
+    calls = []
+
+    def ask(stage, payload, rules):
+        calls.append(stage)
+        if stage == 'repair':
+            return {'text': TEXT}
+        if stage == 'verify':
+            return {'issues': []}
+        if stage == 'book':
+            return {'introduction': '', 'conclusion': '', 'issues': []}
+        return {'text': 'коротко', 'flow': 'good'}
+
+    monkeypatch.setattr(p, '_ask', ask)
+    p.book_summary_tool('test', str(project))
+    assert calls == ['write', 'size', 'review', 'clarity', 'repair', 'verify', 'book']
+
+
+def test_repair_introducing_wrong_size_is_corrected_again(project, monkeypatch):
+    repairs, verified = [], []
+
+    def ask(stage, payload, rules):
+        if stage == 'verify':
+            verified.append(payload['text'])
+            return {'issues': ['Ошибка смысла'] if len(verified) == 1 else []}
+        if stage == 'repair':
+            repairs.append(payload['issues'])
+            return {'text': 'коротко' if len(repairs) == 1 else TEXT + ' исправлено'}
+        if stage == 'book':
+            return {'introduction': '', 'conclusion': '', 'issues': []}
+        return {'text': TEXT, 'flow': 'good'}
+
+    monkeypatch.setattr(p, '_ask', ask)
+    p.book_summary_tool('test', str(project))
+    assert repairs[0] == ['Ошибка смысла']
+    assert '20–40%' in repairs[1][0]
+    assert verified == [TEXT, TEXT + ' исправлено']
+
+
+def test_persistent_book_findings_stop_without_accepting_result(project, monkeypatch):
+    repairs, reviews = [], []
+
+    def ask(stage, payload, rules):
+        if stage == 'verify':
+            return {'issues': []}
+        if stage == 'repair':
+            repairs.append(payload['chapter_id'])
+        if stage == 'book':
+            reviews.append(True)
+            return {'introduction': '', 'conclusion': '', 'issues': [
+                {'chapter_id': '001', 'message': 'Противоречие между главами'},
+            ]}
+        return {'text': TEXT, 'flow': 'good'}
+
+    monkeypatch.setattr(p, '_ask', ask)
+    with pytest.raises(ValueError, match='Противоречие между главами'):
+        p.book_summary_tool('test', str(project))
+    assert repairs == ['001'] * 3
+    assert len(reviews) == 4
+    assert not (project / 'book.json').exists()
 
 
 def make_epub(path):
