@@ -1,0 +1,94 @@
+name: "book_summary"
+version: "1.0"
+description: "Подготовка PDF/EPUB, пересказ книги по главам и сборка материалов"
+
+inputs:
+  source_path: ""
+  output_dir: "plots/book_summaries/book"
+  review_plan: false
+  plan_approved: false
+
+outputs:
+  plan:
+    from_step: prepare
+    field: plan_path
+    format: text
+  review_required:
+    from_step: summarize
+    field: review_required
+    format: json
+  message:
+    from_step: summarize
+    field: message
+    format: text
+  book:
+    from_step: summarize
+    field: book_path
+    format: json
+  markdown:
+    from_step: build
+    field: markdown_path
+    format: text
+  html:
+    from_step: build
+    field: html_path
+    format: text
+  epub:
+    from_step: build
+    field: epub_path
+    format: text
+  png_dir:
+    from_step: build
+    field: png_dir
+    format: text
+
+global_retry_policy:
+  max_retries: 0
+
+steps:
+  - id: prepare
+    step_type: tool
+    tool_name: book_prepare_tool
+    task: "Подготовить книгу {source_path} для пересказа и сохранить материалы в {output_dir}"
+    tool_params:
+      source_path: "{source_path}"
+      output_dir: "{output_dir}"
+    timeout: 3600
+    output_schema: json_object
+
+  - id: summarize
+    step_type: tool
+    tool_name: book_summary_tool
+    task: "Создать пересказ глав книги из {output_dir}, учитывая необязательную проверку плана"
+    tool_params:
+      output_dir: "{output_dir}"
+      review_plan: "{review_plan}"
+      plan_approved: "{plan_approved}"
+    depends_on: [prepare]
+    timeout: 86400
+    output_schema: json_object
+
+  - id: build
+    step_type: tool
+    tool_name: book_build_tool
+    task: "Собрать Markdown, HTML, EPUB и PNG из пересказа в {output_dir}"
+    tool_params:
+      output_dir: "{output_dir}"
+    depends_on: [summarize]
+    condition: "{summarize.ready_for_build}"
+    metadata:
+      skip_output:
+        markdown_path: ""
+        html_path: ""
+        epub_path: ""
+        png_dir: ""
+    timeout: 600
+    output_schema: json_object
+
+error_handling:
+  on_failure: stop
+  save_partial_results: true
+
+metadata:
+  category: books
+  tags: ["book", "summary", "chapters", "epub", "png"]

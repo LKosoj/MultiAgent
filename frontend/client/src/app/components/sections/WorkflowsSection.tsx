@@ -211,11 +211,38 @@ export function WorkflowsSection({
   const resultModalRunIdRef = React.useRef<string | null>(null);
   const [isMounted, setIsMounted] = useState(false);
   const [isSubmittingRun, setIsSubmittingRun] = useState(false);
+  const [isUploadingBook, setIsUploadingBook] = useState(false);
+  const [bookUploadError, setBookUploadError] = useState<string | null>(null);
   const [isSubmittingYaml, setIsSubmittingYaml] = useState(false);
   const [logsModalAutoRefresh, setLogsModalAutoRefresh] = useState(true);
   const [runLogsAutoRefresh, setRunLogsAutoRefresh] = useState(true);
   const runLogsInFlightRef = useRef<Set<string>>(new Set());
   const selectedIsStorybook = Boolean(selectedWorkflow && isStorybookWorkflowName(selectedWorkflow.name));
+  const handleBookUpload = async (file: File) => {
+    setBookUploadError(null);
+    setIsUploadingBook(true);
+    try {
+      if (!/\.(pdf|epub)$/i.test(file.name)) {
+        throw new Error("Выберите книгу в формате PDF или EPUB");
+      }
+      const content = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(",")[1]);
+        reader.onerror = () => reject(new Error("Не удалось прочитать файл книги"));
+        reader.readAsDataURL(file);
+      });
+      const result = await runServiceAction("workflows.upload_book", {
+        filename: file.name, content_base64: content,
+      }) as { source_path: string; output_dir: string };
+      setWorkflowParams((prev) => ({
+        ...prev, source_path: result.source_path, output_dir: result.output_dir, plan_approved: false,
+      }));
+    } catch (error) {
+      setBookUploadError(error instanceof Error ? error.message : "Не удалось загрузить книгу");
+    } finally {
+      setIsUploadingBook(false);
+    }
+  };
   const handleGenerateReport = async (runId: string) => {
     setReportError(null);
     try {
@@ -569,7 +596,7 @@ export function WorkflowsSection({
                   <div className="card-title">{selectedWorkflow.name}</div>
                   <div className="card-description">{selectedWorkflow.description || "Описание отсутствует."}</div>
                 </div>
-                <button className="button ghost" type="button" onClick={() => setWorkflowTab("list")}>
+                <button className="button ghost" type="button" onClick={() => setWorkflowTab("list")} disabled={isUploadingBook}>
                   Сменить пайплайн
                 </button>
               </div>
@@ -618,6 +645,27 @@ export function WorkflowsSection({
                   <div className="card-description">Этот workflow не содержит inputs — проверьте YAML.</div>
                 ) : (
                   Object.entries(workflowInputs).map(([key, defaultValue]) => {
+                    if (selectedWorkflow.name === "book_summary" && key === "source_path") {
+                      return (
+                        <label className="field" key={key}>
+                          <span className="label">Файл книги</span>
+                          <input
+                            type="file"
+                            accept=".pdf,.epub,application/pdf,application/epub+zip"
+                            disabled={isBusy || isUploadingBook || isSubmittingRun}
+                            onChange={(event) => {
+                              const file = event.target.files?.[0];
+                              event.target.value = "";
+                              if (file) void handleBookUpload(file);
+                            }}
+                          />
+                          <span className="card-description" role="status">
+                            {isUploadingBook ? "Книга загружается…" : workflowParams.source_path ? `Книга загружена: ${String(workflowParams.source_path).split(/[\\/]/).pop()}` : "Выберите PDF или EPUB"}
+                          </span>
+                          {bookUploadError ? <span role="alert">{bookUploadError}</span> : null}
+                        </label>
+                      );
+                    }
                     const kind = inferWorkflowInputKind(defaultValue);
                     const currentValue = workflowParams[key];
                     if (kind === "boolean") {
@@ -666,7 +714,7 @@ export function WorkflowsSection({
                 <button
                   className="button"
                   type="button"
-                  disabled={isBusy || isSubmittingRun}
+                  disabled={isBusy || isSubmittingRun || isUploadingBook || (selectedWorkflow.name === "book_summary" && (!workflowParams.source_path || Boolean(bookUploadError)))}
                   onClick={async () => {
                     if (isSubmittingRun) return;
                     setIsSubmittingRun(true);
@@ -676,7 +724,7 @@ export function WorkflowsSection({
                   {isSubmittingRun ? <span className="spinner" /> : null}
                   Запустить
                 </button>
-                <button className="button secondary" type="button" onClick={() => loadWorkflowInputs(selectedWorkflow.name)} disabled={isBusy}>
+                <button className="button secondary" type="button" onClick={() => loadWorkflowInputs(selectedWorkflow.name)} disabled={isBusy || isUploadingBook}>
                   Обновить inputs
                 </button>
               </div>

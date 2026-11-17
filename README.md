@@ -50,6 +50,7 @@ export DB_DSN="sqlite:///path/to/your.db"  # Опционально для Text-
 ## Документация
 
 ### Основные компоненты
+- [**Пересказы книг PDF/EPUB**](doc/MultiAgent/MultiAgent/32_book_summary_pipeline.md) — один пайплайн от подготовки до HTML/EPUB/PNG; проверка плана пользователем необязательна и по умолчанию выключена.
 - [**Text-to-SQL система**](doc/TEXT_TO_SQL.md) - Преобразование естественного языка в SQL-запросы
 - [**Конфигурация RAG-памяти**](doc/RAG_MEMORY_CONFIGURATION.md) - Настройка системы памяти агентов
 - [**Интеграция Mermaid диаграмм**](doc/MERMAID_INTEGRATION_SUMMARY.md) - Создание диаграмм

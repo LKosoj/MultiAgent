@@ -241,6 +241,7 @@ _ALL_SERVICE_ACTIONS = frozenset(
         "workflows.result",
         "workflows.save_yaml",
         "workflows.start",
+        "workflows.upload_book",
         "workflows.status",
         "workflows.storybook_actions",
         "workflows.storybook_project_inventory",
@@ -3625,6 +3626,12 @@ def handle_service_action(
 
     if action == "workflows.list":
         return {"workflows": _serialize(wf_manager.list_workflows())}
+    if action == "workflows.upload_book":
+        from custom_tools.book_summary.files import save_uploaded_book
+
+        return save_uploaded_book(
+            _project_root(), str(payload.get("filename") or ""), payload.get("content_base64"),
+        )
     if action == "workflows.start":
         workflow_name = payload.get("workflow_name")
         parameters = payload.get("parameters") or {}

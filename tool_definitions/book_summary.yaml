@@ -1,0 +1,22 @@
+name: book_summary_tool
+description: "Пишет и проверяет пересказ глав; проверка плана пользователем необязательна"
+category: "Книги"
+source_type: custom_function
+implementation_source: custom_tools.book_summary.pipeline.book_summary_tool
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии"
+    required: true
+  - name: "output_dir"
+    type: "str"
+    description: "Каталог материалов книги"
+    required: true
+  - name: "plan_approved"
+    type: "bool"
+    description: "Подтверждено ли человеком продолжение после проверки плана"
+    required: false
+  - name: "review_plan"
+    type: "bool"
+    description: "Требовать проверку плана пользователем; по умолчанию выключено"
+    required: false

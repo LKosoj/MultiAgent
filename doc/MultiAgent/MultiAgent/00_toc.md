@@ -31,3 +31,4 @@
 - 29. Связчик схем — `29_schema_linker.md`
 - 30. Модель с повторными попытками — `30_openai_retry_model.md`
 - 31. Система наблюдаемости — `31_observability.md`
+- 32. [Пересказ книг из PDF/EPUB](32_book_summary_pipeline.md)

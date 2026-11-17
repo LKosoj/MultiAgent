@@ -1,0 +1,14 @@
+name: book_build_tool
+description: "Собирает пересказ книги в Markdown, HTML, EPUB и изображения страниц PNG"
+category: "Книги"
+source_type: custom_function
+implementation_source: custom_tools.book_summary.pipeline.book_build_tool
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии"
+    required: true
+  - name: "output_dir"
+    type: "str"
+    description: "Каталог материалов книги"
+    required: true

@@ -225,3 +225,4 @@ doc/MultiAgent/.DS_Store
 CopilotKit/
 !frontend/client/package-lock.json
 .cli-proxy/runtime/
+/.attachments/
