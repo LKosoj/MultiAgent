@@ -226,3 +226,4 @@ CopilotKit/
 !frontend/client/package-lock.json
 .cli-proxy/runtime/
 /.attachments/
+StoryBookManager/config/settings.json.lock

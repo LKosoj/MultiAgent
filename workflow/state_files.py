@@ -1260,7 +1260,7 @@ def _copy_pinned_member_to_private(
 
 
 def _recover_and_collapse_private_copy(
-    state_directory_fd: int,
+    state_directory: _PinnedDirectoryChain,
     main_snapshot_name: str,
     display_path: Path,
 ) -> None:
@@ -1271,10 +1271,16 @@ def _recover_and_collapse_private_copy(
     is demoted out of WAL mode entirely so the remainder of the migration
     only ever has to deal with a single-file database.
     """
-    connection_path = f"/proc/self/fd/{state_directory_fd}/{main_snapshot_name}"
+    # /proc/self/fd/<dirfd>/<name> only exists on Linux; use the pinned
+    # directory's real path so macOS works too (the chain is revalidated
+    # by inode around every step, which guards against path swaps).
+    connection_path = str(state_directory.path / main_snapshot_name)
+    # mode=rw refuses to create the database, so a directory swapped in
+    # after pinning cannot receive a stray freshly-created file.
+    connection_uri = f"file:{quote(connection_path, safe='/')}?mode=rw"
     connection: sqlite3.Connection | None = None
     try:
-        connection = sqlite3.connect(connection_path, timeout=30)
+        connection = sqlite3.connect(connection_uri, timeout=30, uri=True)
         busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
         if busy != 0:
             raise LegacyDatabaseUnrecoverable(
@@ -1369,7 +1375,7 @@ def _migrate_legacy_database(
         assert main_snapshot_name is not None
         assert main_display_path is not None
         _recover_and_collapse_private_copy(
-            state_directory.fd,
+            state_directory,
             main_snapshot_name,
             main_display_path,
         )
@@ -1383,12 +1389,13 @@ def _migrate_legacy_database(
         created_entries[temporary_name] = temporary_identity
         os.close(temporary_fd)
 
-        source_path = f"/proc/self/fd/{state_directory.fd}/{main_snapshot_name}"
+        source_path = str(state_directory.path / main_snapshot_name)
         source_uri = f"file:{quote(source_path, safe='/')}?mode=ro"
-        destination_path = f"/proc/self/fd/{state_directory.fd}/{temporary_name}"
+        destination_path = str(state_directory.path / temporary_name)
+        destination_uri = f"file:{quote(destination_path, safe='/')}?mode=rw"
         source = sqlite3.connect(source_uri, timeout=30.0, uri=True)
         source.execute("PRAGMA query_only=ON")
-        destination = sqlite3.connect(destination_path, timeout=30.0)
+        destination = sqlite3.connect(destination_uri, timeout=30.0, uri=True)
         destination.execute("PRAGMA journal_mode=OFF")
         source.backup(destination)
         destination.commit()
